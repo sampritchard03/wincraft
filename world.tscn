@@ -1,0 +1,138 @@
+[gd_scene format=3 uid="uid://drlmvflveo18g"]
+
+[ext_resource type="Script" uid="uid://cf1fglmiv57xt" path="res://world.gd" id="1_tlwt5"]
+[ext_resource type="Shader" uid="uid://cu75sf0yohhpb" path="res://terrain.gdshader" id="2_terrain"]
+[ext_resource type="Shader" uid="uid://brg3fiekapihb" path="res://terrain_prepass.gdshader" id="3_prepass"]
+[ext_resource type="PackedScene" uid="uid://claoexgme20hh" path="res://forg.tscn" id="4_aqk2v"]
+
+[sub_resource type="ShaderMaterial" id="TerrainMaterial"]
+render_priority = 0
+shader = ExtResource("2_terrain")
+shader_parameter/clip_brick_count = 16.0
+shader_parameter/clip_count = 0
+shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+shader_parameter/clip_size = 128.0
+shader_parameter/clip_reach = 45.0
+shader_parameter/view_position = Vector3(0, 0, 0)
+shader_parameter/view_distance_limit = 872.0
+shader_parameter/use_prepass = false
+shader_parameter/sun_direction = Vector3(0.45, 0.75, 0.35)
+shader_parameter/sun_color = Color(1, 0.94, 0.82, 1)
+shader_parameter/sky_color = Color(0.45, 0.62, 0.88, 1)
+shader_parameter/horizon_color = Color(0.78, 0.84, 0.9, 1)
+shader_parameter/has_sea = false
+shader_parameter/sea_level = 0.0
+shader_parameter/water_tint = Color(0.24, 0.42, 0.86, 1)
+shader_parameter/water_clarity = 7.0
+shader_parameter/ambient_strength = 0.45
+shader_parameter/texture_size = 8.0
+
+[sub_resource type="ShaderMaterial" id="PrepassMaterial"]
+render_priority = 0
+shader = ExtResource("3_prepass")
+shader_parameter/clip_brick_count = 16.0
+shader_parameter/clip_count = 0
+shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+shader_parameter/clip_size = 128.0
+shader_parameter/clip_reach = 45.0
+shader_parameter/view_position = Vector3(0, 0, 0)
+shader_parameter/view_distance_limit = 872.0
+
+[sub_resource type="QuadMesh" id="ScreenQuad"]
+size = Vector2(2, 2)
+
+[sub_resource type="SphereMesh" id="BrushSphere"]
+radial_segments = 24
+rings = 12
+
+[sub_resource type="StandardMaterial3D" id="BrushMaterial"]
+transparency = 1
+shading_mode = 0
+albedo_color = Color(1, 0.9, 0.6, 0.25)
+
+[node name="World" type="Node" unique_id=307198148 node_paths=PackedStringArray("terrain", "screen", "camera", "prepass_viewport", "prepass_camera", "brush_preview", "info_label")]
+script = ExtResource("1_tlwt5")
+terrain = NodePath("Terrain")
+screen = NodePath("Screen")
+camera = NodePath("Screen/Viewport/Camera")
+forg_scene = ExtResource("4_aqk2v")
+prepass_viewport = NodePath("Screen/Viewport/Prepass")
+prepass_camera = NodePath("Screen/Viewport/Prepass/Camera")
+brush_preview = NodePath("Screen/Viewport/BrushPreview")
+info_label = NodePath("HUD/Info")
+
+[node name="Terrain" type="SculptTerrain" parent="." unique_id=1541261100]
+world_type = 1
+save_path = "user://torus"
+material = SubResource("TerrainMaterial")
+prepass_material = SubResource("PrepassMaterial")
+
+[node name="Screen" type="SubViewportContainer" parent="." unique_id=1476213551]
+texture_filter = 1
+offset_right = 320.0
+offset_bottom = 180.0
+scale = Vector2(3.6, 3.6)
+mouse_filter = 2
+
+[node name="Viewport" type="SubViewport" parent="Screen" unique_id=265028557]
+own_world_3d = true
+handle_input_locally = false
+size = Vector2i(320, 180)
+render_target_update_mode = 4
+
+[node name="Camera" type="Camera3D" parent="Screen/Viewport" unique_id=1461816443]
+transform = Transform3D(1, 0, 0, 0, 0.939693, 0.34202, 0, -0.34202, 0.939693, 128, 150, 230)
+fov = 70.0
+far = 10000.0
+
+[node name="TerrainView" type="MeshInstance3D" parent="Screen/Viewport" unique_id=1857056786]
+cast_shadow = 0
+extra_cull_margin = 16384.0
+mesh = SubResource("ScreenQuad")
+surface_material_override/0 = SubResource("TerrainMaterial")
+
+[node name="Prepass" type="SubViewport" parent="Screen/Viewport" unique_id=1970806063]
+own_world_3d = true
+handle_input_locally = false
+use_hdr_2d = true
+size = Vector2i(160, 90)
+render_target_update_mode = 4
+
+[node name="Camera" type="Camera3D" parent="Screen/Viewport/Prepass" unique_id=1302435286]
+fov = 70.0
+far = 10000.0
+
+[node name="TerrainView" type="MeshInstance3D" parent="Screen/Viewport/Prepass" unique_id=1952471478]
+cast_shadow = 0
+extra_cull_margin = 16384.0
+mesh = SubResource("ScreenQuad")
+surface_material_override/0 = SubResource("PrepassMaterial")
+
+[node name="BrushPreview" type="MeshInstance3D" parent="Screen/Viewport" unique_id=839384945]
+cast_shadow = 0
+mesh = SubResource("BrushSphere")
+surface_material_override/0 = SubResource("BrushMaterial")
+
+[node name="HUD" type="CanvasLayer" parent="." unique_id=339788452]
+
+[node name="Crosshair" type="Label" parent="HUD" unique_id=602829916]
+anchors_preset = 8
+anchor_left = 0.5
+anchor_top = 0.5
+anchor_right = 0.5
+anchor_bottom = 0.5
+offset_left = -10.0
+offset_top = -12.0
+offset_right = 10.0
+offset_bottom = 12.0
+text = "+"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="Info" type="Label" parent="HUD" unique_id=1427010088]
+offset_left = 12.0
+offset_top = 8.0
+offset_right = 900.0
+offset_bottom = 80.0
+theme_override_colors/font_outline_color = Color(0, 0, 0, 1)
+theme_override_constants/outline_size = 4

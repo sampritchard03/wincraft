@@ -1,0 +1,17 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+.vscode/
+
+# Native extension build output (rebuild with gdextension/build.sh)
+gdextension/build/
+
+# Exported game packs
+*.pck
+*.pck-*
+
+# Backup copies (git history replaces these)
+*.pre_*
+*.bak
+*.old
+~*

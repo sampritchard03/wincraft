@@ -1,0 +1,173 @@
+#pragma once
+
+#include "voxel_world.h"
+
+#include <godot_cpp/variant/vector3.hpp>
+#include <godot_cpp/variant/vector3i.hpp>
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace godot {
+
+// The copy of the density grid the raymarching shader reads: a few cubes of
+// size^3 texels ("levels") centred on the camera. Level l has one texel every
+// 2^l voxels, so each level covers twice the distance of the one before at half
+// the detail, and the shader uses the finest level that reaches a point.
+//
+// Storage wraps around (toroidal): world texel w (= position / scale) lives at
+// w mod size on each axis, and the shader samples with repeat wrapping. When a
+// level moves, texels still inside it stay where they are and only the newly
+// covered slabs are computed, on a worker thread.
+//
+// Each level is uploaded as an Image::FORMAT_RGB8 2D texture array with one
+// layer per z slice (storage z = world texel z mod size), x fastest, then y:
+// layers that changed can be uploaded on their own, a few per frame. The
+// shader interpolates between layers itself. A texel is three bytes: R, the
+// density at its point in 1/16 of the level's texel size
+// (VoxelWorld::lod_texel) + 128, so coarse levels hold larger distances; G
+// and B, its material (render_bytes(): a texture layer, or a color).
+//
+// Separately, per BRICK^3 block of texels: how many bricks away the nearest
+// brick containing surface (a texel within DENSITY_CLAMP of it) is, Chebyshev,
+// up to MAX_BRICK_DISTANCE. The shader turns that into a distance rays can
+// safely jump through open air or rock. These are small (size / BRICK cubed)
+// and all levels share one texture.
+class Clipmap {
+public:
+	static constexpr int BRICK = 8;
+	// A level moves once the camera is this many texels from its centre. A
+	// multiple of BRICK, so bricks line up across moves.
+	static constexpr int RECENTER = 16;
+	// Brick distances stop counting here (it means "this far or more"), so a
+	// change to one brick only affects distances within this many bricks.
+	static constexpr int MAX_BRICK_DISTANCE = 8;
+	static constexpr int TEXEL_BYTES = 3;
+
+	// The shader uses level l within this many texels of the camera (largest of
+	// |dx|, |dy|, |dz|), which the level always covers: size / 2 - RECENTER -
+	// margin. Passed to terrain_common.gdshaderinc as clip_reach.
+	int reach() const { return size / 2 - RECENTER - 3; }
+
+	struct Level {
+		int scale = 1; // voxels per texel
+		Vector3i origin; // first texel, in world texels (world position / scale)
+		bool valid = false;
+		std::vector<uint8_t> texels; // TEXEL_BYTES per texel: density + 128, material (wrapped)
+		std::vector<uint8_t> layer_dirty; // per storage layer: changed since uploaded
+		// Where the GPU copy is placed. After a move it stays at the old origin
+		// until every changed layer is uploaded (see SculptTerrain), which is
+		// safe because texels inside both boxes keep their storage slot and the
+		// changed ones lie beyond the range the shader uses this level for.
+		Vector3i published_origin;
+		bool published = false;
+		std::vector<uint8_t> has_surface; // per brick (wrapped)
+		std::vector<uint8_t> bricks; // per brick distance (wrapped)
+		bool bricks_dirty = false; // changed since uploaded
+		// Edits made while a move was running, to re-apply when it finishes.
+		std::vector<std::pair<Vector3i, Vector3i>> pending_edits;
+
+		Vector3i world_origin() const { return origin * scale; }
+	};
+
+	~Clipmap() { cancel_jobs(); }
+	// Discards all levels. p_size must be a multiple of BRICK.
+	void configure(int p_size, int p_level_count);
+	int get_size() const { return size; }
+	int get_brick_count() const { return size / BRICK; }
+	int get_level_count() const { return (int)levels.size(); }
+	Level &level(int p_index) { return levels[p_index]; }
+	const Level &level(int p_index) const { return levels[p_index]; }
+
+	// Moves levels to keep p_center near their middle. The texels a move
+	// brings into view are generated on a worker thread, and edited chunks are
+	// filled in on this thread once it finishes; until then the level stays
+	// where it was. Level 0 is built at once the first time if p_wait_first,
+	// and with p_wait everything finishes before this returns. Returns a bit
+	// mask of levels that moved during this call.
+	int follow(VoxelWorld &r_world, const Vector3 &p_center, int p_threads, bool p_wait_first, bool p_wait);
+	// Relabels everything by p_offset voxels (a multiple of the world's
+	// size in x and z: the same place on the wrapping world) without
+	// regenerating: storage slots don't change when p_offset is a multiple of
+	// a level's extent (size * scale); a level for which it isn't is rebuilt.
+	// Running moves carry on and are moved when they finish.
+	void shift(VoxelWorld &r_world, const Vector3i &p_offset);
+	// Waits for running work and discards it. Call before changing the world's
+	// generator settings.
+	void cancel_jobs();
+	bool has_pending_jobs() const;
+	// Re-reads the texels whose points lie in [p_min, p_max] after an edit there.
+	void refresh(VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max);
+
+	// Density stored for world texel p_texel of a level, in voxels (for tests).
+	float texel_value(const Level &p_level, const Vector3i &p_texel) const;
+	// Brick distance stored for the brick holding world texel p_texel (for tests).
+	int brick_value(const Level &p_level, const Vector3i &p_texel) const;
+
+private:
+	// World texels [lo, hi] a move brings into view. Brick-aligned (levels
+	// move in steps of RECENTER texels).
+	struct Slab {
+		Vector3i lo, hi;
+		std::vector<uint8_t> surface; // has_surface per brick of the slab, x fastest
+	};
+	// A move of one level, generating on a worker thread.
+	struct Job {
+		Vector3i origin; // the level's origin once done
+		Vector3i old_origin;
+		bool reset = false; // the new box doesn't overlap the old one
+		std::vector<Slab> slabs;
+		// A reset builds a whole new level here; otherwise the worker writes the
+		// slabs straight into the level's storage slots they replace, which
+		// nothing else touches while it runs (see refresh()).
+		std::vector<uint8_t> texels;
+		// Texels shift() moved the world by while this ran (main thread only:
+		// the worker's coordinates are applied with this once it's done).
+		Vector3i shift;
+		std::thread thread;
+		std::atomic<bool> finished{ false };
+	};
+
+	int size = 128;
+	std::vector<Level> levels;
+	std::vector<std::unique_ptr<Job>> jobs; // per level, or null
+
+	void start_job(int p_level, const Vector3i &p_target, const VoxelWorld &p_world, bool p_wait, int p_threads);
+	void finish_job(int p_level, VoxelWorld &r_world);
+	// Worker side: generated (unedited) texels of a slab into r_texels, and
+	// which of its bricks hold surface. Reads nothing the main thread changes.
+	void generate_slab(const VoxelWorld &p_world, int p_level, Slab &r_slab, uint8_t *r_texels, int p_threads) const;
+	// Main thread: re-reads world texels [p_min, p_max] (clipped to the level)
+	// through VoxelWorld::lod_texel, which knows about edits. Returns whether
+	// any brick's has_surface changed.
+	bool write_texels(Level &r_level, int p_level, VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max);
+	// Overwrites the texels of edited chunks within world texels [p_min, p_max].
+	void patch_edited(Level &r_level, int p_level, VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max);
+	// Calls p_function(t0, t1) with the texel box of each repeat of the
+	// (wrapping) world's voxel box [p_min, p_max] inside texels [p_lo, p_hi].
+	template <typename F>
+	void for_each_repeat(const VoxelWorld &p_world, const Vector3i &p_min, const Vector3i &p_max, const Vector3i &p_lo, const Vector3i &p_hi, int p_scale, F p_function) const;
+	// Returns whether any brick's flag changed.
+	bool update_has_surface(Level &r_level, const Vector3i &p_min, const Vector3i &p_max);
+	void update_brick_distances(Level &r_level);
+	// Marks the layers holding world texels z in [p_z0, p_z1] as changed.
+	void mark_layers(Level &r_level, int p_z0, int p_z1);
+
+	static int wrap(int p_value, int p_size) {
+		const int m = p_value % p_size;
+		return m < 0 ? m + p_size : m;
+	}
+	size_t texel_index(const Vector3i &p_world_texel) const {
+		return ((size_t)wrap(p_world_texel.z, size) * size + wrap(p_world_texel.y, size)) * size + wrap(p_world_texel.x, size);
+	}
+	size_t brick_index(const Vector3i &p_world_brick) const {
+		const int nb = size / BRICK;
+		return ((size_t)wrap(p_world_brick.z, nb) * nb + wrap(p_world_brick.y, nb)) * nb + wrap(p_world_brick.x, nb);
+	}
+};
+
+} // namespace godot
