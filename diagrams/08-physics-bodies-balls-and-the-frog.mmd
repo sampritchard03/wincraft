@@ -32,3 +32,9 @@ flowchart TD
         F2 -- yes --> F4["Every 10-15 s: big leap<br/>forward + up"]
         F3 & F4 --> F5["AnimationTree: idle / jump_start / jump<br/>animates the shape's 'pose'"]
     end
+
+    subgraph Online["Online (network.gd, diagram 12)"]
+        O1["Each object simulated on one computer: its owner"] --> O2["Other computers: frozen copy following<br/>the owner's updates; frog AI off"]
+        O3["Other players: frozen capsules<br/>objects bounce off"]
+    end
+    Step -.-> Online

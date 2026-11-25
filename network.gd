@@ -23,8 +23,18 @@ extends Node
 ## exact values, so nothing drifts. Your own edits show at once; a batch from
 ## someone else that the host ordered before yours is applied under your
 ## unconfirmed batches (they're put back on top), as it will be everywhere.
-## Physics objects and frogs aren't shared yet (step 3 of
-## diagrams/12-multiplayer.mmd).
+##
+## Physics objects (step 3): every ball, frog and object has an owner, the
+## computer that simulates it (frogs: and runs their AI); the others hold a
+## frozen copy that follows the owner's updates (its velocity set too, so
+## their own objects bounce off it properly). Whoever makes an object owns
+## it, so each player simulates what they throw or drop and the work is
+## spread out; using one (physics gun, sculpting it, the object editor) takes
+## it over. The host keeps the order of hand-overs, and takes the objects of
+## a player who leaves. New and removed objects are found by looking (every
+## SCAN_INTERVAL), so every way of making or removing one is covered. Other
+## players are solid: frozen capsules that objects bounce off. Online, every
+## object stays loaded (bouncy_balls.gd's streaming waits for step 4).
 ##
 ## Positions go over the network in wrapped world coordinates (x and z in
 ## [0, world_size)): world.gd moves its coordinates by whole world sizes to
@@ -68,6 +78,25 @@ var next_batch_id := 0
 var edit_timer := 0.0
 var batches_sent := 0
 var batches_received := 0
+
+## Physics objects: net id ("peer:n") -> DensityBody3D, ours and copies.
+## Each body's metadata: net_id, net_owner (peer id), net_sim (simulated
+## here), net_frozen (a copy: the owner's freeze), net_target / net_turn
+## (a copy: where the owner last had it), net_shape (the shape and version
+## last sent).
+const BODY_INTERVAL := 0.05  # seconds between updates of moving objects
+const REST_INTERVAL := 1.0  # ... and of ones at rest
+const SCAN_INTERVAL := 0.1
+const SHAPE_INTERVAL := 0.25
+const BODY_PROPERTIES := ["mass", "bounce", "friction", "gravity_scale", "linear_damp", "angular_damp", "rolling_resistance",
+		"auto_material_properties", "auto_center_of_mass", "center_of_mass", "collide_with_bodies", "drawn", "color", "material"]
+var bodies: Dictionary = {}
+var next_body := 0
+var body_timer := 0.0
+var scan_timer := 0.0
+var shape_timer := 0.0
+var ready_for_bodies := false
+var early_bodies: Array[Callable] = []
 
 ## Other players: peer id -> {"node", "label", "target", "yaw", "height", "name"}.
 var remotes: Dictionary = {}
@@ -165,6 +194,11 @@ func _on_peer_connected(p_id: int) -> void:
 	outgoing[p_id] = chunks
 	print("Network: player %d joined, sending %d edited chunks" % [p_id, chunks.size()])
 	_welcome.rpc_id(p_id, world.terrain.get_world_settings(), _wrapped(world.player.global_position), chunks.size())
+	# Every object, with its owner (they appear once the joiner's world is ready).
+	for id in bodies:
+		var b = bodies[id]
+		if is_instance_valid(b):
+			_spawn.rpc_id(p_id, id, b.get_meta("net_owner", 1), _describe(b))
 	# Where everyone already is, so the new player sees them at once.
 	_player_state.rpc_id(p_id, _wrapped(world.player.global_position), world.yaw, world.player_height, player_name)
 
@@ -288,12 +322,240 @@ func _apply_changes(p_changes: Array) -> void:
 		world.terrain.apply_change(p_changes[i], p_changes[i + 1])
 
 
+# --- Physics objects ---------------------------------------------------------------
+
+## world.gd: the player, the balls and the rest exist now.
+func world_ready() -> void:
+	ready_for_bodies = true
+	if mode == Mode.HOST:
+		world.balls.load_all(world.player.global_position)  # online, everything stays loaded
+	for call in early_bodies:
+		call.call()
+	early_bodies.clear()
+
+## Simulate an object here from now on (the physics gun, sculpting it, the
+## object editor): this computer takes it over at once, and the host tells
+## everyone (if two players grab it at once, the host's order decides).
+func take(p_body: DensityBody3D) -> void:
+	if mode == Mode.OFFLINE or not p_body.has_meta("net_id"):
+		return
+	var me := multiplayer.get_unique_id()
+	if p_body.get_meta("net_owner", 0) == me:
+		return
+	var id: String = p_body.get_meta("net_id")
+	p_body.set_meta("net_owner", me)
+	_simulate_here(p_body, true)
+	if mode == Mode.HOST:
+		_set_owner.rpc(id, me)
+	else:
+		_request_owner.rpc_id(1, id)
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _request_owner(p_id: String) -> void:
+	if not multiplayer.is_server() or not bodies.has(p_id):
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	_set_owner_now(p_id, sender)
+	_set_owner.rpc(p_id, sender)
+
+@rpc("authority", "call_remote", "reliable", 1)
+func _set_owner(p_id: String, p_owner: int) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_set_owner_now.bind(p_id, p_owner))
+		return
+	_set_owner_now(p_id, p_owner)
+
+func _set_owner_now(p_id: String, p_owner: int) -> void:
+	var b = bodies.get(p_id)
+	if b == null or not is_instance_valid(b):
+		return
+	b.set_meta("net_owner", p_owner)
+	_simulate_here(b, p_owner == multiplayer.get_unique_id())
+
+## Switches an object between simulated here and a frozen copy of another
+## player's (its own freeze kept in net_frozen meanwhile; a frog's AI and
+## animation only run where it's simulated).
+func _simulate_here(p_body: DensityBody3D, p_on: bool) -> void:
+	if p_body.has_meta("net_sim") and p_body.get_meta("net_sim") == p_on:
+		return
+	if p_on:
+		p_body.freeze = p_body.get_meta("net_frozen", false)
+		p_body.sleeping = false
+	else:
+		p_body.set_meta("net_frozen", p_body.freeze)
+		p_body.freeze = true
+		p_body.set_meta("net_target", _wrapped(p_body.global_position))
+		p_body.set_meta("net_turn", p_body.global_basis.get_rotation_quaternion())
+	p_body.set_meta("net_sim", p_on)
+	if p_body.get_script() != null:
+		p_body.set_physics_process(p_on)
+	for child in p_body.get_children():
+		if child is AnimationTree:
+			child.active = p_on
+
+## Everything another computer needs to make a copy of an object.
+func _describe(p_body: DensityBody3D) -> Dictionary:
+	var props := {}
+	for key in BODY_PROPERTIES:
+		props[key] = p_body.get(key)
+	var frozen: bool = p_body.freeze if p_body.get_meta("net_sim", true) else p_body.get_meta("net_frozen", false)
+	return {"scene": p_body.scene_file_path, "shape": p_body.shape.to_dict(), "props": props,
+			"position": _wrapped(p_body.global_position), "turn": p_body.global_basis.get_rotation_quaternion(),
+			"velocity": p_body.linear_velocity, "spin": p_body.angular_velocity, "frozen": frozen, "pose": p_body.pose}
+
+## Finds objects made here (thrown, dropped, P, imported, cut off) and gives
+## them ids, and objects removed here (X, broken, fallen out), and tells
+## everyone. Previews and the floating piece aren't pickable: left out.
+func _scan_bodies() -> void:
+	for id in bodies.keys():
+		var b = bodies[id]
+		if not is_instance_valid(b) or not b.is_inside_tree() or b.is_queued_for_deletion():
+			bodies.erase(id)
+			_despawn.rpc(id)
+	var me := multiplayer.get_unique_id()
+	for parent in [world.balls, world.camera.get_parent()]:
+		for b in parent.get_children():
+			if b is DensityBody3D and not b is DensityCharacter3D and b.pickable and b.shape != null \
+					and not b.has_meta("net_id") and not b.has_meta("net_avatar") and not b.is_queued_for_deletion():
+				next_body += 1
+				var id := "%d:%d" % [me, next_body]
+				b.set_meta("net_id", id)
+				b.set_meta("net_owner", me)
+				b.set_meta("net_sim", true)
+				b.set_meta("net_shape", [b.shape, b.shape.get_version()])
+				bodies[id] = b
+				_spawn.rpc(id, me, _describe(b))
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _spawn(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_spawn_now.bind(p_id, p_owner, p_desc))
+		return
+	_spawn_now(p_id, p_owner, p_desc)
+
+func _spawn_now(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
+	if bodies.has(p_id):
+		return
+	var shape := DensityShape.from_dict(p_desc.shape)
+	var b: DensityBody3D
+	if p_desc.scene != "":
+		b = load(p_desc.scene).instantiate()
+		world.camera.get_parent().add_child(b)
+		b.shape = shape
+	else:
+		b = world.balls.add_shape_body(shape, Vector3.ZERO)
+	for key in p_desc.props:
+		b.set(key, p_desc.props[key])
+	b.set_meta("net_id", p_id)
+	b.set_meta("net_owner", p_owner)
+	b.set_meta("net_sim", true)
+	b.set_meta("net_shape", [b.shape, b.shape.get_version()])
+	bodies[p_id] = b
+	b.global_transform = Transform3D(Basis(p_desc.turn), _nearest_repeat(p_desc.position))
+	b.linear_velocity = p_desc.velocity
+	b.angular_velocity = p_desc.spin
+	b.pose = p_desc.pose
+	b.freeze = p_desc.frozen
+	_simulate_here(b, p_owner == multiplayer.get_unique_id())
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _despawn(p_id: String) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_despawn.bind(p_id))
+		return
+	var b = bodies.get(p_id)
+	bodies.erase(p_id)
+	if b != null and is_instance_valid(b):
+		world.balls.remove(b)
+
+## Where the objects simulated here are (the moving ones often, the ones at
+## rest now and then), and their shapes when sculpted.
+func _send_bodies() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	var batch := []
+	var send_shapes := shape_timer >= SHAPE_INTERVAL
+	if send_shapes:
+		shape_timer = 0.0
+	for id in bodies:
+		var b = bodies[id]  # (untyped: it may have been freed since the last scan)
+		if not is_instance_valid(b) or not b.get_meta("net_sim", false):
+			continue
+		if send_shapes:
+			var seen: Array = b.get_meta("net_shape", [null, -1])
+			if seen[0] != b.shape or seen[1] != b.shape.get_version():
+				b.set_meta("net_shape", [b.shape, b.shape.get_version()])
+				_shape.rpc(id, b.shape.to_dict())
+		var resting: bool = b.sleeping or b.freeze
+		if resting and now - float(b.get_meta("net_sent", -100.0)) < REST_INTERVAL:
+			continue
+		b.set_meta("net_sent", now)
+		batch.append_array([id, _wrapped(b.global_position), b.global_basis.get_rotation_quaternion(),
+				b.linear_velocity, b.pose, b.freeze])
+	if not batch.is_empty():
+		_states.rpc(batch)
+
+@rpc("any_peer", "call_remote", "unreliable_ordered", 2)
+func _states(p_batch: Array) -> void:
+	if not ready_for_bodies:
+		return
+	for i in range(0, p_batch.size() - 5, 6):
+		var b = bodies.get(p_batch[i])
+		if b == null or not is_instance_valid(b) or b.get_meta("net_sim", false):
+			continue  # unknown yet, or simulated here (a hand-over on its way)
+		b.set_meta("net_target", p_batch[i + 1])
+		b.set_meta("net_turn", p_batch[i + 2])
+		b.linear_velocity = p_batch[i + 3]  # what objects here bounce off
+		b.pose = p_batch[i + 4]
+		b.set_meta("net_frozen", p_batch[i + 5])
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _shape(p_id: String, p_shape: Dictionary) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_shape.bind(p_id, p_shape))
+		return
+	var b = bodies.get(p_id)
+	if b == null or not is_instance_valid(b):
+		return
+	b.shape = DensityShape.from_dict(p_shape)
+	b.set_meta("net_shape", [b.shape, b.shape.get_version()])
+
+func _update_bodies(p_delta: float, p_k: float) -> void:
+	scan_timer += p_delta
+	if scan_timer >= SCAN_INTERVAL:
+		scan_timer = 0.0
+		_scan_bodies()
+	shape_timer += p_delta
+	body_timer += p_delta
+	if body_timer >= BODY_INTERVAL:
+		body_timer = 0.0
+		_send_bodies()
+	# Copies glide towards where their owners have them.
+	for b in bodies.values():
+		if not is_instance_valid(b) or b.get_meta("net_sim", false) or not b.has_meta("net_target"):
+			continue
+		var target := _nearest_repeat(b.get_meta("net_target"))
+		var turn: Quaternion = b.get_meta("net_turn")
+		if b.global_position.distance_to(target) > 50.0:
+			b.global_transform = Transform3D(Basis(turn), target)
+		else:
+			var q: Quaternion = b.global_basis.get_rotation_quaternion().slerp(turn, p_k)
+			b.global_transform = Transform3D(Basis(q), b.global_position.lerp(target, p_k))
+
+
 # --- Players ---------------------------------------------------------------------------
 
 func _on_peer_disconnected(p_id: int) -> void:
 	print("Network: player %d left" % p_id)
 	_remove_remote(p_id)
 	outgoing.erase(p_id)
+	if multiplayer.is_server():
+		# Their objects: simulated here from now on.
+		for id in bodies.keys():
+			var b = bodies[id]
+			if is_instance_valid(b) and b.get_meta("net_owner", 0) == p_id:
+				b.set_meta("net_owner", 1)
+				_simulate_here(b, true)
+				_set_owner.rpc(id, 1)
 
 func _on_server_disconnected() -> void:
 	if not synced:
@@ -305,6 +567,12 @@ func _on_server_disconnected() -> void:
 	unconfirmed.clear()
 	for id in remotes.keys():
 		_remove_remote(id)
+	for b in bodies.values():  # everything is ours now
+		if is_instance_valid(b):
+			_simulate_here(b, true)
+			for key in ["net_id", "net_owner", "net_sim", "net_frozen", "net_target", "net_turn", "net_shape", "net_sent"]:
+				b.remove_meta(key)
+	bodies.clear()
 	multiplayer.multiplayer_peer = null
 	mode = Mode.OFFLINE
 
@@ -325,7 +593,13 @@ func _player_state(p_position: Vector3, p_yaw: float, p_height: float, p_name: S
 		_shape_remote(r)
 
 func _add_remote(p_id: int) -> void:
-	var node := Node3D.new()
+	# A frozen body (spheres up a capsule) so objects bounce off other
+	# players; not pickable, so brushes and the physics gun ignore it.
+	var node := DensityBody3D.new()
+	node.freeze = true
+	node.pickable = false
+	node.drawn = false
+	node.set_meta("net_avatar", p_id)
 	node.name = "RemotePlayer%d" % p_id
 	var mesh := MeshInstance3D.new()
 	mesh.name = "Body"
@@ -364,6 +638,11 @@ func _shape_remote(p_r: Dictionary) -> void:
 	p_r.eye.position = Vector3(0, h * 0.85, -radius)
 	p_r.label.position = Vector3.UP * (h + radius)
 	p_r.label.text = p_r.name
+	var spheres := PackedVector4Array()
+	var count := maxi(2, ceili(h / radius))
+	for i in count:
+		spheres.append(Vector4(0.0, lerpf(radius, h - radius, float(i) / (count - 1)), 0.0, radius))
+	p_r.node.spheres = spheres
 
 func _remove_remote(p_id: int) -> void:
 	if remotes.has(p_id):
@@ -394,14 +673,19 @@ func _process(delta: float) -> void:
 	# Glide towards the latest positions (updates come 20 times a second).
 	var k := 1.0 - exp(-delta * 15.0)
 	for r in remotes.values():
-		var node: Node3D = r.node
+		var node: DensityBody3D = r.node
 		var target: Vector3 = _nearest_repeat(r.target)
 		if not r.placed or node.global_position.distance_to(target) > 50.0:
 			node.global_position = target  # first update, or a jump
+			node.linear_velocity = Vector3.ZERO
 			r.placed = true
 		else:
-			node.global_position = node.global_position.lerp(target, k)
+			var before := node.global_position
+			node.global_position = before.lerp(target, k)
+			node.linear_velocity = (node.global_position - before) / maxf(delta, 1e-4)  # what objects bounce off
 		node.rotation.y = lerp_angle(node.rotation.y, r.yaw, k)
+	if ready_for_bodies:
+		_update_bodies(delta, k)
 
 ## A line for the HUD: who is here.
 func hud_text() -> String:
@@ -410,7 +694,12 @@ func hud_text() -> String:
 	var names := PackedStringArray([player_name + " (you)"])
 	for r in remotes.values():
 		names.append(r.name)
-	return "%s   Players: %s   Edits sent %d, received %d" % [status, ", ".join(names), batches_sent, batches_received]
+	var here := 0
+	for b in bodies.values():
+		if is_instance_valid(b) and b.get_meta("net_sim", false):
+			here += 1
+	return "%s   Players: %s   Edits sent %d, received %d   Objects %d (%d simulated here)" % [
+			status, ", ".join(names), batches_sent, batches_received, bodies.size(), here]
 
 
 # --- Coordinates ------------------------------------------------------------------

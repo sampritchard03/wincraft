@@ -1,5 +1,5 @@
 ---
-title: 12. Multiplayer (planned design; steps 1-2 built)
+title: 12. Multiplayer (planned design; steps 1-3 built)
 ---
 flowchart TB
     subgraph S1["Step 1: shared world and players (built: network.gd)"]
@@ -14,10 +14,11 @@ flowchart TB
         owner2 -->|"ordered batch to everyone<br/>(the sender's comes back as a receipt)"| all2["Every computer applies them in order;<br/>own unconfirmed batches re-applied on top<br/>so all copies end up identical"]
     end
 
-    subgraph S3["Step 3: shared physics"]
+    subgraph S3["Step 3: shared physics (built: network.gd)"]
         direction LR
-        rowner["Region owner simulates<br/>balls, frogs, objects in it"] -->|"body states"| others3["Everyone else<br/>shows them"]
-        rowner -->|"body crosses border:<br/>hand it to the next owner"| next3["Neighbouring region owner"]
+        make3["Whoever makes an object owns it<br/>(F, G, P, import, cut-off pieces);<br/>using one takes it over<br/>(physics gun, sculpting, object editor)"] --> rowner["Owner simulates it<br/>(frogs: and runs their AI)"]
+        rowner -->|"position, turn, velocity, pose<br/>20x/s moving, 1x/s at rest;<br/>shape when sculpted"| others3["Everyone else: a frozen copy<br/>that follows (its velocity set,<br/>so their objects bounce off it)"]
+        leave3["A player leaves"] -->|"host takes over<br/>their objects"| rowner
     end
 
     subgraph S4["Step 4: spreading the load"]

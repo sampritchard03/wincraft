@@ -58,12 +58,14 @@ func remove(p_body: Node) -> void:
 ## p_player are put away (kept only as data, saved with the rest) and ones
 ## within load_distance come back, at whichever repeat of the wrapping world
 ## is nearest the player. Balls that fell out of the world break.
-func stream(p_player: Vector3) -> void:
+## p_unload false (multiplayer): only the breaking.
+func stream(p_player: Vector3, p_unload := true) -> void:
 	for i in range(balls.size() - 1, -1, -1):
 		var ball := balls[i]
 		if ball.global_position.y < -terrain.world_height * 0.5 - 64.0:
-			_break(ball)
-		elif _offset_from(p_player, ball.global_position).length() > unload_distance:
+			if not ball.freeze:  # (a frozen copy of another player's ball follows them)
+				_break(ball)
+		elif p_unload and _offset_from(p_player, ball.global_position).length() > unload_distance:
 			unloaded.append(_entry_of(ball))
 			balls.remove_at(i)
 			ball.queue_free()
@@ -73,6 +75,13 @@ func stream(p_player: Vector3) -> void:
 			var entry: Dictionary = unloaded[i]
 			unloaded.remove_at(i)
 			_restore(entry, p_player + d)
+
+## Brings every put-away ball back, each at the repeat of the wrapping world
+## nearest p_player (multiplayer keeps them all loaded).
+func load_all(p_player: Vector3) -> void:
+	for entry in unloaded:
+		_restore(entry, p_player + _offset_from(p_player, entry.get("position", Vector3.ZERO)))
+	unloaded.clear()
 
 func save(p_path: String) -> void:
 	var list := unloaded.duplicate()

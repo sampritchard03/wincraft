@@ -124,6 +124,7 @@ func open_aimed() -> void:
 func open(p_body: DensityBody3D) -> void:
 	if active:
 		close()
+	world.network.take(p_body)  # (multiplayer: edited here, so simulated here)
 	body = p_body
 	active = true
 	was_frozen = body.freeze

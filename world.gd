@@ -315,6 +315,7 @@ func _finish_ready(p_start: int) -> void:
 	_make_symmetry_visuals()
 	if network.mode == Network.Mode.HOST:
 		network.start_host()
+	network.world_ready()
 
 ## The block textures as one texture array (a layer per material, in
 ## material_names order), with mipmaps for distant ground. A missing
@@ -475,6 +476,7 @@ func _input(event: InputEvent) -> void:
 			var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
 			if not aimed.is_empty():
 				var body: DensityBody3D = aimed.body
+				network.take(body)  # (multiplayer: it's simulated here from now on)
 				if event.button_index == MOUSE_BUTTON_RIGHT:
 					# Freeze where it is, or let it go again.
 					body.freeze = not body.freeze
@@ -770,7 +772,9 @@ func _physics_process(delta: float) -> void:
 	# Bodies (balls, frogs) are stepped by the terrain itself, after this
 	# (it is a child of this node); the player moves here.
 	_wrap_player()
-	balls.stream(player.global_position)
+	# Online, every object stays loaded (each is simulated by one player's
+	# computer; see network.gd); only ones that fell out of the world go.
+	balls.stream(player.global_position, not network.is_online())
 
 	var facing := -camera.global_basis.z
 	facing = Vector3(facing.x, 0.0, facing.z).normalized()
@@ -1033,6 +1037,7 @@ func _drag(p_target: Vector3) -> Vector3:
 
 ## Holds a body still while it's sculpted (see held_body).
 func _hold_body(p_body: DensityBody3D) -> void:
+	network.take(p_body)  # (multiplayer: sculpted here, so simulated here)
 	held_body = p_body
 	held_was_frozen = p_body.freeze
 	p_body.freeze = true

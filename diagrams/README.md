@@ -58,19 +58,20 @@ and the timeline animates `pose`.
 Run from a terminal with `--headless --script bake_frog.gd` after editing the
 model in Blender.
 
-## [12. Multiplayer (planned design; steps 1-2 built)](12-multiplayer.mmd)
+## [12. Multiplayer (planned design; steps 1-3 built)](12-multiplayer.mmd)
 
 Peer-to-peer with region ownership: the world is split into 256-voxel
 regions (32x32 on an 8192 world), each owned by one player's computer, which
 orders edits and simulates physics there, so the work is spread across
-everyone. Steps 1 and 2 are built (`network.gd`):
+everyone. Steps 1-3 are built (`network.gd`):
 
     godot-4 --path . -- --host [--port 24565] [--name Sam]
     godot-4 --path . -- --join 192.168.1.20[:24565] [--name Alex]
 
 The joining player generates the host's world from its settings, receives
 its edited chunks, and plays unsaved; everyone sees each other as coloured
-capsules with names. Sculpting is shared: every tool's changes (and undo /
-redo) go out as the voxel values they changed, which the host puts in one
-order for everyone, so all copies stay identical. Balls and frogs aren't
-shared yet.
+capsules with names, which objects bounce off. Sculpting is shared: every
+tool's changes (and undo / redo) go out as the voxel values they changed,
+which the host puts in one order for everyone. Physics is shared: each
+ball, frog and object is simulated by one computer (whoever made it, or
+last used it), and the others show a copy that follows it.
