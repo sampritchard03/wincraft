@@ -203,6 +203,20 @@ public:
 	// if needed. False outside the world.
 	bool read_chunk(const Vector3i &p_chunk, std::vector<int8_t> &r_density, std::vector<MaterialId> &r_materials) const;
 
+	// Change tracking (multiplayer): while on, the first edit_chunk() of a
+	// chunk since the last take_changes() keeps a copy of its points as they
+	// were, so the changes can be worked out and sent. Suppressed while
+	// applying changes that came from elsewhere.
+	struct ChangedChunk {
+		Vector3i chunk; // wrapped
+		std::vector<int8_t> density; // before the changes
+		std::vector<MaterialId> materials;
+	};
+	void set_change_tracking(bool p_on);
+	bool is_change_tracking() const { return track_changes; }
+	void set_changes_suppressed(bool p_on) { suppress_changes = p_on; }
+	void take_changes(std::vector<ChangedChunk> &r_changes);
+
 	// Full-detail density / material at a point.
 	int8_t point(int x, int y, int z) const;
 	MaterialId point_material(int x, int y, int z) const;
@@ -312,6 +326,9 @@ private:
 	String dir; // absolute; empty = not saving
 
 	mutable std::vector<Chunk> chunks; // every chunk of the world (chunk_index()); loaded on demand
+	bool track_changes = false;
+	bool suppress_changes = false;
+	std::unordered_map<Vector3i, ChangedChunk, Vector3iHash> changes; // see take_changes()
 	struct RegionIndex {
 		int version = 0;
 		std::vector<RegionEntry> entries;

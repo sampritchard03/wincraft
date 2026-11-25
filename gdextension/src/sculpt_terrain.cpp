@@ -576,7 +576,9 @@ bool SculptTerrain::set_chunk_data(const Vector3i &p_chunk, const PackedByteArra
 	const int64_t expected = (int64_t)VoxelWorld::CHUNK_POINTS * 3;
 	const PackedByteArray raw = p_data.decompress(expected, FileAccess::COMPRESSION_ZSTD);
 	ERR_FAIL_COND_V_MSG(raw.size() != expected, false, "SculptTerrain.set_chunk_data(): not a chunk's data.");
+	world.set_changes_suppressed(true);
 	const VoxelWorld::ChunkData chunk = world.edit_chunk(p_chunk);
+	world.set_changes_suppressed(false);
 	if (chunk.density == nullptr) {
 		return false;
 	}
@@ -584,6 +586,118 @@ bool SculptTerrain::set_chunk_data(const Vector3i &p_chunk, const PackedByteArra
 	std::memcpy(chunk.density, r, VoxelWorld::CHUNK_POINTS);
 	for (int i = 0; i < VoxelWorld::CHUNK_POINTS; i++) {
 		chunk.material[i] = (MaterialId)(r[VoxelWorld::CHUNK_POINTS + i * 2] | (r[VoxelWorld::CHUNK_POINTS + i * 2 + 1] << 8));
+	}
+	world.update_mips(p_chunk);
+	const Vector3i lo = p_chunk * CH, hi = lo + Vector3i(CH - 1, CH - 1, CH - 1);
+	clipmap.refresh(world, lo, hi);
+	mark_edited(lo, hi);
+	return true;
+}
+
+// A change: 4 bytes (little endian) of its size uncompressed, then zstd of:
+// kind 0 (some points: a uint32 count, then per point a uint16 index, int8
+// density and uint16 material) or kind 1 (the whole chunk: every density,
+// then every material).
+namespace {
+void put_u16(uint8_t *p, uint16_t v) {
+	p[0] = (uint8_t)(v & 0xff);
+	p[1] = (uint8_t)(v >> 8);
+}
+uint16_t get_u16(const uint8_t *p) {
+	return (uint16_t)(p[0] | (p[1] << 8));
+}
+} // namespace
+
+Array SculptTerrain::take_changes() {
+	std::vector<VoxelWorld::ChangedChunk> changed;
+	world.take_changes(changed);
+	Array out;
+	std::vector<int8_t> density;
+	std::vector<MaterialId> materials;
+	std::vector<uint16_t> points;
+	const int N = VoxelWorld::CHUNK_POINTS;
+	for (const VoxelWorld::ChangedChunk &before : changed) {
+		if (!world.read_chunk(before.chunk, density, materials)) {
+			continue;
+		}
+		points.clear();
+		for (int i = 0; i < N; i++) {
+			if (density[i] != before.density[i] || materials[i] != before.materials[i]) {
+				points.push_back((uint16_t)i);
+			}
+		}
+		if (points.empty()) {
+			continue;
+		}
+		PackedByteArray raw;
+		if (points.size() * 5 + 5 < (size_t)N * 3 + 1) {
+			raw.resize((int64_t)(5 + points.size() * 5));
+			uint8_t *w = raw.ptrw();
+			w[0] = 0;
+			const uint32_t count = (uint32_t)points.size();
+			std::memcpy(w + 1, &count, 4);
+			uint8_t *p = w + 5;
+			for (uint16_t i : points) {
+				put_u16(p, i);
+				p[2] = (uint8_t)density[i];
+				put_u16(p + 3, materials[i]);
+				p += 5;
+			}
+		} else {
+			raw.resize((int64_t)N * 3 + 1);
+			uint8_t *w = raw.ptrw();
+			w[0] = 1;
+			std::memcpy(w + 1, density.data(), N);
+			for (int i = 0; i < N; i++) {
+				put_u16(w + 1 + N + i * 2, materials[i]);
+			}
+		}
+		const PackedByteArray packed = raw.compress(FileAccess::COMPRESSION_ZSTD);
+		PackedByteArray change;
+		change.resize(4 + packed.size());
+		const uint32_t size = (uint32_t)raw.size();
+		std::memcpy(change.ptrw(), &size, 4);
+		std::memcpy(change.ptrw() + 4, packed.ptr(), packed.size());
+		out.push_back(before.chunk);
+		out.push_back(change);
+	}
+	return out;
+}
+
+bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray &p_change) {
+	const int CH = VoxelWorld::CHUNK;
+	const int N = VoxelWorld::CHUNK_POINTS;
+	ERR_FAIL_COND_V(p_change.size() < 4, false);
+	uint32_t size = 0;
+	std::memcpy(&size, p_change.ptr(), 4);
+	ERR_FAIL_COND_V(size < 1 || size > (uint32_t)N * 3 + 1, false);
+	const PackedByteArray raw = p_change.slice(4).decompress(size, FileAccess::COMPRESSION_ZSTD);
+	ERR_FAIL_COND_V_MSG(raw.size() != (int64_t)size, false, "SculptTerrain.apply_change(): damaged change.");
+	const uint8_t *r = raw.ptr();
+	world.set_changes_suppressed(true);
+	const VoxelWorld::ChunkData chunk = world.edit_chunk(p_chunk);
+	world.set_changes_suppressed(false);
+	if (chunk.density == nullptr) {
+		return false;
+	}
+	if (r[0] == 0) {
+		uint32_t count = 0;
+		std::memcpy(&count, r + 1, 4);
+		ERR_FAIL_COND_V((int64_t)count * 5 + 5 != raw.size(), false);
+		const uint8_t *p = r + 5;
+		for (uint32_t k = 0; k < count; k++, p += 5) {
+			const uint16_t i = get_u16(p);
+			if (i < N) {
+				chunk.density[i] = (int8_t)p[2];
+				chunk.material[i] = get_u16(p + 3);
+			}
+		}
+	} else {
+		ERR_FAIL_COND_V(raw.size() != (int64_t)N * 3 + 1, false);
+		std::memcpy(chunk.density, r + 1, N);
+		for (int i = 0; i < N; i++) {
+			chunk.material[i] = get_u16(r + 1 + N + i * 2);
+		}
 	}
 	world.update_mips(p_chunk);
 	const Vector3i lo = p_chunk * CH, hi = lo + Vector3i(CH - 1, CH - 1, CH - 1);
@@ -1743,6 +1857,10 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_edited_chunks"), &SculptTerrain::get_edited_chunks);
 	ClassDB::bind_method(D_METHOD("get_chunk_data", "chunk"), &SculptTerrain::get_chunk_data);
 	ClassDB::bind_method(D_METHOD("set_chunk_data", "chunk", "data"), &SculptTerrain::set_chunk_data);
+	ClassDB::bind_method(D_METHOD("set_change_tracking", "on"), &SculptTerrain::set_change_tracking);
+	ClassDB::bind_method(D_METHOD("is_change_tracking"), &SculptTerrain::is_change_tracking);
+	ClassDB::bind_method(D_METHOD("take_changes"), &SculptTerrain::take_changes);
+	ClassDB::bind_method(D_METHOD("apply_change", "chunk", "change"), &SculptTerrain::apply_change);
 	ClassDB::bind_method(D_METHOD("save_world"), &SculptTerrain::save_world);
 	ClassDB::bind_method(D_METHOD("update_view", "camera_position", "wait"), &SculptTerrain::update_view, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material"), &SculptTerrain::apply_brush, DEFVAL(-1));

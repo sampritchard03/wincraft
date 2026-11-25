@@ -26,4 +26,5 @@ flowchart TD
         R5 --> R6["Sync prepass camera"]
         R6 --> R7{"30 s passed?"}
         R7 -- yes --> R8["Save player + objects"]
+        R5 --> RN["network.gd _process (online):<br/>send player position (20x/s),<br/>send terrain changes (10x/s),<br/>move other players' avatars"]
     end

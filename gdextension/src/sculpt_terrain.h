@@ -135,6 +135,16 @@ public:
 	TypedArray<Vector3i> get_edited_chunks() const;
 	PackedByteArray get_chunk_data(const Vector3i &p_chunk) const;
 	bool set_chunk_data(const Vector3i &p_chunk, const PackedByteArray &p_data);
+	// Change tracking: while on, take_changes() returns what every edit since
+	// the last call changed (any tool, undo and redo too), as
+	// [chunk, change, chunk, change...]: each change the points that differ
+	// (their new density and material), compressed. apply_change() writes one
+	// (on another player's computer) without it counting as a change there,
+	// or as an undo step.
+	void set_change_tracking(bool p_on) { world.set_change_tracking(p_on); }
+	bool is_change_tracking() const { return world.is_change_tracking(); }
+	Array take_changes();
+	bool apply_change(const Vector3i &p_chunk, const PackedByteArray &p_change);
 	// Writes all changes now. Returns false if a write failed.
 	bool save_world();
 	// Moves the clipmap to follow p_camera_position, uploads changed levels,

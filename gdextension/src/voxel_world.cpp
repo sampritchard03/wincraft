@@ -1132,6 +1132,19 @@ VoxelWorld::ChunkData VoxelWorld::edit_chunk(const Vector3i &p_chunk) {
 	if (chunk == nullptr) {
 		return { nullptr, nullptr };
 	}
+	if (track_changes && !suppress_changes) {
+		const Vector3i key = wrap_chunk(p_chunk);
+		if (changes.find(key) == changes.end()) {
+			ChangedChunk &before = changes[key];
+			before.chunk = key;
+			before.density.resize(CHUNK_POINTS);
+			before.materials.resize(CHUNK_POINTS);
+			for (size_t i = 0; i < (size_t)CHUNK_POINTS; i++) {
+				before.density[i] = chunk_density(*chunk, i);
+				before.materials[i] = chunk_material(*chunk, i);
+			}
+		}
+	}
 	if (chunk->uniform()) {
 		chunk->full.assign(CHUNK_POINTS, chunk->uniform_density);
 		chunk->full_materials.assign(CHUNK_POINTS, chunk->uniform_material);
@@ -1573,6 +1586,22 @@ bool VoxelWorld::save() {
 		ok &= write_region(r);
 	}
 	return ok;
+}
+
+void VoxelWorld::set_change_tracking(bool p_on) {
+	track_changes = p_on;
+	if (!p_on) {
+		changes.clear();
+	}
+}
+
+void VoxelWorld::take_changes(std::vector<ChangedChunk> &r_changes) {
+	r_changes.clear();
+	r_changes.reserve(changes.size());
+	for (auto &[key, before] : changes) {
+		r_changes.push_back(std::move(before));
+	}
+	changes.clear();
 }
 
 void VoxelWorld::edited_chunk_list(std::vector<Vector3i> &r_chunks) const {

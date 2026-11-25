@@ -1,5 +1,6 @@
 extends Node
-## Multiplayer, step 1: a shared world and each other's players.
+## Multiplayer, steps 1 and 2: a shared world, each other's players, and
+## shared sculpting.
 ##
 ## Start the game with arguments after "--":
 ##   godot-4 --path . -- --host [--port 24565] [--name Sam]
@@ -12,7 +13,17 @@ extends Node
 ## computer moves its own player and sends where it is to the others about
 ## 20 times a second; other players show as coloured capsules with names.
 ##
-## Sculpting, physics objects and frogs aren't shared yet (steps 2 and 3 of
+## Sculpting (step 2): every tool's changes to the terrain (and undo / redo)
+## are shared as the voxel values they changed, not as brush strokes:
+## SculptTerrain's change tracking records which points each edit changed,
+## and every EDIT_INTERVAL they go out as a batch (a few KB per chunk). The
+## host puts every batch in one order and sends it to everyone (its own
+## straight away; a joining player's back to them too, as a receipt). Each
+## computer applies them in that order, so all copies end up the same:
+## exact values, so nothing drifts. Your own edits show at once; a batch from
+## someone else that the host ordered before yours is applied under your
+## unconfirmed batches (they're put back on top), as it will be everywhere.
+## Physics objects and frogs aren't shared yet (step 3 of
 ## diagrams/12-multiplayer.mmd).
 ##
 ## Positions go over the network in wrapped world coordinates (x and z in
@@ -28,6 +39,7 @@ const DEFAULT_PORT := 24565
 const MAX_PLAYERS := 8
 const SEND_INTERVAL := 0.05  # seconds between player updates
 const CHUNKS_PER_FRAME := 8  # sent to a joining player each frame
+const EDIT_INTERVAL := 0.1  # seconds between batches of terrain changes
 
 enum Mode { OFFLINE, HOST, CLIENT }
 
@@ -44,10 +56,18 @@ var host_spawn := Vector3.ZERO
 var chunks_expected := -1
 var chunks_received := 0
 var synced := false
-var pending_chunks: Array = []  # [coords, data] batches that came before the world was open
+var early: Array[Callable] = []  # world data that came before the world was open, in order
 
 ## Host: chunks still to send to each joining peer.
 var outgoing: Dictionary = {}  # peer id -> Array[Vector3i]
+
+## Sculpting: this computer's batches the host hasn't sent back yet
+## ([id, changes]; joining players only), and counts for the HUD.
+var unconfirmed: Array = []
+var next_batch_id := 0
+var edit_timer := 0.0
+var batches_sent := 0
+var batches_received := 0
 
 ## Other players: peer id -> {"node", "label", "target", "yaw", "height", "name"}.
 var remotes: Dictionary = {}
@@ -103,6 +123,7 @@ func start_host() -> void:
 	multiplayer.multiplayer_peer = peer
 	multiplayer.peer_connected.connect(_on_peer_connected)
 	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+	world.terrain.set_change_tracking(true)
 	status = "Hosting on port %d" % port
 	print("Network: ", status)
 
@@ -179,7 +200,7 @@ func _welcome(p_settings: Dictionary, p_host_position: Vector3, p_chunk_count: i
 @rpc("authority", "call_remote", "reliable", 1)
 func _chunks(p_coords: Array, p_data: Array) -> void:
 	if not world.terrain.is_world_open():
-		pending_chunks.append([p_coords, p_data])  # (the settings come on another channel)
+		early.append(_apply_chunks.bind(p_coords, p_data))  # (the settings come on another channel)
 		return
 	_apply_chunks(p_coords, p_data)
 
@@ -192,18 +213,79 @@ func _apply_chunks(p_coords: Array, p_data: Array) -> void:
 
 ## world.gd: the world is open with host_settings.
 func world_opened() -> void:
-	for batch in pending_chunks:
-		_apply_chunks(batch[0], batch[1])
-	pending_chunks.clear()
+	for call in early:
+		call.call()
+	early.clear()
 	_check_synced()
 
 func _check_synced() -> void:
 	if synced or chunks_expected < 0 or chunks_received < chunks_expected or not world.terrain.is_world_open():
 		return
 	synced = true
+	world.terrain.set_change_tracking(true)  # from now on, our edits are shared
 	status = "Joined %s:%d" % [address, port]
 	print("Network: ", status)
 	joined.emit()
+
+
+# --- Sculpting ---------------------------------------------------------------------------
+
+## Sends what this computer's edits changed since last time (to the host, or
+## from the host straight to everyone).
+func _flush_edits() -> void:
+	if not world.terrain.is_change_tracking():
+		return
+	var changes: Array = world.terrain.take_changes()
+	if changes.is_empty() or multiplayer.multiplayer_peer == null:
+		return
+	if mode == Mode.HOST:
+		if not multiplayer.get_peers().is_empty():
+			_edits.rpc(1, 0, changes)
+			batches_sent += 1
+	else:
+		batches_sent += 1
+		next_batch_id += 1
+		unconfirmed.append([next_batch_id, changes])
+		_submit_edits.rpc_id(1, next_batch_id, changes)
+
+## A joining player's batch, to the host: it takes its place in the order.
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _submit_edits(p_batch_id: int, p_changes: Array) -> void:
+	if not multiplayer.is_server():
+		return
+	var sender := multiplayer.get_remote_sender_id()
+	_flush_edits()  # the host's own edits so far come first
+	_apply_changes(p_changes)
+	batches_received += 1
+	_edits.rpc(sender, p_batch_id, p_changes)  # to everyone (the sender: as a receipt)
+
+## A batch in the host's order (p_origin: whose it was).
+@rpc("authority", "call_remote", "reliable", 1)
+func _edits(p_origin: int, p_batch_id: int, p_changes: Array) -> void:
+	if not world.terrain.is_world_open():
+		early.append(_apply_edits.bind(p_origin, p_batch_id, p_changes))
+		return
+	_apply_edits(p_origin, p_batch_id, p_changes)
+
+func _apply_edits(p_origin: int, p_batch_id: int, p_changes: Array) -> void:
+	if p_origin == multiplayer.get_unique_id():
+		# Ours, now in the order: already applied here.
+		for i in unconfirmed.size():
+			if unconfirmed[i][0] == p_batch_id:
+				unconfirmed.remove_at(i)
+				break
+		return
+	# Our own edits so far become a batch first (so they're kept on top too),
+	# then this goes under everything of ours the host hasn't ordered yet.
+	_flush_edits()
+	_apply_changes(p_changes)
+	for batch in unconfirmed:
+		_apply_changes(batch[1])
+	batches_received += 1
+
+func _apply_changes(p_changes: Array) -> void:
+	for i in range(0, p_changes.size() - 1, 2):
+		world.terrain.apply_change(p_changes[i], p_changes[i + 1])
 
 
 # --- Players ---------------------------------------------------------------------------
@@ -219,6 +301,8 @@ func _on_server_disconnected() -> void:
 		return
 	status = "The host left: playing on alone (unsaved)"
 	print("Network: ", status)
+	world.terrain.set_change_tracking(false)
+	unconfirmed.clear()
 	for id in remotes.keys():
 		_remove_remote(id)
 	multiplayer.multiplayer_peer = null
@@ -297,6 +381,10 @@ func _process(delta: float) -> void:
 	if mode == Mode.CLIENT and not synced:
 		world.info_label.text = status  # (world.gd isn't running yet)
 		return
+	edit_timer += delta
+	if edit_timer >= EDIT_INTERVAL:
+		edit_timer = 0.0
+		_flush_edits()
 	if not is_instance_valid(world.player):
 		return
 	send_timer += delta
@@ -322,7 +410,7 @@ func hud_text() -> String:
 	var names := PackedStringArray([player_name + " (you)"])
 	for r in remotes.values():
 		names.append(r.name)
-	return "%s   Players: %s" % [status, ", ".join(names)]
+	return "%s   Players: %s   Edits sent %d, received %d" % [status, ", ".join(names), batches_sent, batches_received]
 
 
 # --- Coordinates ------------------------------------------------------------------

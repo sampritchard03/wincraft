@@ -1,5 +1,5 @@
 ---
-title: 12. Multiplayer (planned design; step 1 built)
+title: 12. Multiplayer (planned design; steps 1-2 built)
 ---
 flowchart TB
     subgraph S1["Step 1: shared world and players (built: network.gd)"]
@@ -8,11 +8,10 @@ flowchart TB
         host1 <-->|"each player's position 20x a second<br/>(wrapped coordinates; the host relays)"| join1
     end
 
-    subgraph S2["Step 2: shared sculpting (next)"]
+    subgraph S2["Step 2: shared sculpting (built: change tracking + network.gd)"]
         direction LR
-        brush["Your brush<br/>applied at once locally"] -->|"edit command<br/>(centre, radius, mode, material)"| owner2["Owner of the region<br/>it lands in: numbers it"]
-        owner2 -->|"numbered edit to everyone"| all2["Every computer applies<br/>edits in number order"]
-        owner2 -.->|"per-chunk checksums;<br/>mismatched chunks re-sent"| all2
+        brush["Any tool, undo or redo<br/>applied at once locally"] -->|"every 0.1 s: the voxel values<br/>it changed (per chunk, compressed)"| owner2["Host (later: region owner)<br/>puts batches in one order"]
+        owner2 -->|"ordered batch to everyone<br/>(the sender's comes back as a receipt)"| all2["Every computer applies them in order;<br/>own unconfirmed batches re-applied on top<br/>so all copies end up identical"]
     end
 
     subgraph S3["Step 3: shared physics"]

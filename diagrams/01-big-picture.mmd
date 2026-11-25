@@ -23,7 +23,7 @@ flowchart TB
         network["Network<br/>network.gd: host / join,<br/>other players' avatars"]
     end
     worldNode --> player & balls & editor & frogs & floating & network
-    network <-->|ENet: settings, chunks,<br/>player positions| peers[("Other players' games")]
+    network <-->|ENet: settings, chunks,<br/>player positions, terrain changes| peers[("Other players' games")]
 
     subgraph "C++ extension (wincraft_native)"
         ST["SculptTerrain<br/>brushes, selection, undo,<br/>steps all bodies, update_view"]

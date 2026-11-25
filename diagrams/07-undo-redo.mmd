@@ -22,3 +22,5 @@ flowchart TD
         U5 -- selection --> U8["restore sel_before"]
         U6 & U7 & U8 --> U9["move entry to future (redo)"]
     end
+
+    U6 -.->|"online: its voxel changes are<br/>shared like any edit (diagram 12)"| NET7["Other players"]
