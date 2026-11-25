@@ -34,7 +34,25 @@ extends Node
 ## a player who leaves. New and removed objects are found by looking (every
 ## SCAN_INTERVAL), so every way of making or removing one is covered. Other
 ## players are solid: frozen capsules that objects bounce off. Online, every
-## object stays loaded (bouncy_balls.gd's streaming waits for step 4).
+## object stays loaded (a frozen copy costs almost nothing).
+##
+## Spreading the load (step 4): the world's x / z plane is split into
+## REGION-voxel squares, and the host (the directory) gives each region with
+## objects in it to a player: at first the nearest one. Every REBALANCE_INTERVAL
+## it compares each computer's load (moving objects, frogs counting extra)
+## with how fast that computer is (a short benchmark of the native code each
+## runs once; and a computer whose physics nears its frame budget counts as
+## more loaded) and, past IMBALANCE, moves the overloaded computer's region
+## nearest the least loaded one's player over to it. Objects go to the owner
+## of the region they are in (so things near each other are simulated
+## together), except while someone is using one (physics gun, sculpting,
+## object editor: a short lease, renewed every frame by use()). Owners send
+## fast updates only to players within INTEREST_RADIUS of an object; the rest
+## get one a second.
+##
+## Terrain edits stay in the host's one order: every computer applies every
+## edit anyway (each keeps the whole world), so ordering them per region
+## would spread no work, only add ways for copies to differ.
 ##
 ## Positions go over the network in wrapped world coordinates (x and z in
 ## [0, world_size)): world.gd moves its coordinates by whole world sizes to
@@ -97,6 +115,31 @@ var scan_timer := 0.0
 var shape_timer := 0.0
 var ready_for_bodies := false
 var early_bodies: Array[Callable] = []
+
+## Regions (step 4). The host keeps region_owners (region -> peer id) and
+## each peer's speed; everyone gets the region counts for the HUD.
+const REGION := 256  # voxels a side
+const REBALANCE_INTERVAL := 2.0
+const RECONCILE_INTERVAL := 0.5
+const REPORT_INTERVAL := 2.0
+const IMBALANCE := 1.2  # move a region when one computer has 20% more load than another (for its speed)
+const LEASE := 1.0  # seconds an object stays with whoever last used it
+const INTEREST_RADIUS := 512.0  # players nearer an object than this get its fast updates
+const FROG_WEIGHT := 2.0  # a frog (AI) counts as this many balls
+var region_owners: Dictionary = {}  # Vector2i -> peer id (host)
+var region_loads: Dictionary = {}  # Vector2i -> load (host, last rebalance)
+var peer_speed: Dictionary = {}  # peer id -> benchmark score (host)
+var peer_strain: Dictionary = {}  # peer id -> >= 1: how far its physics time is over BUSY of its budget (host)
+var speed_score := 0.0  # this computer's benchmark (see _benchmark())
+const BUSY := 0.6  # of the physics frame budget
+const STATES_PER_PACKET := 12  # (~100 bytes each; unreliable packets over ~1400 bytes get lost more)
+var regions_mine := 0  # (everyone, from the host) for the HUD
+var regions_total := 0
+var load_mine := 0.0
+var rebalance_timer := 0.0
+var reconcile_timer := 0.0
+var report_timer := 0.0
+var regions_moved := 0
 
 ## Other players: peer id -> {"node", "label", "target", "yaw", "height", "name"}.
 var remotes: Dictionary = {}
@@ -333,9 +376,18 @@ func world_ready() -> void:
 		call.call()
 	early_bodies.clear()
 
-## Simulate an object here from now on (the physics gun, sculpting it, the
-## object editor): this computer takes it over at once, and the host tells
-## everyone (if two players grab it at once, the host's order decides).
+## Using an object (the physics gun, sculpting it, the object editor): call
+## every frame while in use. It's simulated here from now on, and isn't
+## handed to its region's owner until LEASE seconds after the last call.
+func use(p_body: DensityBody3D) -> void:
+	if mode == Mode.OFFLINE or not is_instance_valid(p_body) or not p_body.has_meta("net_id"):
+		return
+	p_body.set_meta("net_lease", _now())
+	take(p_body)
+
+## Simulate an object here from now on: this computer takes it over at once,
+## and the host tells everyone (if two players grab it at once, the host's
+## order decides).
 func take(p_body: DensityBody3D) -> void:
 	if mode == Mode.OFFLINE or not p_body.has_meta("net_id"):
 		return
@@ -468,14 +520,20 @@ func _despawn(p_id: String) -> void:
 	if b != null and is_instance_valid(b):
 		world.balls.remove(b)
 
-## Where the objects simulated here are (the moving ones often, the ones at
-## rest now and then), and their shapes when sculpted.
+## Where the objects simulated here are, and their shapes when sculpted.
+## Moving ones: every BODY_INTERVAL to players within INTEREST_RADIUS, every
+## REST_INTERVAL to the rest; ones at rest: every REST_INTERVAL to everyone.
+## A state: id, wrapped position, turn, velocity, spin, pose, flags (1 frozen,
+## 2 sleeping, 4 in use).
 func _send_bodies() -> void:
-	var now := Time.get_ticks_msec() / 1000.0
-	var batch := []
+	var now := _now()
 	var send_shapes := shape_timer >= SHAPE_INTERVAL
 	if send_shapes:
 		shape_timer = 0.0
+	var peers := multiplayer.get_peers()
+	var batches := {}  # peer id -> Array
+	for peer in peers:
+		batches[peer] = []
 	for id in bodies:
 		var b = bodies[id]  # (untyped: it may have been freed since the last scan)
 		if not is_instance_valid(b) or not b.get_meta("net_sim", false):
@@ -486,27 +544,54 @@ func _send_bodies() -> void:
 				b.set_meta("net_shape", [b.shape, b.shape.get_version()])
 				_shape.rpc(id, b.shape.to_dict())
 		var resting: bool = b.sleeping or b.freeze
-		if resting and now - float(b.get_meta("net_sent", -100.0)) < REST_INTERVAL:
+		var everyone: bool = now - float(b.get_meta("net_sent", -100.0)) >= REST_INTERVAL
+		if resting and not everyone:
 			continue
-		b.set_meta("net_sent", now)
-		batch.append_array([id, _wrapped(b.global_position), b.global_basis.get_rotation_quaternion(),
-				b.linear_velocity, b.pose, b.freeze])
-	if not batch.is_empty():
-		_states.rpc(batch)
+		if everyone:
+			b.set_meta("net_sent", now)
+		var flags := (1 if b.freeze else 0) | (2 if b.sleeping else 0) | (4 if _in_use(b) else 0)
+		var state := [id, _wrapped(b.global_position), b.global_basis.get_rotation_quaternion(),
+				b.linear_velocity, b.angular_velocity, b.pose, flags]
+		for peer in peers:
+			if everyone or _peer_near(peer, b.global_position):
+				batches[peer].append_array(state)
+	for peer in batches:
+		var batch: Array = batches[peer]
+		var size := 7 * STATES_PER_PACKET
+		for from in range(0, batch.size(), size):
+			_states.rpc_id(peer, batch.slice(from, from + size))
+
+func _peer_near(p_peer: int, p_position: Vector3) -> bool:
+	var r = remotes.get(p_peer)
+	if r == null or not r.placed:
+		return true  # (where they are isn't known yet)
+	return r.node.global_position.distance_to(p_position) < INTEREST_RADIUS
+
+func _in_use(p_body: Node) -> bool:
+	if p_body.get_meta("net_sim", false):
+		return _now() - float(p_body.get_meta("net_lease", -100.0)) < LEASE
+	return p_body.get_meta("net_in_use", false)
+
+func _now() -> float:
+	return Time.get_ticks_msec() / 1000.0
 
 @rpc("any_peer", "call_remote", "unreliable_ordered", 2)
 func _states(p_batch: Array) -> void:
 	if not ready_for_bodies:
 		return
-	for i in range(0, p_batch.size() - 5, 6):
+	for i in range(0, p_batch.size() - 6, 7):
 		var b = bodies.get(p_batch[i])
 		if b == null or not is_instance_valid(b) or b.get_meta("net_sim", false):
 			continue  # unknown yet, or simulated here (a hand-over on its way)
 		b.set_meta("net_target", p_batch[i + 1])
 		b.set_meta("net_turn", p_batch[i + 2])
 		b.linear_velocity = p_batch[i + 3]  # what objects here bounce off
-		b.pose = p_batch[i + 4]
-		b.set_meta("net_frozen", p_batch[i + 5])
+		b.angular_velocity = p_batch[i + 4]  # (kept, for a hand-over)
+		b.pose = p_batch[i + 5]
+		var flags: int = p_batch[i + 6]
+		b.set_meta("net_frozen", flags & 1 != 0)
+		b.set_meta("net_sleeping", flags & 2 != 0)
+		b.set_meta("net_in_use", flags & 4 != 0)
 
 @rpc("any_peer", "call_remote", "reliable", 1)
 func _shape(p_id: String, p_shape: Dictionary) -> void:
@@ -529,6 +614,25 @@ func _update_bodies(p_delta: float, p_k: float) -> void:
 	if body_timer >= BODY_INTERVAL:
 		body_timer = 0.0
 		_send_bodies()
+	report_timer += p_delta
+	if report_timer >= REPORT_INTERVAL:
+		report_timer = 0.0
+		if speed_score <= 0.0:
+			speed_score = _benchmark()
+		var physics_ms := Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0
+		if multiplayer.is_server():
+			_take_report(1, speed_score, physics_ms)
+		else:
+			_report.rpc_id(1, speed_score, physics_ms)
+	if multiplayer.is_server():
+		reconcile_timer += p_delta
+		if reconcile_timer >= RECONCILE_INTERVAL:
+			reconcile_timer = 0.0
+			_reconcile()
+		rebalance_timer += p_delta
+		if rebalance_timer >= REBALANCE_INTERVAL:
+			rebalance_timer = 0.0
+			_rebalance()
 	# Copies glide towards where their owners have them.
 	for b in bodies.values():
 		if not is_instance_valid(b) or b.get_meta("net_sim", false) or not b.has_meta("net_target"):
@@ -540,6 +644,180 @@ func _update_bodies(p_delta: float, p_k: float) -> void:
 		else:
 			var q: Quaternion = b.global_basis.get_rotation_quaternion().slerp(turn, p_k)
 			b.global_transform = Transform3D(Basis(q), b.global_position.lerp(target, p_k))
+
+
+# --- Regions and load (step 4) -------------------------------------------------------
+
+func _region_of(p_position: Vector3) -> Vector2i:
+	var w := _wrapped(p_position)
+	return Vector2i(floori(w.x / REGION), floori(w.z / REGION))
+
+func _region_centre(p_region: Vector2i) -> Vector3:
+	return Vector3((p_region.x + 0.5) * REGION, 0.0, (p_region.y + 0.5) * REGION)
+
+## How much simulating an object costs, roughly: moving ones 1 (frogs more,
+## for their AI), ones at rest almost nothing.
+func _body_load(p_body: Node) -> float:
+	var at_rest: bool
+	if p_body.get_meta("net_sim", false):
+		at_rest = p_body.sleeping or p_body.freeze
+	else:
+		at_rest = p_body.get_meta("net_sleeping", false) or p_body.get_meta("net_frozen", false)
+	var weight := FROG_WEIGHT if p_body.scene_file_path != "" else 1.0
+	return weight * (0.05 if at_rest else 1.0)
+
+## How fast this computer runs the native code the physics uses: shapes
+## made per millisecond (the best of a few tries, so a hiccup doesn't count).
+func _benchmark() -> float:
+	var best := 0.0
+	for attempt in 5:
+		var t0 := Time.get_ticks_usec()
+		for i in 6:
+			DensityShape.make_sphere(9.0, 2).get_volume()
+		var ms := (Time.get_ticks_usec() - t0) / 1000.0
+		best = maxf(best, 6.0 / maxf(ms, 0.001))
+	print("Network: speed score %.2f" % best)
+	return best
+
+## Each computer, every REPORT_INTERVAL: its speed and its physics time.
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _report(p_speed: float, p_physics_ms: float) -> void:
+	if multiplayer.is_server():
+		_take_report(multiplayer.get_remote_sender_id(), p_speed, p_physics_ms)
+
+func _take_report(p_peer: int, p_speed: float, p_physics_ms: float) -> void:
+	peer_speed[p_peer] = p_speed
+	var budget_ms := 1000.0 / Engine.physics_ticks_per_second
+	peer_strain[p_peer] = maxf(1.0, p_physics_ms / (budget_ms * BUSY))
+
+## A peer's speed relative to the others (1 = average; unknown = average).
+func _relative_speed(p_peer: int, p_peers: Array) -> float:
+	var known := []
+	for peer in p_peers:
+		if peer_speed.get(peer, 0.0) > 0.0:
+			known.append(peer_speed[peer])
+	var speed: float = peer_speed.get(p_peer, 0.0)
+	if known.is_empty() or speed <= 0.0:
+		return 1.0
+	var mean := 0.0
+	for k in known:
+		mean += k
+	mean /= known.size()
+	return clampf(speed / mean, 0.25, 4.0)
+
+## Where each player is (wrapped), for giving out regions.
+func _player_positions() -> Dictionary:
+	var where := {multiplayer.get_unique_id(): _wrapped(world.player.global_position)}
+	for id in remotes:
+		var r: Dictionary = remotes[id]
+		if r.placed:
+			where[id] = _wrapped(r.node.global_position)
+	return where
+
+## The player nearest a region (the short way round the wrapping world).
+func _nearest_player(p_region: Vector2i, p_where: Dictionary) -> int:
+	var size := float(world.terrain.get_world_size())
+	var centre := _region_centre(p_region)
+	var best := 1
+	var best_d := INF
+	for peer in p_where:
+		var d: Vector3 = p_where[peer] - centre
+		d.x = fposmod(d.x + size * 0.5, size) - size * 0.5
+		d.z = fposmod(d.z + size * 0.5, size) - size * 0.5
+		d.y = 0.0
+		if d.length() < best_d:
+			best_d = d.length()
+			best = peer
+	return best
+
+## Host: every object goes to its region's owner (a region nobody has yet:
+## the nearest player), unless someone is using it.
+func _reconcile() -> void:
+	var where := _player_positions()
+	var peers := [1] + Array(multiplayer.get_peers())
+	for region in region_owners.keys():
+		if not peers.has(region_owners[region]):
+			region_owners.erase(region)  # (they left)
+	for id in bodies:
+		var b = bodies[id]
+		if not is_instance_valid(b) or _in_use(b):
+			continue
+		var region := _region_of(b.global_position)
+		if not region_owners.has(region):
+			region_owners[region] = _nearest_player(region, where)
+		var owner: int = region_owners[region]
+		if b.get_meta("net_owner", 1) != owner:
+			_set_owner_now(id, owner)
+			_set_owner.rpc(id, owner)
+
+## Host: regions with objects, and their load; then, if one computer has
+## IMBALANCE times the load of another (each divided by its speed), its
+## region nearest the less loaded player moves over (one per rebalance, so
+## it settles gently).
+func _rebalance() -> void:
+	var peers := [1] + Array(multiplayer.get_peers())
+	region_loads.clear()
+	for b in bodies.values():
+		if is_instance_valid(b):
+			var region := _region_of(b.global_position)
+			region_loads[region] = region_loads.get(region, 0.0) + _body_load(b)
+	for region in region_owners.keys():
+		if not region_loads.has(region):
+			region_owners.erase(region)  # empty: given out again when something arrives
+	var load_of := {}
+	for peer in peers:
+		load_of[peer] = 0.0
+	for region in region_owners:
+		var owner: int = region_owners[region]
+		if load_of.has(owner):
+			load_of[owner] += region_loads.get(region, 0.0)
+	if peers.size() > 1:
+		var relative := func(peer: int) -> float: return load_of[peer] / _relative_speed(peer, peers) * peer_strain.get(peer, 1.0)
+		var over: int = peers[0]
+		var under: int = peers[0]
+		for peer in peers:
+			if relative.call(peer) > relative.call(over):
+				over = peer
+			if relative.call(peer) < relative.call(under):
+				under = peer
+		var worst: float = relative.call(over)
+		if over != under and worst > 0.5 and worst > relative.call(under) * IMBALANCE:
+			var where := _player_positions()
+			var target: Vector3 = where.get(under, Vector3.ZERO)
+			var best = null
+			var best_d := INF
+			for region in region_owners:
+				if region_owners[region] != over:
+					continue
+				var moved: float = region_loads.get(region, 0.0)
+				var after := maxf((load_of[over] - moved) / _relative_speed(over, peers) * peer_strain.get(over, 1.0),
+						(load_of[under] + moved) / _relative_speed(under, peers) * peer_strain.get(under, 1.0))
+				if after >= worst - 0.01:
+					continue  # moving this one wouldn't help
+				var d := Vector2(_region_centre(region).x - target.x, _region_centre(region).z - target.z).length()
+				if d < best_d:
+					best_d = d
+					best = region
+			if best != null:
+				region_owners[best] = under
+				regions_moved += 1
+				_reconcile()
+	# Everyone's share, for the HUD.
+	for peer in peers:
+		var count := 0
+		for region in region_owners:
+			if region_owners[region] == peer:
+				count += 1
+		if peer == 1:
+			_region_summary(count, region_owners.size(), load_of[peer])
+		else:
+			_region_summary.rpc_id(peer, count, region_owners.size(), load_of[peer])
+
+@rpc("authority", "call_remote", "unreliable")
+func _region_summary(p_mine: int, p_total: int, p_load: float) -> void:
+	regions_mine = p_mine
+	regions_total = p_total
+	load_mine = p_load
 
 
 # --- Players ---------------------------------------------------------------------------
@@ -698,8 +976,8 @@ func hud_text() -> String:
 	for b in bodies.values():
 		if is_instance_valid(b) and b.get_meta("net_sim", false):
 			here += 1
-	return "%s   Players: %s   Edits sent %d, received %d   Objects %d (%d simulated here)" % [
-			status, ", ".join(names), batches_sent, batches_received, bodies.size(), here]
+	return "%s   Players: %s   Edits sent %d, received %d   Objects %d (%d simulated here)   Regions %d of %d, load %.1f" % [
+			status, ", ".join(names), batches_sent, batches_received, bodies.size(), here, regions_mine, regions_total, load_mine]
 
 
 # --- Coordinates ------------------------------------------------------------------

@@ -476,7 +476,7 @@ func _input(event: InputEvent) -> void:
 			var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
 			if not aimed.is_empty():
 				var body: DensityBody3D = aimed.body
-				network.take(body)  # (multiplayer: it's simulated here from now on)
+				network.use(body)  # (multiplayer: it's simulated here while used)
 				if event.button_index == MOUSE_BUTTON_RIGHT:
 					# Freeze where it is, or let it go again.
 					body.freeze = not body.freeze
@@ -916,6 +916,11 @@ func _sculpt(delta: float) -> void:
 		brush_preview.global_position = hit
 		brush_preview.scale = Vector3.ONE * brush_radius
 
+	# Multiplayer: a body being sculpted or dragged stays with us meanwhile.
+	if held_body != null:
+		network.use(held_body)
+	if drag_body != null:
+		network.use(drag_body)
 	_select(hit, sculpting)
 	_extrude(hit, held)
 	var mode := -1
@@ -1037,7 +1042,7 @@ func _drag(p_target: Vector3) -> Vector3:
 
 ## Holds a body still while it's sculpted (see held_body).
 func _hold_body(p_body: DensityBody3D) -> void:
-	network.take(p_body)  # (multiplayer: sculpted here, so simulated here)
+	network.use(p_body)  # (multiplayer: sculpted here, so simulated here)
 	held_body = p_body
 	held_was_frozen = p_body.freeze
 	p_body.freeze = true
@@ -1230,6 +1235,7 @@ func _update_physics_gun(p_delta: float) -> void:
 	if not is_instance_valid(gun_body) or tool != Tool.PHYSICS_GUN or not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		gun_body = null
 		return
+	network.use(gun_body)  # (multiplayer: stays with us while held)
 	var target := camera.global_position - camera.global_basis.z * gun_distance
 	var point := gun_body.to_global(gun_point)
 	if gun_body.freeze:

@@ -34,7 +34,7 @@ flowchart TD
     end
 
     subgraph Online["Online (network.gd, diagram 12)"]
-        O1["Each object simulated on one computer: its owner"] --> O2["Other computers: frozen copy following<br/>the owner's updates; frog AI off"]
+        O1["Each object simulated on one computer: the owner<br/>of its region (or whoever is using it)"] --> O2["Other computers: frozen copy following<br/>the owner's updates; frog AI off"]
         O3["Other players: frozen capsules<br/>objects bounce off"]
     end
     Step -.-> Online

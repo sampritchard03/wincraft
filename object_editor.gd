@@ -124,7 +124,7 @@ func open_aimed() -> void:
 func open(p_body: DensityBody3D) -> void:
 	if active:
 		close()
-	world.network.take(p_body)  # (multiplayer: edited here, so simulated here)
+	world.network.use(p_body)  # (multiplayer: edited here, so simulated here)
 	body = p_body
 	active = true
 	was_frozen = body.freeze
@@ -185,6 +185,7 @@ func _process(_delta: float) -> void:
 	if not is_instance_valid(body):
 		close()
 		return
+	world.network.use(body)  # (multiplayer: stays with us while edited)
 	if playing and is_instance_valid(player):
 		if player.is_playing():
 			time = player.current_animation_position
