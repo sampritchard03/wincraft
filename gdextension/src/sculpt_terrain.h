@@ -12,6 +12,8 @@
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/aabb.hpp>
 #include <godot_cpp/variant/array.hpp>
+#include <godot_cpp/variant/typed_array.hpp>
+#include <godot_cpp/variant/vector3i.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
 #include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
@@ -119,6 +121,20 @@ public:
 	// Opens the world at save_path (empty = don't save). Returns false (and
 	// prints why) if it can't, in which case the world still runs, unsaved.
 	bool open_world();
+
+	// --- Sharing the world (multiplayer) --------------------------------------
+	// Every generator setting (world type, seed, sizes, noise...), as the
+	// open world has them: set them on another player's terrain before its
+	// open_world() and it generates the same ground.
+	Dictionary get_world_settings() const;
+	void set_world_settings(const Dictionary &p_settings);
+	// The chunks holding edits (wrapped chunk coordinates: multiply by 32 for
+	// voxels), and one chunk's points, zstd-compressed (densities, then
+	// materials as 16-bit little-endian ids). set_chunk_data() replaces a
+	// chunk with such data and redraws it; it isn't an undo step.
+	TypedArray<Vector3i> get_edited_chunks() const;
+	PackedByteArray get_chunk_data(const Vector3i &p_chunk) const;
+	bool set_chunk_data(const Vector3i &p_chunk, const PackedByteArray &p_data);
 	// Writes all changes now. Returns false if a write failed.
 	bool save_world();
 	// Moves the clipmap to follow p_camera_position, uploads changed levels,

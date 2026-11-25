@@ -1575,6 +1575,35 @@ bool VoxelWorld::save() {
 	return ok;
 }
 
+void VoxelWorld::edited_chunk_list(std::vector<Vector3i> &r_chunks) const {
+	r_chunks.clear();
+	const int64_t plane = (int64_t)chunk_counts.x * chunk_counts.z;
+	for (size_t i = 0; i < chunks.size(); i++) {
+		if (!chunks[i].edited) {
+			continue;
+		}
+		const int64_t n = (int64_t)i;
+		const int x = (int)(n % chunk_counts.x);
+		const int z = (int)((n / chunk_counts.x) % chunk_counts.z);
+		const int y = (int)(n / plane) + y_min() / CHUNK;
+		r_chunks.push_back(Vector3i(x, y, z));
+	}
+}
+
+bool VoxelWorld::read_chunk(const Vector3i &p_chunk, std::vector<int8_t> &r_density, std::vector<MaterialId> &r_materials) const {
+	const Chunk *chunk = loaded_chunk(p_chunk);
+	if (chunk == nullptr) {
+		return false;
+	}
+	r_density.resize(CHUNK_POINTS);
+	r_materials.resize(CHUNK_POINTS);
+	for (size_t i = 0; i < (size_t)CHUNK_POINTS; i++) {
+		r_density[i] = chunk_density(*chunk, i);
+		r_materials[i] = chunk_material(*chunk, i);
+	}
+	return true;
+}
+
 int VoxelWorld::get_edited_chunk_count() const {
 	int count = 0;
 	for (const Chunk &chunk : chunks) {

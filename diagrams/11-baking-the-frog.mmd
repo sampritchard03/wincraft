@@ -1,0 +1,10 @@
+---
+title: 11. Baking the frog (offline tool, bake_frog.gd)
+---
+flowchart LR
+    A["forg.glb<br/>(Blender model)"] --> B["forg_model.tscn<br/>animated mesh"]
+    B --> C["bake_frog.gd:<br/>sample poses idle, jump_start, jump"]
+    C --> D["DensityShape.bake_meshes()<br/>one density key per pose"]
+    D --> E[("forg_shape.res")]
+    D --> F["Rebuild forg.tscn:<br/>DensityBody3D + AnimationPlayer<br/>animating 'pose' between keys"]
+    E --> F

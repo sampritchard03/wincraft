@@ -1,0 +1,34 @@
+---
+title: 12. Multiplayer (planned design; step 1 built)
+---
+flowchart TB
+    subgraph S1["Step 1: shared world and players (built: network.gd)"]
+        direction LR
+        host1["Host<br/>its saved world"] -->|"join: world settings<br/>+ edited chunks"| join1["Joining player<br/>generates the same world,<br/>applies the chunks, plays unsaved"]
+        host1 <-->|"each player's position 20x a second<br/>(wrapped coordinates; the host relays)"| join1
+    end
+
+    subgraph S2["Step 2: shared sculpting (next)"]
+        direction LR
+        brush["Your brush<br/>applied at once locally"] -->|"edit command<br/>(centre, radius, mode, material)"| owner2["Owner of the region<br/>it lands in: numbers it"]
+        owner2 -->|"numbered edit to everyone"| all2["Every computer applies<br/>edits in number order"]
+        owner2 -.->|"per-chunk checksums;<br/>mismatched chunks re-sent"| all2
+    end
+
+    subgraph S3["Step 3: shared physics"]
+        direction LR
+        rowner["Region owner simulates<br/>balls, frogs, objects in it"] -->|"body states"| others3["Everyone else<br/>shows them"]
+        rowner -->|"body crosses border:<br/>hand it to the next owner"| next3["Neighbouring region owner"]
+    end
+
+    subgraph S4["Step 4: spreading the load"]
+        direction LR
+        dir["Directory<br/>(host; another takes over<br/>if it leaves)"] -->|"assign regions by load score<br/>(bodies + edits, per computer speed)<br/>prefer players nearby,<br/>move only past ~20% imbalance"| peers4["Each player's computer<br/>owns some of the 32x32 regions"]
+    end
+
+    subgraph S5["Step 5: finishing"]
+        direction LR
+        undo["Per-player undo<br/>(own strokes only)"] ~~~ save["Saving each region's edits"] ~~~ drop["Recovering when<br/>a player drops out"]
+    end
+
+    S1 --> S2 --> S3 --> S4 --> S5

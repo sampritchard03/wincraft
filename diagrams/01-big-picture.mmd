@@ -1,0 +1,49 @@
+---
+title: 1. Big picture
+---
+flowchart TB
+    subgraph Scenes
+        game["game.tscn<br/>(main scene)"] --> worldScene["world.tscn"]
+        worldScene --> worldNode["World (Node)<br/>script: world.gd"]
+        worldNode --> terrainNode["Terrain<br/>SculptTerrain (C++)"]
+        worldNode --> screen["Screen: 320x180 SubViewport<br/>scaled up, chunky pixels"]
+        screen --> cam["Camera3D"]
+        screen --> view["TerrainView<br/>full-screen quad + terrain.gdshader"]
+        screen --> prepass["Prepass SubViewport 160x90<br/>terrain_prepass.gdshader"]
+        screen --> brush["BrushPreview sphere"]
+        worldNode --> hud["HUD: crosshair + info text"]
+    end
+
+    subgraph "Created at runtime by world.gd"
+        player["Player<br/>DensityCharacter3D (C++)"]
+        balls["BouncyBalls<br/>bouncy_balls.gd"]
+        editor["ObjectEditor<br/>object_editor.gd"]
+        frogs["Frogs<br/>forg.tscn + forg.gd"]
+        floating["Floating piece / previews<br/>DensityBody3D"]
+        network["Network<br/>network.gd: host / join,<br/>other players' avatars"]
+    end
+    worldNode --> player & balls & editor & frogs & floating & network
+    network <-->|ENet: settings, chunks,<br/>player positions| peers[("Other players' games")]
+
+    subgraph "C++ extension (wincraft_native)"
+        ST["SculptTerrain<br/>brushes, selection, undo,<br/>steps all bodies, update_view"]
+        VW["VoxelWorld<br/>whole wrapping world in 32^3 chunks,<br/>generation, save/load"]
+        CM["Clipmap<br/>nested LOD textures around camera<br/>for the shader"]
+        NO["noise<br/>island / ground generator"]
+        DB["DensityBody3D / DensityCharacter3D<br/>custom physics against density field"]
+        DS["DensityShape<br/>small density grid + pose keys"]
+        SEL["selection<br/>bitmask of selected voxels"]
+    end
+    terrainNode -.is.-> ST
+    ST --> VW --> NO
+    ST --> CM
+    ST --> SEL
+    ST -->|physics step| DB
+    DB --> DS
+    player -.is.-> DB
+    balls --> DB
+    frogs -.is.-> DB
+
+    CM -->|textures| view
+    ST -->|body atlas| view
+    VW <-->|region files| disk[("user://torus<br/>world + player.cfg + objects.cfg")]

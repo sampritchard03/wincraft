@@ -5,6 +5,7 @@
 #include "parallel.h"
 
 #include <godot_cpp/classes/time.hpp>
+#include <godot_cpp/classes/file_access.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/error_macros.hpp>
 #include <godot_cpp/classes/engine.hpp>
@@ -498,6 +499,97 @@ void SculptTerrain::shift_origin(const Vector3i &p_offset) {
 	DensityBody3D::shift_all(Vector3(p_offset));
 	shift_selection(p_offset);
 	bind_material();
+}
+
+Dictionary SculptTerrain::get_world_settings() const {
+	const IslandSettings &s = island_settings;
+	Dictionary d;
+	d["world_type"] = s.world_type;
+	d["seed"] = s.seed;
+	d["world_size"] = s.world_size;
+	d["world_height"] = s.world_height;
+	d["cell_size"] = s.cell_size;
+	d["island_chance"] = s.island_chance;
+	d["min_radius"] = s.min_radius;
+	d["max_radius"] = s.max_radius;
+	d["detail"] = s.detail;
+	d["detail_frequency"] = s.detail_frequency;
+	d["octaves"] = s.octaves;
+	d["terrain_height"] = s.terrain_height;
+	d["terrain_scale"] = s.terrain_scale;
+	d["caves"] = s.caves;
+	d["sea_level"] = s.sea_level;
+	d["terrain_version"] = s.terrain_version;
+	return d;
+}
+
+void SculptTerrain::set_world_settings(const Dictionary &p_settings) {
+	IslandSettings &s = island_settings;
+	s.world_type = p_settings.get("world_type", s.world_type);
+	s.seed = p_settings.get("seed", s.seed);
+	s.world_size = p_settings.get("world_size", s.world_size);
+	s.world_height = p_settings.get("world_height", s.world_height);
+	s.cell_size = p_settings.get("cell_size", s.cell_size);
+	s.island_chance = (float)(double)p_settings.get("island_chance", s.island_chance);
+	s.min_radius = (float)(double)p_settings.get("min_radius", s.min_radius);
+	s.max_radius = (float)(double)p_settings.get("max_radius", s.max_radius);
+	s.detail = (float)(double)p_settings.get("detail", s.detail);
+	s.detail_frequency = (float)(double)p_settings.get("detail_frequency", s.detail_frequency);
+	s.octaves = p_settings.get("octaves", s.octaves);
+	s.terrain_height = (float)(double)p_settings.get("terrain_height", s.terrain_height);
+	s.terrain_scale = (float)(double)p_settings.get("terrain_scale", s.terrain_scale);
+	s.caves = p_settings.get("caves", s.caves);
+	s.sea_level = (float)(double)p_settings.get("sea_level", s.sea_level);
+	s.terrain_version = p_settings.get("terrain_version", s.terrain_version);
+}
+
+TypedArray<Vector3i> SculptTerrain::get_edited_chunks() const {
+	std::vector<Vector3i> list;
+	world.edited_chunk_list(list);
+	TypedArray<Vector3i> out;
+	out.resize((int64_t)list.size());
+	for (size_t i = 0; i < list.size(); i++) {
+		out[(int64_t)i] = list[i];
+	}
+	return out;
+}
+
+PackedByteArray SculptTerrain::get_chunk_data(const Vector3i &p_chunk) const {
+	std::vector<int8_t> density;
+	std::vector<MaterialId> materials;
+	if (!world.read_chunk(p_chunk, density, materials)) {
+		return PackedByteArray();
+	}
+	PackedByteArray raw;
+	raw.resize((int64_t)VoxelWorld::CHUNK_POINTS * 3);
+	uint8_t *w = raw.ptrw();
+	std::memcpy(w, density.data(), VoxelWorld::CHUNK_POINTS);
+	for (int i = 0; i < VoxelWorld::CHUNK_POINTS; i++) {
+		w[VoxelWorld::CHUNK_POINTS + i * 2] = (uint8_t)(materials[i] & 0xff);
+		w[VoxelWorld::CHUNK_POINTS + i * 2 + 1] = (uint8_t)(materials[i] >> 8);
+	}
+	return raw.compress(FileAccess::COMPRESSION_ZSTD);
+}
+
+bool SculptTerrain::set_chunk_data(const Vector3i &p_chunk, const PackedByteArray &p_data) {
+	const int CH = VoxelWorld::CHUNK;
+	const int64_t expected = (int64_t)VoxelWorld::CHUNK_POINTS * 3;
+	const PackedByteArray raw = p_data.decompress(expected, FileAccess::COMPRESSION_ZSTD);
+	ERR_FAIL_COND_V_MSG(raw.size() != expected, false, "SculptTerrain.set_chunk_data(): not a chunk's data.");
+	const VoxelWorld::ChunkData chunk = world.edit_chunk(p_chunk);
+	if (chunk.density == nullptr) {
+		return false;
+	}
+	const uint8_t *r = raw.ptr();
+	std::memcpy(chunk.density, r, VoxelWorld::CHUNK_POINTS);
+	for (int i = 0; i < VoxelWorld::CHUNK_POINTS; i++) {
+		chunk.material[i] = (MaterialId)(r[VoxelWorld::CHUNK_POINTS + i * 2] | (r[VoxelWorld::CHUNK_POINTS + i * 2 + 1] << 8));
+	}
+	world.update_mips(p_chunk);
+	const Vector3i lo = p_chunk * CH, hi = lo + Vector3i(CH - 1, CH - 1, CH - 1);
+	clipmap.refresh(world, lo, hi);
+	mark_edited(lo, hi);
+	return true;
 }
 
 void SculptTerrain::mark_edited(const Vector3i &p_min, const Vector3i &p_max) {
@@ -1646,6 +1738,11 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_thread_count"), &SculptTerrain::get_thread_count);
 
 	ClassDB::bind_method(D_METHOD("open_world"), &SculptTerrain::open_world);
+	ClassDB::bind_method(D_METHOD("get_world_settings"), &SculptTerrain::get_world_settings);
+	ClassDB::bind_method(D_METHOD("set_world_settings", "settings"), &SculptTerrain::set_world_settings);
+	ClassDB::bind_method(D_METHOD("get_edited_chunks"), &SculptTerrain::get_edited_chunks);
+	ClassDB::bind_method(D_METHOD("get_chunk_data", "chunk"), &SculptTerrain::get_chunk_data);
+	ClassDB::bind_method(D_METHOD("set_chunk_data", "chunk", "data"), &SculptTerrain::set_chunk_data);
 	ClassDB::bind_method(D_METHOD("save_world"), &SculptTerrain::save_world);
 	ClassDB::bind_method(D_METHOD("update_view", "camera_position", "wait"), &SculptTerrain::update_view, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material"), &SculptTerrain::apply_brush, DEFVAL(-1));

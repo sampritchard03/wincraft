@@ -1,0 +1,27 @@
+---
+title: 6. Selection, transform and copy/paste
+---
+stateDiagram-v2
+    [*] --> NoSelection
+    NoSelection --> Selected: Select paint / fill / geometry (7)
+    Selected --> NoSelection: Backspace
+    Selected --> Selected: Extrude (8) drags it outwards
+    Selected --> PhysicsObject: P (cut out, becomes a body)
+    Selected --> File: Ctrl+P export DensityShape
+    Selected --> Clipboard: Ctrl+C
+    Selected --> Floating: Transform tool (8 twice) lifts it out
+    Clipboard --> Floating: Ctrl+V paste
+    File --> PhysicsObject: Ctrl+O import
+    File --> Floating: Ctrl+Shift+O import to paste
+
+    state Floating {
+        [*] --> Move
+        Move --> Rotate: T
+        Rotate --> Scale: T
+        Scale --> Move: T
+    }
+    Floating --> Selected: Enter (stamped back into terrain)
+    Floating --> NoSelection: Shift+Enter (carves its shape out)
+    Floating --> Selected: Ctrl+Z past first move (put back where lifted)
+
+    PhysicsObject --> [*]

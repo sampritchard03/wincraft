@@ -1,0 +1,24 @@
+---
+title: 7. Undo / redo
+---
+flowchart TD
+    subgraph Recording["_record_history() each frame"]
+        A1["terrain.get_undo_serial()<br/>advanced?"] -- yes --> A2["push {terrain: true}<br/>per finished stroke"]
+        A3["Selection serial changed<br/>and mouse released?"] -- yes --> A4{"Came with a<br/>terrain step?"}
+        A4 -- yes --> A5["attach sel_before / sel_after<br/>to that entry"]
+        A4 -- no --> A6["push {selection: true}"]
+        A7["Body sculpt"] --> A8["push {body, before, after, parts}"]
+        A9["Gizmo move"] --> A10["push {floating, before, after}"]
+    end
+
+    subgraph Undo["Ctrl+Z"]
+        U0{"Piece floating?"} -- yes --> U1{"Last entry is<br/>its move?"}
+        U1 -- yes --> U2["restore its transform"]
+        U1 -- no --> U3["cancel lift: put it back"]
+        U0 -- no --> U4["pop entry"]
+        U4 --> U5{"Kind"}
+        U5 -- terrain --> U6["terrain.undo()"]
+        U5 -- body --> U7["shape = before,<br/>remove split-off parts"]
+        U5 -- selection --> U8["restore sel_before"]
+        U6 & U7 & U8 --> U9["move entry to future (redo)"]
+    end

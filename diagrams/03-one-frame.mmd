@@ -1,0 +1,29 @@
+---
+title: 3. One frame
+---
+flowchart TD
+    subgraph "_input (per event)"
+        I0{"ObjectEditor.handle_input<br/>took it?"} -- yes --> Iend([done])
+        I0 -- no --> I1["Mouse move: yaw / pitch camera"]
+        I0 -- no --> I2["Mouse button: capture mouse, physics gun,<br/>box/geometry clicks, gizmo, middle-click pick,<br/>wheel = radius / strength / size"]
+        I0 -- no --> I3["Keys: tools, undo/redo, copy/paste,<br/>spawn ball/frog, symmetry, ..."]
+    end
+
+    subgraph "_physics_process (fixed rate)"
+        P1["_wrap_player()<br/>shift everything by world size<br/>when past half-way"] --> P2["balls.stream()<br/>load / unload far balls"]
+        P2 --> P3["WASD + sprint + jump<br/>-> player.velocity, gravity"]
+        P3 --> P4["player.move_and_slide()<br/>(against density field)"]
+        P4 --> P5["_update_physics_gun()"]
+        P5 --> P6["SculptTerrain._physics_process<br/>DensityBody3D.step_all():<br/>gravity, terrain contacts,<br/>body-body contacts, sleep"]
+        P6 --> P7["forg.gd _physics_process<br/>(each frog decides hops)"]
+    end
+
+    subgraph "_process (every rendered frame)"
+        R1["Camera follows player eye<br/>(eased on small steps)"] --> R2["_sculpt(delta)<br/>see diagram 5"]
+        R2 --> R3["_update_gizmo / _update_geometry / _update_box"]
+        R3 --> R4["_record_history()<br/>see diagram 7"]
+        R4 --> R5["terrain.update_view(camera)<br/>move clipmap, upload changes,<br/>send drawn bodies, autosave"]
+        R5 --> R6["Sync prepass camera"]
+        R6 --> R7{"30 s passed?"}
+        R7 -- yes --> R8["Save player + objects"]
+    end

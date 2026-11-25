@@ -1,0 +1,30 @@
+---
+title: 5. Sculpting decision (_sculpt, every frame)
+---
+flowchart TD
+    S0{"Object editor owns<br/>the mouse?"} -- yes --> S0a["End stroke / drag,<br/>hide brush"] --> Send([return])
+    S0 -- no --> S1["pressing = LMB or RMB held<br/>(not for gun / transform / geometry / box)"]
+    S1 --> S2{"Stroke start<br/>or end?"}
+    S2 -- start --> S2a["terrain.begin_stroke()"]
+    S2 -- end --> S2b["terrain.end_stroke()<br/>release held body,<br/>clear flatten plane"]
+    S2a & S2b & S2 --> S3{"Dragging<br/>(grab / snake hook)?"}
+    S3 -- yes --> S3a["_drag(): terrain.warp()<br/>or body.warp()"]
+    S3 -- no --> S4["Raycast terrain,<br/>then raycast bodies in front"]
+    S4 --> S5{"Hit a body<br/>(ball / frog)?"}
+    S5 -- yes --> S5a["target_body = it<br/>hold it still while sculpting"]
+    S5 -- no --> S6
+    S5a --> S6{"Grab / snake hook<br/>and LMB?"}
+    S6 -- yes --> S6a["_begin_drag(hit)"]
+    S6 -- no --> S7
+    S6a --> S7["Move brush preview to hit"]
+    S3a --> S7
+    S7 --> S8["_select(): select paint / fill"]
+    S8 --> S9["_extrude(): sweep selection<br/>along surface normal"]
+    S9 --> S10{"Which brush mode?"}
+    S10 -- "RMB" --> S10a["SUBTRACT<br/>(inflate/pinch: inverted)"]
+    S10 -- "LMB" --> S10b["Tool's mode: ADD, SMOOTH,<br/>FLATTEN, PAINT, INFLATE, PINCH"]
+    S10 -- "non-sculpt tool<br/>or no hit" --> S12
+    S10a & S10b --> S11{"Target is a body?"}
+    S11 -- yes --> S11a["body.apply_brush / paint_color<br/>(no symmetry)"]
+    S11 -- no --> S11b["For each symmetry copy:<br/>terrain.apply_brush / paint_color<br/>(flatten locks a plane first)"]
+    S11a & S11b --> S12["Update symmetry visuals<br/>+ HUD info text"]

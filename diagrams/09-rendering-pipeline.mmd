@@ -1,0 +1,16 @@
+---
+title: 9. Rendering pipeline
+---
+flowchart LR
+    VW["VoxelWorld<br/>density byte + 16-bit material<br/>per point, 32^3 chunks"] --> CM["Clipmap<br/>levels 0..n, each 2x coarser,<br/>centred on camera,<br/>rebuilt on worker thread"]
+    CM --> TEX["Texture arrays per level<br/>(R = density, GB = material)<br/>+ brick distance texture"]
+    Bodies["Drawn DensityBody3Ds"] --> ATLAS["Body atlas + transforms"]
+    SEL["Selection mask"] --> TEX
+
+    TEX --> PRE["Prepass 160x90<br/>terrain_prepass.gdshader:<br/>where rays can start"]
+    TEX --> MAIN["terrain.gdshader 320x180<br/>raymarch, skip empty bricks,<br/>textures / colours, water"]
+    ATLAS --> MAIN
+    PRE --> MAIN
+    MAIN --> SHADOW["terrain_shadow.gdshaderinc<br/>shadow rays"]
+    SHADOW --> OUT["Scaled up to window<br/>(nearest neighbour)"]
+    OUT --> HUD["HUD at full resolution"]

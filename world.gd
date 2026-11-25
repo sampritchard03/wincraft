@@ -49,6 +49,9 @@ var balls: BouncyBalls
 ## The object editor (M on a body: sculpt it, animate its pose keys; object_editor.gd).
 const ObjectEditor := preload("res://object_editor.gd")
 var editor: ObjectEditor
+## Multiplayer (network.gd): hosting or joining, from the command line.
+const Network := preload("res://network.gd")
+var network: Network
 ## The ball or frog the brush is on this frame (null: the terrain).
 var target_body: DensityBody3D = null
 ## A body being sculpted is held still for the stroke (it would roll away
@@ -233,7 +236,54 @@ func respawn(spawn) -> void:
 
 func _ready() -> void:
 	var start := Time.get_ticks_msec()
-	terrain.open_world()
+	network = Network.new()
+	network.name = "Network"
+	network.world = self
+	add_child(network)
+	network.configure_from_args()
+	if network.is_joining() and await _join():
+		pass  # the host's world is open, and we stand next to the host
+	else:
+		terrain.open_world()
+		_place_at_start()
+	yaw = camera.rotation.y
+	pitch = camera.rotation.x
+	terrain.gravity = gravity  # what the physics bodies fall with
+	_make_player()
+	balls = BouncyBalls.new(terrain)
+	camera.get_parent().add_child(balls)
+	if not terrain.save_path.is_empty():
+		balls.load_from(_objects_path())
+	_finish_ready(start)
+
+## Joining a host: waits for its world settings, opens the same world
+## (unsaved: it's the host's) and waits for its edited chunks. Returns false
+## if that failed (the caller opens this computer's own world instead).
+func _join() -> bool:
+	set_process(false)
+	set_physics_process(false)
+	set_process_input(false)
+	network.start_client()
+	if network.is_joining():
+		await network.settings_received
+	if network.is_joining():
+		terrain.save_path = ""  # the host's world: don't write it into ours
+		terrain.set_world_settings(network.host_settings)
+		terrain.open_world()
+		network.world_opened()
+		if not network.synced and network.is_joining():
+			await network.joined
+	set_process(true)
+	set_physics_process(true)
+	set_process_input(true)
+	if not terrain.is_world_open():
+		return false
+	respawn(network.host_spawn + Vector3(12, 0, 12))
+	return true
+
+## Where a new session starts: the saved camera, or off the edge of the
+## nearest island, looking at it.
+func _place_at_start() -> void:
 	if not _load_player():
 		# Start off the edge of the nearest island, looking at it.
 		var island = terrain.find_island(Vector3.ZERO)
@@ -243,14 +293,8 @@ func _ready() -> void:
 		respawn(spawn)
 		if island != null:
 			camera.look_at(island)
-	yaw = camera.rotation.y
-	pitch = camera.rotation.x
-	terrain.gravity = gravity  # what the physics bodies fall with
-	_make_player()
-	balls = BouncyBalls.new(terrain)
-	camera.get_parent().add_child(balls)
-	if not terrain.save_path.is_empty():
-		balls.load_from(_objects_path())
+
+func _finish_ready(p_start: int) -> void:
 	var material: ShaderMaterial = terrain.material
 	material_names = SculptTerrain.get_material_names()
 	_make_color_panel()
@@ -264,11 +308,13 @@ func _ready() -> void:
 	material.set_shader_parameter("use_prepass", true)
 	terrain.update_view(camera.global_position)  # builds and uploads the clipmap
 	_sync_prepass_camera()
-	print("World opened in %d ms" % (Time.get_ticks_msec() - start))
+	print("World opened in %d ms" % (Time.get_ticks_msec() - p_start))
 
 	get_viewport().size_changed.connect(_fit_screen)
 	_fit_screen()
 	_make_symmetry_visuals()
+	if network.mode == Network.Mode.HOST:
+		network.start_host()
 
 ## The block textures as one texture array (a layer per material, in
 ## material_names order), with mipmaps for distant ground. A missing
@@ -916,6 +962,8 @@ func _sculpt(delta: float) -> void:
 			"Color #%s, opacity %d%%, hardness %d%% (Tab: picker)" % [paint_color.to_html(false), roundi(paint_opacity * 100.0), roundi(paint_hardness * 100.0)]
 	info_label.text = "%s (1 Draw / Inflate, 2 Smooth / Pinch, 3 Flatten, 4 Grab, 5 Snake hook, 6 Paint, 7 Select: paint / fill / geometry, 8 Extrude / Transform, 9 Physics gun, 0 Geometry / Box / Box cut)   LMB sculpt, RMB carve\nMaterial: %s ([ / ], middle click picks)   Radius %.1f (wheel)   Strength %.1f (Ctrl+wheel)   Undo %d / redo %d (Ctrl+Z / Ctrl+Shift+Z)   %d FPS\n%s" % [
 		TOOL_NAMES[tool], block_name, brush_radius, brush_strength, terrain.get_undo_count(), terrain.get_redo_count(), Engine.get_frames_per_second(), sym]
+	if not network.status.is_empty():
+		info_label.text += "\n" + network.hud_text()
 
 func _begin_drag(p_hit: Vector3) -> void:
 	dragging = true

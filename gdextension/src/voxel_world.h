@@ -196,6 +196,12 @@ public:
 	// Chunks (in the caller's unwrapped coordinates, every repeat) with points
 	// in [p_min, p_max] that hold edits.
 	void edited_chunks_in(const Vector3i &p_min, const Vector3i &p_max, std::vector<Vector3i> &r_chunks) const;
+	// Every chunk that holds edits (wrapped coordinates), for sending the
+	// world to another player.
+	void edited_chunk_list(std::vector<Vector3i> &r_chunks) const;
+	// A chunk's points (CHUNK_POINTS each, x fastest, then y, z), loading it
+	// if needed. False outside the world.
+	bool read_chunk(const Vector3i &p_chunk, std::vector<int8_t> &r_density, std::vector<MaterialId> &r_materials) const;
 
 	// Full-detail density / material at a point.
 	int8_t point(int x, int y, int z) const;
