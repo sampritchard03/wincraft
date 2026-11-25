@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -360,6 +361,19 @@ private:
 	mutable int repaired_chunks = 0;
 	// The chunk, loaded (nullptr outside the y limits).
 	const Chunk *loaded_chunk(const Vector3i &p_chunk) const;
+	// The chunks (wrapped) whose points are in memory, so unload_far() looks
+	// at those rather than every chunk of the world (millions). May hold
+	// some no longer loaded; unload_far() drops them. Loading can happen on
+	// the clipmap's worker threads, hence the lock.
+	mutable std::unordered_set<Vector3i, Vector3iHash> loaded_set;
+	// Every edited chunk (wrapped), in the order they became edited (a chunk
+	// never stops being edited), so finding the edited ones in a box doesn't
+	// mean going through every chunk of the world: a clipmap level that
+	// moved did that on the main thread, 4 million chunks for the coarsest
+	// level, a 40-90 ms hitch every few steps while walking.
+	std::vector<Vector3i> edited_list;
+	mutable std::mutex loaded_lock;
+	void note_loaded(const Vector3i &p_chunk) const;
 	Vector3i chunk_counts; // chunks per axis
 	mutable String last_error;
 	std::unordered_set<Vector3i, Vector3iHash> region_files; // regions with a file on disk

@@ -12,7 +12,10 @@ extends Node
 @export var camera : Camera3D
 @export var forg_scene : PackedScene
 ## Half-resolution pass that tells the terrain shader where rays can start
-## (see terrain_prepass.gdshader). Its camera follows `camera`.
+## (see terrain_prepass.gdshader). Its camera follows `camera`. Off unless
+## use_prepass: at 320x180 it cost more than it saved (about 0.6 ms a frame
+## on an Intel HD 4400), as the full image re-marches from where it stops.
+@export var use_prepass := false
 @export var prepass_viewport : SubViewport
 @export var prepass_camera : Camera3D
 ## Sphere showing where and how big the brush is.
@@ -278,7 +281,7 @@ func _join() -> bool:
 	set_process_input(true)
 	if not terrain.is_world_open():
 		return false
-	respawn(network.host_spawn + Vector3(12, 0, 12))
+	respawn(network.host_spawn + Network.JOIN_OFFSET)
 	return true
 
 ## Where a new session starts: the saved camera, or off the edge of the
@@ -305,7 +308,8 @@ func _finish_ready(p_start: int) -> void:
 	material.set_shader_parameter("block_textures", _load_block_textures())
 	material.set_shader_parameter("water_texture", _load_water_texture())
 	material.set_shader_parameter("prepass_texture", prepass_viewport.get_texture())
-	material.set_shader_parameter("use_prepass", true)
+	material.set_shader_parameter("use_prepass", use_prepass)
+	prepass_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if use_prepass else SubViewport.UPDATE_DISABLED
 	terrain.update_view(camera.global_position)  # builds and uploads the clipmap
 	_sync_prepass_camera()
 	print("World opened in %d ms" % (Time.get_ticks_msec() - p_start))
@@ -429,6 +433,8 @@ func _save_objects() -> void:
 		balls.save(_objects_path())
 
 func _sync_prepass_camera() -> void:
+	if not use_prepass:
+		return
 	prepass_camera.global_transform = camera.global_transform
 	prepass_camera.fov = camera.fov
 
@@ -677,6 +683,16 @@ func _distinct_copies(p_copies: Array[Transform3D], p_point: Vector3) -> PackedI
 				duplicate = true
 				break
 		if not duplicate:
+			kept.append(i)
+	return kept
+
+## _distinct_copies() for a body: only the copies whose brush reaches it
+## (the axis needn't run through it; a copy off in the air would only grow
+## its grid towards nothing). The first (the brush itself) is always kept.
+func _body_copies(p_body: DensityBody3D, p_copies: Array[Transform3D], p_point: Vector3) -> PackedInt32Array:
+	var kept := PackedInt32Array()
+	for i in _distinct_copies(p_copies, p_point):
+		if i == 0 or p_body.get_density_at(p_copies[i] * p_point) > -brush_radius:
 			kept.append(i)
 	return kept
 
@@ -935,12 +951,16 @@ func _sculpt(delta: float) -> void:
 	# Inflate / pinch with the right button: deflate / spread.
 	var strength := brush_strength * delta * (-1.0 if tool in INVERTIBLE_TOOLS and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT) else 1.0)
 	if mode >= 0 and target_body != null:
-		# Bodies are sculpted on their own (no symmetry, no undo).
-		if mode == SculptTerrain.BRUSH_PAINT and coloring:
-			target_body.paint_color(hit, brush_radius, paint_color, paint_opacity, paint_hardness)
-		else:
-			var material: int = SculptTerrain.color_to_material(paint_color) if coloring else block
-			target_body.apply_brush(hit, brush_radius, strength, mode, material)
+		# Bodies are sculpted on their own (their undo is the held body's),
+		# with symmetry like the terrain: each copy that lands on the body.
+		var copies := _symmetry_copies()
+		var material: int = SculptTerrain.color_to_material(paint_color) if coloring else block
+		for i in _body_copies(target_body, copies, hit):
+			var at: Vector3 = copies[i] * hit
+			if mode == SculptTerrain.BRUSH_PAINT and coloring:
+				target_body.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
+			else:
+				target_body.apply_brush(at, brush_radius, strength, mode, material)
 	elif mode >= 0:
 		var copies := _symmetry_copies()
 		for i in _distinct_copies(copies, hit):
@@ -959,7 +979,7 @@ func _sculpt(delta: float) -> void:
 				terrain.apply_brush(copies[i] * hit, brush_radius, strength, mode, material)
 	_update_symmetry_visuals(hit)
 
-	var sym := "Blocky %s (B)   F throws a ball, G drops a frog, X removes one   Selected %d (Backspace clears, P: to physics object, Ctrl+C / Ctrl+V copy, Ctrl+P export, Ctrl+O import)   %s   " % [
+	var sym :="Blocky %s (B)   F throws a ball, G drops a frog, X removes one   Selected %d (Backspace clears, P: to physics object, Ctrl+C / Ctrl+V copy, Ctrl+P export, Ctrl+O import)   %s   " % [
 		"on" if terrain.blocky_size >= 2 else "off", terrain.get_selected_count(), _tool_hint()]
 	var prefix := sym
 	sym += "Symmetry off (E: axis along view)"
@@ -982,7 +1002,11 @@ func _begin_drag(p_hit: Vector3) -> void:
 	last_grab_delta = Vector3.INF
 	drag_body = target_body
 	if drag_body != null:
-		drag_copies = [Transform3D.IDENTITY]  # no symmetry on bodies
+		# Symmetry on a body too: the copies that start on it.
+		var on_body: Array[Transform3D] = []
+		for i in _body_copies(drag_body, drag_copies, p_hit):
+			on_body.append(drag_copies[i])
+		drag_copies = on_body
 		if tool == Tool.GRAB:
 			drag_body.begin_grab()
 	elif tool == Tool.GRAB:
@@ -1011,13 +1035,13 @@ func _drag(p_target: Vector3) -> Vector3:
 			last_grab_delta = delta
 			var centers := PackedVector3Array()
 			var deltas := PackedVector3Array()
-			if drag_body != null:
-				if is_instance_valid(drag_body):
-					drag_body.warp(drag_start, delta, brush_radius, true)
-				return p_target
 			for i in kept:
 				centers.append(drag_copies[i] * drag_start)
 				deltas.append(drag_copies[i].basis * delta)
+			if drag_body != null:
+				if is_instance_valid(drag_body):
+					drag_body.warp_copies(centers, deltas, brush_radius, true)
+				return p_target
 			terrain.warp(centers, deltas, brush_radius, true)
 		return p_target
 	# Snake hook: pulls material along in short steps.
@@ -1028,15 +1052,15 @@ func _drag(p_target: Vector3) -> Vector3:
 			break
 		var step := move.limit_length(max_step)
 		drag_start += step
-		if drag_body != null:
-			if is_instance_valid(drag_body):
-				drag_body.warp(drag_start, step, brush_radius, false)
-			continue
 		var centers := PackedVector3Array()
 		var deltas := PackedVector3Array()
 		for i in kept:
 			centers.append(drag_copies[i] * drag_start)
 			deltas.append(drag_copies[i].basis * step)
+		if drag_body != null:
+			if is_instance_valid(drag_body):
+				drag_body.warp_copies(centers, deltas, brush_radius, false)
+			continue
 		terrain.warp(centers, deltas, brush_radius, false)
 	return drag_start
 

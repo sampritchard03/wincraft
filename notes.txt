@@ -7,4 +7,4 @@ Physics objects have a small size limit
 
 Painted objects have the color underneath show through sometimes
 
-Player name tag large
+Player name tag too large

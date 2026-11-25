@@ -343,8 +343,10 @@ void fragment() {
 		float diffuse = max(dot(n, sun), 0.0);
 		// Sun shadows fade out far away: there islands are only a few coarse
 		// texels across, and their self-shadowing is noise (haze is taking
-		// over by then anyway).
-		float shadow_fade = smoothstep(clip_reach * 8.0, clip_reach * 32.0, t);
+		// over by then anyway), and past the fade no shadow ray is cast. In
+		// voxels: tied to clip_reach, the fade moved past the view distance
+		// when the clipmap grew, and every pixel paid for a shadow ray.
+		float shadow_fade = smoothstep(300.0, 700.0, t);
 		float shadow = 0.0;
 		if (diffuse > 0.0) {
 			shadow = shadow_fade < 1.0 ? mix(sun_shadow(p, n, sun, scale), 1.0, shadow_fade) : 1.0;

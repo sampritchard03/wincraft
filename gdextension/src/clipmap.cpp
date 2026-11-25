@@ -77,11 +77,13 @@ int Clipmap::brick_value(const Level &p_level, const Vector3i &p_texel) const {
 }
 
 void Clipmap::mark_layers(Level &r_level, int p_z0, int p_z1) {
-	if (p_z1 - p_z0 + 1 >= size) {
+	// The GPU layer for slice z also holds slice z + 1's densities (see
+	// SculptTerrain::upload_level()), so the slice below changes too.
+	if (p_z1 - p_z0 + 2 >= size) {
 		std::fill(r_level.layer_dirty.begin(), r_level.layer_dirty.end(), 1);
 		return;
 	}
-	for (int z = p_z0; z <= p_z1; z++) {
+	for (int z = p_z0 - 1; z <= p_z1; z++) {
 		r_level.layer_dirty[wrap(z, size)] = 1;
 	}
 }

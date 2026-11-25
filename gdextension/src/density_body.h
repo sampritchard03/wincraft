@@ -128,6 +128,8 @@ public:
 	// SculptTerrain.warp(), one centre): begin_grab(), then warp() each frame.
 	void begin_grab();
 	bool warp(const Vector3 &p_center, const Vector3 &p_delta, double p_radius, bool p_grab);
+	// The same with a centre and delta per symmetry copy (world space).
+	bool warp_copies(const PackedVector3Array &p_centers, const PackedVector3Array &p_deltas, double p_radius, bool p_grab);
 	void end_grab();
 	// Where a ray first enters the body, or null.
 	Variant raycast(const Vector3 &p_from, const Vector3 &p_direction, double p_max_distance);
@@ -325,12 +327,14 @@ private:
 	Vector3 axis_point(const Vector3 &p_feet, int p_index) const;
 	// How far the capsule's p_index-th sphere is from the nearest thing it
 	// collides with (negative: that deep inside), and the way out.
-	// p_bodies: other bodies count only from above (to stand on).
+	// p_bodies: other bodies count only from above (to stand on): those in
+	// near_bodies, gathered once per move_and_slide().
 	double gap(SculptTerrain *p_terrain, const Vector3 &p_center, double p_radius, bool p_bodies, Vector3 &r_normal) const;
 	// The spheres it collides with (offset from the feet, radius); the
 	// lowest first. See rebuild_spheres().
 	std::vector<Vector4> samples;
 	static constexpr double MAX_SAMPLE_RADIUS = 5.0;
+	std::vector<DensityBody3D *> near_bodies;
 };
 
 } // namespace godot

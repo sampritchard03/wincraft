@@ -35,6 +35,9 @@ class DensityShape : public Resource {
 
 public:
 	static constexpr int MAX_SIZE = 64; // the drawing atlas's slot (SculptTerrain::GRID_SLOT)
+	// Building past MAX_SIZE points a side makes the voxels coarser (twice
+	// as big each time) rather than stopping, up to this voxel size.
+	static constexpr double MAX_VOXEL_SIZE = 16.0;
 
 	// Saved form: densities as signed bytes (1/16 voxel), materials as
 	// 16-bit ids (little endian).
@@ -75,15 +78,15 @@ public:
 	double get_material_density_at(const Vector3 &p_local) const;
 	// Sculpting, in the body's space: as SculptTerrain.apply_brush() and
 	// paint_color(). p_key: which key (-1: all). Adding near the edge grows
-	// the grid (up to MAX_SIZE). Returns whether anything changed.
+	// the grid (coarser past MAX_SIZE). Returns whether anything changed.
 	bool apply_brush(const Vector3 &p_center, double p_radius, double p_strength, int p_mode, int p_material, int p_key = -1);
 	bool paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness);
-	// Grab and snake hook, as SculptTerrain.warp() (one centre, body space):
-	// begin_grab() keeps the shape as it is; each warp() with p_grab moves it
-	// by p_delta (the whole move since then) from that; a snake hook step
-	// pulls the current shape along by p_delta.
+	// Grab and snake hook, as SculptTerrain.warp() (a centre per symmetry
+	// copy, body space): begin_grab() keeps the shape as it is; each warp()
+	// with p_grab moves it by p_deltas (the whole move since then) from that;
+	// a snake hook step pulls the current shape along by p_deltas.
 	void begin_grab();
-	bool warp(const Vector3 &p_center, const Vector3 &p_delta, double p_radius, bool p_grab, int p_key = -1);
+	bool warp(const std::vector<Vector3> &p_centers, const std::vector<Vector3> &p_deltas, double p_radius, bool p_grab, int p_key = -1);
 	void end_grab();
 	// How much solid it has (key 0), in cubic voxels of its space.
 	double get_volume() const;
@@ -132,8 +135,20 @@ private:
 	int64_t version = 0;
 	std::vector<std::vector<float>> grab_keys; // the keys when a grab began
 	std::vector<MaterialId> grab_materials;
+	Vector3 grab_box_lo, grab_box_hi; // what the grab has rewritten so far (body space)
+	bool grab_has_box = false;
+	uint32_t paint_serial = 0; // varies paint_color()'s rounding dither between calls
 	mutable std::vector<std::vector<Vector4>> probe_cache;
 	mutable int64_t probe_version = -1;
+	// physical_properties() and mass_properties() of `mass_version` (they
+	// read every point: bodies changing pose, or sharing the shape, reuse them).
+	mutable int64_t mass_version = -1;
+	mutable double cached_mass = 0.0, cached_bounce = 0.5, cached_friction = 0.5;
+	mutable Vector3 cached_centroid;
+	mutable Basis cached_inertia;
+	void update_mass_cache() const;
+	void physical_properties_now(double &r_mass, double &r_bounce, double &r_friction) const;
+	void mass_properties_now(Vector3 &r_centroid, Basis &r_inertia) const;
 
 	size_t count() const { return (size_t)size.x * size.y * size.z; }
 	size_t index(int x, int y, int z) const { return ((size_t)z * size.y + y) * size.x + x; }
@@ -144,6 +159,18 @@ private:
 	// Makes the grid cover [p_lo, p_hi] (grid points, may be outside it now),
 	// as far as MAX_SIZE allows, keeping what's there.
 	void grow(Vector3i p_lo, Vector3i p_hi);
+	// Halves the resolution: voxels twice as big, every other point kept
+	// (the grab's saved shape too).
+	void coarsen();
+	// Makes the grid cover the body-space box [p_lo, p_hi] (p_coarsen: making
+	// the voxels coarser if it wouldn't fit in MAX_SIZE; else as far as fits).
+	void fit(const Vector3 &p_lo, const Vector3 &p_hi, bool p_coarsen);
+	// After an edit of key values within grid box [p_lo, p_hi]: repairs the
+	// distances (as the terrain's commit_edit()) where it can have changed
+	// them, the box grown by the clamp. Points the edit changed take the
+	// repaired value; the rest keep theirs unless the repair finds the
+	// surface nearer, or on their other side.
+	void repair(std::vector<float> &r_after, const std::vector<float> &p_before, const Vector3i &p_lo, const Vector3i &p_hi) const;
 	void changed();
 };
 

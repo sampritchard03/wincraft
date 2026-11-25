@@ -3,13 +3,14 @@
 // through it.
 
 // Set by SculptTerrain. Level l has 2^l voxels per texel, stored as a 2D
-// texture array with one layer per z slice (see Clipmap). Each texel (RGB8):
+// texture array with one layer per z slice (see Clipmap). Each texel (RGBA8):
 // R is the density in 1/16ths of the level's texel size + 128, so a level
-// holds distances up to CLAMP of its own texels; G and B the material (see
-// material_at): G under 128 is a block's texture layer, otherwise the point
-// is a plain color whose 15 bits (5 red, 5 green, 5 blue, red highest) are
-// G's low 7 bits and B. Storage wraps around: world texel w (= position /
-// 2^l) is at w mod clip_size, hence repeat.
+// holds distances up to CLAMP of its own texels; G the same for the texel
+// one slice up (so one read gives both slices a point lies between); B and
+// A the material (see material_at): B under 128 is a block's texture layer,
+// otherwise the point is a plain color whose 15 bits (5 red, 5 green, 5
+// blue, red highest) are B's low 7 bits and A. Storage wraps around: world
+// texel w (= position / 2^l) is at w mod clip_size, hence repeat.
 uniform sampler2DArray clip_texture0 : filter_linear, repeat_enable;
 uniform sampler2DArray clip_texture1 : filter_linear, repeat_enable;
 uniform sampler2DArray clip_texture2 : filter_linear, repeat_enable;
@@ -79,15 +80,15 @@ float far_distance(vec3 w, float level, float reach_left, float scale) {
 // variable is several times slower on Intel GPUs.
 //
 // Layers are z slices, so the hardware filters within a layer and the shader
-// blends the two layers around the point (storage wraps: layer = z mod size).
+// blends the two slices around the point: layer z (storage wraps: layer = z
+// mod size) holds both, in R and G.
 #define LEVEL_SAMPLER(NAME, TEX, LEVEL, SCALE) \
 float NAME(vec3 p, float reach_left, out float r_far) { \
 	vec3 w = p / SCALE; \
 	vec2 uv = (w.xy + 0.5) / clip_size; \
 	float z0 = floor(w.z); \
-	float below = textureLod(TEX, vec3(uv, mod(z0, clip_size)), 0.0).r; \
-	float above = textureLod(TEX, vec3(uv, mod(z0 + 1.0, clip_size)), 0.0).r; \
-	float d = (mix(below, above, w.z - z0) * 255.0 - 128.0) / 16.0 * SCALE; \
+	vec2 slices = textureLod(TEX, vec3(uv, mod(z0, clip_size)), 0.0).rg; \
+	float d = (mix(slices.x, slices.y, w.z - z0) * 255.0 - 128.0) / 16.0 * SCALE; \
 	r_far = near_surface(d, SCALE) ? -d : far_distance(w, LEVEL, reach_left, SCALE); \
 	return d; \
 }
@@ -120,11 +121,11 @@ if (clip_count > L && reach <= clip_reach * SCALE && inside((p - clip_origin[L])
 	float votes[8]; \
 	for (int k = 0; k < 8; k++) { \
 		vec3 o = vec3(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1)); \
-		vec3 texel = texelFetch(TEX, ivec3(mod(b + o, clip_size)), 0).rgb; \
+		vec4 texel = texelFetch(TEX, ivec3(mod(b + o, clip_size)), 0); \
 		vec3 tw = mix(1.0 - f, f, o); \
 		float solid = texel.r * 255.0 > 128.5 ? 1.0 : 0.15; \
-		int g = int(texel.g * 255.0 + 0.5); \
-		int bits = (g & 127) * 256 + int(texel.b * 255.0 + 0.5); \
+		int g = int(texel.b * 255.0 + 0.5); \
+		int bits = (g & 127) * 256 + int(texel.a * 255.0 + 0.5); \
 		kinds[k] = g < 128 ? g : 128; \
 		colors[k] = vec3(float((bits >> 10) & 31), float((bits >> 5) & 31), float(bits & 31)) / 31.0; \
 		votes[k] = tw.x * tw.y * tw.z * solid; \
@@ -169,14 +170,21 @@ vec4 material_at(vec3 p) {
 // the last BLEND * 2^l. Because the choice doesn't depend on where a level's
 // box happens to be, the image doesn't change when one moves, and the edge
 // of a box (where a move's new layers may still be uploading) is never read.
-#define TRY_LEVEL(L, NAME, NEXT, SCALE) \
+//
+// BLENDING: whether the hand-over zone mixes in the next level (sampling
+// both), which is what makes it seamless. Only what is seen needs that: the
+// hit itself, its normal and its occlusion (density_only()). Steps along a
+// ray (march_core(), shadows, open_sky()) take the one level: a step is a
+// safe distance either way, and sampling two levels on every step of every
+// ray cost ~1.7 ms a frame on an Intel HD 4400.
+#define TRY_LEVEL(L, NAME, NEXT, SCALE, BLENDING) \
 if (clip_count > L && reach <= clip_reach * SCALE) { \
 	vec3 q = (p - clip_origin[L]) / SCALE; \
 	if (inside(q)) { \
 		r_scale = SCALE; \
 		float d = NAME(p, clip_reach - reach / SCALE, r_far); \
 		float w = clamp((clip_reach * SCALE - reach) / (BLEND * SCALE), 0.0, 1.0); \
-		if (w < 1.0 && clip_count > L + 1) { \
+		if (BLENDING && w < 1.0 && clip_count > L + 1) { \
 			vec3 q_next = (p - clip_origin[L + 1]) / (SCALE * 2.0); \
 			if (inside(q_next)) { \
 				float far_next; \
@@ -188,34 +196,43 @@ if (clip_count > L && reach <= clip_reach * SCALE) { \
 	} \
 }
 
-// Density at p (> 0 = solid). r_far: in air, a distance that is safe to step;
-// r_scale: voxels per texel of the finest level used.
+#define DENSITY_BODY(BLENDING) \
+	vec3 rel = abs(p - view_position); \
+	float reach = max(max(rel.x, rel.y), rel.z); \
+	TRY_LEVEL(0, level0, level1, 1.0, BLENDING) \
+	TRY_LEVEL(1, level1, level2, 2.0, BLENDING) \
+	TRY_LEVEL(2, level2, level3, 4.0, BLENDING) \
+	TRY_LEVEL(3, level3, level4, 8.0, BLENDING) \
+	TRY_LEVEL(4, level4, level5, 16.0, BLENDING) \
+	TRY_LEVEL(5, level5, level6, 32.0, BLENDING) \
+	TRY_LEVEL(6, level6, level7, 64.0, BLENDING) \
+	if (clip_count > 7 && reach <= clip_reach * 128.0) { \
+		vec3 q = (p - clip_origin[7]) / 128.0; \
+		if (inside(q)) { \
+			r_scale = 128.0; \
+			return level7(p, clip_reach - reach / 128.0, r_far); \
+		} \
+	} \
+	r_scale = exp2(float(max(clip_count - 1, 0))); \
+	r_far = CLAMP * r_scale; \
+	return -CLAMP * r_scale;
+
+// Density at p (> 0 = solid; outside every level: air), from the one level
+// used there (for stepping along rays). r_far: in air, a distance that is safe to step; r_scale:
+// voxels per texel of the finest level used.
 float density(vec3 p, out float r_scale, out float r_far) {
-	vec3 rel = abs(p - view_position);
-	float reach = max(max(rel.x, rel.y), rel.z);
-	TRY_LEVEL(0, level0, level1, 1.0)
-	TRY_LEVEL(1, level1, level2, 2.0)
-	TRY_LEVEL(2, level2, level3, 4.0)
-	TRY_LEVEL(3, level3, level4, 8.0)
-	TRY_LEVEL(4, level4, level5, 16.0)
-	TRY_LEVEL(5, level5, level6, 32.0)
-	TRY_LEVEL(6, level6, level7, 64.0)
-	if (clip_count > 7 && reach <= clip_reach * 128.0) {
-		vec3 q = (p - clip_origin[7]) / 128.0;
-		if (inside(q)) {
-			r_scale = 128.0;
-			return level7(p, clip_reach - reach / 128.0, r_far);
-		}
-	}
-	r_scale = exp2(float(max(clip_count - 1, 0)));
-	r_far = CLAMP * r_scale;
-	return -CLAMP * r_scale; // outside every level: treat as air
+	DENSITY_BODY(false)
+}
+
+// The same, blended across level hand-overs (for what is drawn).
+float density_blended(vec3 p, out float r_scale, out float r_far) {
+	DENSITY_BODY(true)
 }
 
 float density_only(vec3 p) {
 	float s;
 	float f;
-	return density(p, s, f);
+	return density_blended(p, s, f);
 }
 
 // How far the clipmap reaches along a ray, at most.

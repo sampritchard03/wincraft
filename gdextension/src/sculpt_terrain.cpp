@@ -274,7 +274,7 @@ bool SculptTerrain::open_world() {
 	for (int l = 0; l < clip_levels; l++) {
 		TypedArray<Image> layers;
 		layers.resize(clip_size);
-		const Ref<Image> blank = Image::create_empty(clip_size, clip_size, false, Image::FORMAT_RGB8);
+		const Ref<Image> blank = Image::create_empty(clip_size, clip_size, false, Image::FORMAT_RGBA8); // see upload_level()
 		for (int z = 0; z < clip_size; z++) {
 			layers[z] = blank;
 		}
@@ -390,13 +390,24 @@ bool SculptTerrain::upload_level(int p_level, int &r_budget) {
 		return false;
 	}
 	const int n = clipmap.get_size();
-	const int64_t layer_bytes = (int64_t)n * n * Clipmap::TEXEL_BYTES;
+	const int64_t layer_texels = (int64_t)n * n;
+	// A GPU texel: this slice's density, the next slice's (storage wraps, as
+	// the shader reads it), then the material, so the shader gets both
+	// densities it interpolates between in one read instead of two.
 	auto layer_image = [&](int p_layer) {
 		PackedByteArray bytes;
-		bytes.resize(layer_bytes);
-		std::memcpy(bytes.ptrw(), &level.texels[(size_t)p_layer * layer_bytes], layer_bytes);
-		upload_bytes += layer_bytes;
-		return Image::create_from_data(n, n, false, Image::FORMAT_RGB8, bytes);
+		bytes.resize(layer_texels * 4);
+		uint8_t *w = bytes.ptrw();
+		const uint8_t *here = &level.texels[(size_t)p_layer * layer_texels * Clipmap::TEXEL_BYTES];
+		const uint8_t *above = &level.texels[(size_t)((p_layer + 1) % n) * layer_texels * Clipmap::TEXEL_BYTES];
+		for (int64_t i = 0; i < layer_texels; i++, w += 4, here += Clipmap::TEXEL_BYTES, above += Clipmap::TEXEL_BYTES) {
+			w[0] = here[0];
+			w[1] = above[0];
+			w[2] = here[1];
+			w[3] = here[2];
+		}
+		upload_bytes += layer_texels * 4;
+		return Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, bytes);
 	};
 	Ref<Texture2DArray> &texture = clip_textures[p_level];
 	bool changed = false;

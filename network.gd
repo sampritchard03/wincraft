@@ -11,7 +11,9 @@ extends Node
 ##
 ## The host plays its own saved world. A player who joins gets the host's
 ## generator settings (so their computer generates the same ground) and the
-## host's edited chunks, then plays unsaved: the world is the host's. Each
+## host's edited chunks around where they start, then plays unsaved: the
+## world is the host's. Edited chunks farther off follow as they come near
+## (see JOIN_RADIUS, STREAM_RADIUS). Each
 ## computer moves its own player and sends where it is to the others about
 ## 20 times a second; other players show as coloured capsules with names.
 ##
@@ -54,8 +56,9 @@ extends Node
 ##
 ## Step 5. Undo: SculptTerrain's undo puts back only points still as your
 ## stroke left them, so undoing never wipes out others' edits since. When
-## the host leaves: everyone has the whole world and every object, so the
-## first player in the host's succession list (join order, with the address
+## the host leaves: everyone has every object and the world around where
+## they've been (edited chunks they never came near aren't sent, so a new
+## host doesn't have those), so the first player in the host's succession list (join order, with the address
 ## and --backup-port the host saw) starts hosting, and the rest reconnect to
 ## it (or the next, if it can't be reached in RECONNECT_TIMEOUT). The new host
 ## takes over every object and saves the world to user://shared/<world id>
@@ -79,6 +82,7 @@ const DEFAULT_PORT := 24565
 const MAX_PLAYERS := 8
 const SEND_INTERVAL := 0.05  # seconds between player updates
 const CHUNKS_PER_FRAME := 8  # sent to a joining player each frame
+const JOIN_OFFSET := Vector3(12, 0, 12)  # where a joining player starts, from the host's player
 const EDIT_INTERVAL := 0.1  # seconds between batches of terrain changes
 const RECONNECT_TIMEOUT := 10.0  # seconds to reach a new host before trying the next
 
@@ -111,8 +115,18 @@ var chunks_received := 0
 var synced := false
 var early: Array[Callable] = []  # world data that came before the world was open, in order
 
-## Host: chunks still to send to each joining peer.
-var outgoing: Dictionary = {}  # peer id -> Array[Vector3i]
+## Host: edited chunks not sent to each player yet. A joining player gets
+## only the ones around where they start (JOIN_RADIUS) before they play;
+## after that, the ones within STREAM_RADIUS of wherever they are go out
+## nearest first, and the rest only once they come near. (Unedited ground
+## needs nothing sent: every computer generates the same.)
+const JOIN_RADIUS := 384.0  # voxels: more than the reach of the tools and the physics around the player
+const STREAM_RADIUS := 960.0  # voxels: beyond the view distance (872), so edits are there before they're seen
+const STREAM_CHECK := 0.5  # seconds between looking for chunks that came into range
+var outgoing: Dictionary = {}  # peer id -> Array[Vector3i], still out of range
+var due: Dictionary = {}  # peer id -> Array[Vector3i], in range, nearest last (sent first)
+var join_spot: Dictionary = {}  # peer id -> where they start (wrapped), until they say where they are
+var stream_timer := 0.0
 
 ## Sculpting: this computer's batches the host hasn't sent back yet
 ## ([id, changes]; joining players only), and counts for the HUD.
@@ -280,9 +294,19 @@ func _on_peer_connected(p_id: int) -> void:
 	if not multiplayer.is_server():
 		return
 	var chunks: Array = world.terrain.get_edited_chunks()
+	var spawn := _wrapped(world.player.global_position)
 	outgoing[p_id] = chunks
-	print("Network: player %d joined, sending %d edited chunks" % [p_id, chunks.size()])
-	_welcome.rpc_id(p_id, world.terrain.get_world_settings(), _wrapped(world.player.global_position), chunks.size(), world_id)
+	due[p_id] = []
+	join_spot[p_id] = _wrapped(spawn + JOIN_OFFSET)
+	_refresh_due(p_id)
+	# What they wait for: the chunks near where they start (the nearest, so
+	# the first sent).
+	var needed := 0
+	for c in due[p_id]:
+		if _chunk_distance(c, join_spot[p_id]) <= JOIN_RADIUS:
+			needed += 1
+	print("Network: player %d joined, sending %d of %d edited chunks now (the rest as they come near)" % [p_id, needed, chunks.size()])
+	_welcome.rpc_id(p_id, world.terrain.get_world_settings(), spawn, needed, world_id)
 	# Every object, with its owner (they appear once the joiner's world is ready).
 	for id in bodies:
 		var b = bodies[id]
@@ -291,22 +315,65 @@ func _on_peer_connected(p_id: int) -> void:
 	# Where everyone already is, so the new player sees them at once.
 	_player_state.rpc_id(p_id, _wrapped(world.player.global_position), world.yaw, world.player_height, player_name)
 
-func _send_chunks() -> void:
+func _send_chunks(p_delta: float) -> void:
+	stream_timer += p_delta
+	var check := stream_timer >= STREAM_CHECK
+	if check:
+		stream_timer = 0.0
+	var peers := multiplayer.get_peers()
 	for id in outgoing.keys():
-		var list: Array = outgoing[id]
-		if not multiplayer.get_peers().has(id):
-			outgoing.erase(id)
+		if not peers.has(id):
+			_forget_peer_chunks(id)
 			continue
+		if check:
+			_refresh_due(id)
+		var list: Array = due[id]
 		var coords: Array = []
 		var data: Array = []
 		while not list.is_empty() and coords.size() < CHUNKS_PER_FRAME:
 			var c: Vector3i = list.pop_back()
 			coords.append(c)
-			data.append(world.terrain.get_chunk_data(c))
+			data.append(world.terrain.get_chunk_data(c))  # (as it is now: later edits follow in order)
 		if not coords.is_empty():
 			_chunks.rpc_id(id, coords, data)
-		if list.is_empty():
-			outgoing.erase(id)
+		if list.is_empty() and (outgoing[id] as Array).is_empty():
+			_forget_peer_chunks(id)
+
+func _forget_peer_chunks(p_id: int) -> void:
+	outgoing.erase(p_id)
+	due.erase(p_id)
+	join_spot.erase(p_id)
+
+## Moves a player's chunks that are now within STREAM_RADIUS of them into
+## their queue, nearest sent first.
+func _refresh_due(p_id: int) -> void:
+	var where := _peer_spot(p_id)
+	var waiting: Array = outgoing[p_id]
+	var list: Array = due[p_id]
+	var still: Array = []
+	for c in waiting:
+		if _chunk_distance(c, where) <= STREAM_RADIUS:
+			list.append(c)
+		else:
+			still.append(c)
+	outgoing[p_id] = still
+	if not list.is_empty():
+		list.sort_custom(func(a: Vector3i, b: Vector3i) -> bool: return _chunk_distance(a, where) > _chunk_distance(b, where))
+
+## Where a player is (wrapped), or will start.
+func _peer_spot(p_id: int) -> Vector3:
+	var r = remotes.get(p_id)
+	if r != null and r.placed:
+		return r.target
+	return join_spot.get(p_id, _wrapped(world.player.global_position))
+
+## How far a chunk's middle is from a wrapped position, the short way round.
+func _chunk_distance(p_chunk: Vector3i, p_wrapped: Vector3) -> float:
+	var size := float(world.terrain.get_world_size())
+	var d := Vector3(p_chunk) * 32.0 + Vector3.ONE * 16.0 - p_wrapped
+	d.x = fposmod(d.x + size * 0.5, size) - size * 0.5
+	d.z = fposmod(d.z + size * 0.5, size) - size * 0.5
+	return d.length()
 
 
 # --- Joining: receiving the world ---------------------------------------------------
@@ -325,7 +392,7 @@ func _welcome(p_settings: Dictionary, p_host_position: Vector3, p_chunk_count: i
 	host_settings = p_settings
 	host_spawn = p_host_position
 	status = "Receiving the world..."
-	print("Network: world settings received, %d edited chunks to come" % p_chunk_count)
+	print("Network: world settings received, %d edited chunks around the start to come" % p_chunk_count)
 	settings_received.emit()
 
 @rpc("authority", "call_remote", "reliable", 1)
@@ -336,14 +403,33 @@ func _chunks(p_coords: Array, p_data: Array) -> void:
 	_apply_chunks(p_coords, p_data)
 
 func _apply_chunks(p_coords: Array, p_data: Array) -> void:
+	# Chunks keep coming while we play (as we come near them): our own edits
+	# there that the host hasn't ordered yet aren't in its copy, so they go
+	# back on top (as under someone else's batch, see _apply_edits()).
+	var ours: bool = synced and world.terrain.is_change_tracking()
+	if ours:
+		_flush_edits()
+	var arrived := {}
 	for i in p_coords.size():
 		world.terrain.set_chunk_data(p_coords[i], p_data[i])
+		arrived[p_coords[i]] = true
+	if ours:
+		for batch in unconfirmed:
+			var changes: Array = batch[1]
+			for j in range(0, changes.size() - 1, 2):
+				if arrived.has(_wrap_chunk(changes[j])):
+					world.terrain.apply_change(changes[j], changes[j + 1], false)
 	chunks_received += p_coords.size()
 	if resyncing:
 		_check_resynced()
 		return
-	status = "Receiving the world: %d / %d chunks" % [chunks_received, chunks_expected]
+	if not synced:
+		status = "Receiving the world around you: %d / %d chunks" % [chunks_received, chunks_expected]
 	_check_synced()
+
+func _wrap_chunk(p_chunk: Vector3i) -> Vector3i:
+	var n: int = world.terrain.get_world_size() / 32
+	return Vector3i(posmod(p_chunk.x, n), p_chunk.y, posmod(p_chunk.z, n))
 
 ## world.gd: the world is open with host_settings.
 func world_opened() -> void:
@@ -826,6 +912,9 @@ func _update_bodies(p_delta: float, p_k: float) -> void:
 			continue
 		var target := _nearest_repeat(b.get_meta("net_target"))
 		var turn: Quaternion = b.get_meta("net_turn")
+		var here: Quaternion = b.global_basis.get_rotation_quaternion()
+		if b.global_position.distance_squared_to(target) < 1e-4 and absf(here.dot(turn)) > 0.999999:
+			continue  # there already (most copies, at rest): setting it again would only notify the tree every frame
 		if b.global_position.distance_to(target) > 50.0:
 			b.global_transform = Transform3D(Basis(turn), target)
 		else:
@@ -1012,7 +1101,7 @@ func _region_summary(p_mine: int, p_total: int, p_load: float) -> void:
 func _on_peer_disconnected(p_id: int) -> void:
 	print("Network: player %d left" % p_id)
 	_remove_remote(p_id)
-	outgoing.erase(p_id)
+	_forget_peer_chunks(p_id)
 	if multiplayer.is_server():
 		roster = roster.filter(func(e: Dictionary) -> bool: return e.id != p_id)
 		_roster.rpc(roster)
@@ -1067,8 +1156,11 @@ func _add_remote(p_id: int) -> void:
 	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 	label.no_depth_test = true
 	label.fixed_size = true
-	label.pixel_size = 0.004
-	label.outline_size = 6
+	# The 3D view is only 320x180 (scaled up): the defaults (32 px font,
+	# 0.004) made a name about 22 of its 180 lines tall. This is about 7.
+	label.font_size = 16
+	label.outline_size = 4
+	label.pixel_size = 0.0035
 	node.add_child(label)
 	world.camera.get_parent().add_child(node)
 	var r := {"node": node, "mesh": mesh, "eye": eye, "label": label, "target": Vector3.ZERO, "yaw": 0.0, "height": -1.0, "name": "", "placed": false}
@@ -1104,7 +1196,7 @@ func _process(delta: float) -> void:
 	if mode == Mode.OFFLINE or multiplayer.multiplayer_peer == null:
 		return
 	if mode == Mode.HOST:
-		_send_chunks()
+		_send_chunks(delta)
 	if mode == Mode.CLIENT and not synced:
 		world.info_label.text = status  # (world.gd isn't running yet)
 		return

@@ -1,5 +1,7 @@
 #include "density_shape.h"
 
+#include "sculpt_terrain.h"
+
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/core/error_macros.hpp>
 #include <godot_cpp/variant/packed_color_array.hpp>
@@ -18,6 +20,17 @@ constexpr int ZSTD = 2; // FileAccess.COMPRESSION_ZSTD
 
 float falloff(float t) {
 	return t >= 1.0f ? 0.0f : 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
+// A repeatable pseudo-random number in [0, 1) per point and call (as the
+// terrain's brushes use): added before rounding, small changes add up on
+// average instead of always rounding away.
+float dither(int x, int y, int z, uint32_t p_serial) {
+	uint32_t h = (uint32_t)x * 0x8DA6B343u ^ (uint32_t)y * 0xD8163841u ^ (uint32_t)z * 0xCB1AB31Fu ^ p_serial * 0x9E3779B9u;
+	h ^= h >> 15;
+	h *= 0x2C1B3C6Du;
+	h ^= h >> 12;
+	return (float)(h & 0xFFFFFF) / (float)0x1000000;
 }
 
 // The closest point of triangle abc to p, as barycentric weights.
@@ -406,24 +419,131 @@ void DensityShape::grow(Vector3i p_lo, Vector3i p_hi) {
 	size = nsize;
 }
 
+void DensityShape::coarsen() {
+	// Points 0, 2, 4... of the old grid, one more if needed so the last old
+	// point is still covered (sampled past the edge as sample_key() does).
+	const Vector3i nsize = (size - Vector3i(1, 1, 1)) / 2 + Vector3i(1, 1, 1) + Vector3i(size.x % 2 == 0, size.y % 2 == 0, size.z % 2 == 0);
+	const Vector3i n = nsize.clamp(Vector3i(1, 1, 1), Vector3i(MAX_SIZE, MAX_SIZE, MAX_SIZE));
+	const size_t ncount = (size_t)n.x * n.y * n.z;
+	auto coarse_keys = [&](const std::vector<std::vector<float>> &p_keys) {
+		std::vector<std::vector<float>> result(p_keys.size(), std::vector<float>(ncount));
+		for (size_t k = 0; k < p_keys.size(); k++) {
+			// sample_key() reads `keys`: sample from the given set.
+			const std::vector<float> &v = p_keys[k];
+			for (int z = 0; z < n.z; z++) {
+				for (int y = 0; y < n.y; y++) {
+					for (int x = 0; x < n.x; x++) {
+						const Vector3i o(x * 2, y * 2, z * 2);
+						const Vector3i c = o.clamp(Vector3i(), size - Vector3i(1, 1, 1));
+						// Distances in the new (twice as big) voxels.
+						const float d = v[index(c.x, c.y, c.z)] - Vector3(o - c).length();
+						result[k][((size_t)z * n.y + y) * n.x + x] = std::clamp(d * 0.5f, -DENSITY_CLAMP, DENSITY_CLAMP);
+					}
+				}
+			}
+			density_redistance(result[k], n);
+		}
+		return result;
+	};
+	auto coarse_materials = [&](const std::vector<MaterialId> &p_materials) {
+		std::vector<MaterialId> result(ncount);
+		for (int z = 0; z < n.z; z++) {
+			for (int y = 0; y < n.y; y++) {
+				for (int x = 0; x < n.x; x++) {
+					const Vector3i c = Vector3i(x * 2, y * 2, z * 2).clamp(Vector3i(), size - Vector3i(1, 1, 1));
+					result[((size_t)z * n.y + y) * n.x + x] = p_materials[index(c.x, c.y, c.z)];
+				}
+			}
+		}
+		return result;
+	};
+	if (!grab_keys.empty() && grab_keys.size() == keys.size() && grab_materials.size() == materials.size()) {
+		grab_keys = coarse_keys(grab_keys);
+		grab_materials = coarse_materials(grab_materials);
+	}
+	keys = coarse_keys(keys);
+	materials = coarse_materials(materials);
+	size = n;
+	voxel_size *= 2.0;
+}
+
+void DensityShape::fit(const Vector3 &p_lo, const Vector3 &p_hi, bool p_coarsen) {
+	bool coarsened = false;
+	while (p_coarsen && voxel_size * 2.0 <= MAX_VOXEL_SIZE) {
+		// The box with the grid, in points at the current voxel size.
+		const Vector3 grid_hi = origin + Vector3(size - Vector3i(1, 1, 1)) * (float)voxel_size;
+		const Vector3 extent = p_hi.max(grid_hi) - p_lo.min(origin);
+		const float points = std::max({ extent.x, extent.y, extent.z }) / (float)voxel_size + 2.0f;
+		if (points <= (float)MAX_SIZE) {
+			break;
+		}
+		coarsen();
+		coarsened = true;
+	}
+	const float vs = (float)voxel_size;
+	Vector3i lo, hi;
+	for (int a = 0; a < 3; a++) {
+		lo[a] = (int)std::floor((p_lo[a] - origin[a]) / vs);
+		hi[a] = (int)std::ceil((p_hi[a] - origin[a]) / vs);
+	}
+	grow(lo, hi);
+	if (coarsened) {
+		changed(); // (even if the edit that needed the room then changes nothing)
+	}
+}
+
+void DensityShape::repair(std::vector<float> &r_after, const std::vector<float> &p_before, const Vector3i &p_lo, const Vector3i &p_hi) const {
+	// A changed point moves distances up to the clamp away (the edit box
+	// grown by M); those are worked out from the surface up to the clamp
+	// beyond them (grown by M again). The rest of the grid can't change, so
+	// repairing all of it every brush call (as it used to) was wasted work.
+	const int M = (int)std::ceil(DENSITY_CLAMP) + 1;
+	const Vector3i last = size - Vector3i(1, 1, 1), m(M, M, M);
+	const Vector3i elo = (p_lo - m).clamp(Vector3i(), last), ehi = (p_hi + m).clamp(Vector3i(), last);
+	const Vector3i rlo = (elo - m).clamp(Vector3i(), last), rhi = (ehi + m).clamp(Vector3i(), last);
+	if (elo.x > ehi.x || elo.y > ehi.y || elo.z > ehi.z) {
+		return;
+	}
+	const Vector3i n = rhi - rlo + Vector3i(1, 1, 1);
+	auto sub_index = [&](int x, int y, int z) { return ((size_t)(z - rlo.z) * n.y + (y - rlo.y)) * n.x + (x - rlo.x); };
+	std::vector<float> repaired((size_t)n.x * n.y * n.z);
+	for (int z = rlo.z; z <= rhi.z; z++) {
+		for (int y = rlo.y; y <= rhi.y; y++) {
+			std::memcpy(&repaired[sub_index(rlo.x, y, z)], &r_after[index(rlo.x, y, z)], sizeof(float) * n.x);
+		}
+	}
+	density_redistance(repaired, n);
+	// Points the edit changed take the repaired value; the rest keep theirs
+	// unless the repair finds the surface nearer, or on their other side.
+	// Re-rounding them every call would make the whole shape drift (the
+	// repair's distances are only within ~8%).
+	const float tolerance = 2.0f * DENSITY_STEP;
+	for (int z = elo.z; z <= ehi.z; z++) {
+		for (int y = elo.y; y <= ehi.y; y++) {
+			for (int x = elo.x; x <= ehi.x; x++) {
+				const size_t i = index(x, y, z);
+				const bool changed = std::abs(r_after[i] - p_before[i]) > 1e-5f;
+				const float r = repaired[sub_index(x, y, z)], b = p_before[i];
+				r_after[i] = changed || (r > 0.0f) != (b > 0.0f) || std::abs(r) < std::abs(b) - tolerance ? r : b;
+			}
+		}
+	}
+}
+
 bool DensityShape::apply_brush(const Vector3 &p_center, double p_radius, double p_strength, int p_mode, int p_material, int p_key) {
 	if (keys.empty() || p_radius <= 0.0 || p_mode < 0 || p_mode > 6 || (p_mode == 4 && p_material < 0)) {
 		return false;
 	}
 	enum { ADD, SUBTRACT, SMOOTH, FLATTEN, PAINT, INFLATE, PINCH };
+	if (p_mode == ADD) {
+		// Room for what it builds, plus a little air: past MAX_SIZE points a
+		// side, coarser voxels rather than a wall it can't build past.
+		const Vector3 room = Vector3(1, 1, 1) * (float)(p_radius + 2.0 * voxel_size);
+		fit(p_center - room, p_center + room, true);
+	}
 	const float vs = (float)voxel_size;
 	const float r = (float)p_radius / vs, s = (float)p_strength / vs, C = DENSITY_CLAMP;
-	Vector3 c = (p_center - origin) / vs;
-	if (p_mode == ADD) {
-		// Room for what it builds, plus a little air.
-		Vector3i lo, hi;
-		for (int a = 0; a < 3; a++) {
-			lo[a] = (int)std::floor(c[a] - r - 2.0f);
-			hi[a] = (int)std::ceil(c[a] + r + 2.0f);
-		}
-		grow(lo, hi);
-		c = (p_center - origin) / vs;
-	}
+	const Vector3 c = (p_center - origin) / vs;
 	const bool sphere_mode = p_mode == ADD || p_mode == SUBTRACT;
 	const float reach = sphere_mode ? r + C : r + 1.0f;
 	Vector3i lo, hi;
@@ -523,21 +643,9 @@ bool DensityShape::apply_brush(const Vector3 &p_center, double p_radius, double 
 			}
 		}
 		if (p_mode != PAINT) {
-			// Repair the distances as the terrain does (commit_edit()):
-			// points the brush changed take the repaired value; the rest keep
-			// theirs unless the repair finds the surface nearer, or on their
-			// other side. Re-rounding them every call would make the whole
-			// shape drift (the repair's distances are only within ~8%).
-			std::vector<float> repaired = after;
-			density_redistance(repaired, size);
-			const float tolerance = 2.0f * DENSITY_STEP;
-			for (size_t i = 0; i < after.size(); i++) {
-				const bool brushed = std::abs(after[i] - before[i]) > 1e-5f;
-				const float r = repaired[i], b = before[i];
-				if (brushed || (r > 0.0f) != (b > 0.0f) || std::abs(r) < std::abs(b) - tolerance) {
-					after[i] = r;
-				}
-			}
+			// Repair the distances as the terrain does (commit_edit()), around
+			// the brush only.
+			repair(after, before, lo, hi);
 		}
 	}
 	any |= materials != materials_before;
@@ -555,20 +663,59 @@ bool DensityShape::paint_color(const Vector3 &p_center, double p_radius, const C
 	const float vs = (float)voxel_size, r = (float)p_radius / vs;
 	const Vector3 c = (p_center - origin) / vs;
 	const float hard = std::clamp((float)p_hardness, 0.0f, 0.999f);
+	const float opacity = std::clamp((float)p_opacity, 0.0f, 1.0f);
+	// Only the points within the brush (not the whole grid, every frame).
+	Vector3i lo, hi;
+	for (int a = 0; a < 3; a++) {
+		lo[a] = std::max((int)std::floor(c[a] - r), 0);
+		hi[a] = std::min((int)std::ceil(c[a] + r), size[a] - 1);
+		if (lo[a] > hi[a]) {
+			return false;
+		}
+	}
+	// What the brush lays down, in the 5-bit steps a color material has.
+	const float target[3] = { (float)std::lround(std::clamp(p_color.r, 0.0f, 1.0f) * 31.0f), (float)std::lround(std::clamp(p_color.g, 0.0f, 1.0f) * 31.0f),
+		(float)std::lround(std::clamp(p_color.b, 0.0f, 1.0f) * 31.0f) };
+	const SculptTerrain *terrain = SculptTerrain::get_singleton();
+	paint_serial++;
 	bool any = false;
-	for (int z = 0; z < size.z; z++) {
-		for (int y = 0; y < size.y; y++) {
-			for (int x = 0; x < size.x; x++) {
+	for (int z = lo.z; z <= hi.z; z++) {
+		for (int y = lo.y; y <= hi.y; y++) {
+			for (int x = lo.x; x <= hi.x; x++) {
 				const float dist = (Vector3((float)x, (float)y, (float)z) - c).length();
+				if (dist > r) {
+					continue;
+				}
 				const size_t i = index(x, y, z);
-				if (dist > r || std::abs(keys[0][i]) > 2.5f) {
+				// The skin of any pose (the surface drawn is the pose's keys,
+				// not just the first one's: else other poses show the old colour).
+				float nearest = DENSITY_CLAMP;
+				for (const std::vector<float> &k : keys) {
+					nearest = std::min(nearest, std::abs(k[i]));
+				}
+				if (nearest > 2.5f) {
 					continue;
 				}
 				const float cover = dist <= hard * r ? 1.0f : 1.0f - (dist - hard * r) / (r - hard * r);
+				const float t = opacity * cover;
+				if (t <= 0.0f) {
+					continue;
+				}
 				const MaterialId m = materials[i];
-				// A block's own color isn't known here: paint over it as grey.
-				const Color base = is_color_material(m) ? Color(((m >> 10) & 31) / 31.0f, ((m >> 5) & 31) / 31.0f, (m & 31) / 31.0f) : Color(0.5f, 0.5f, 0.5f);
-				const MaterialId next = material_of_color(base.lerp(p_color, (float)p_opacity * cover));
+				// A block starts from its texture's average colour, as on the terrain.
+				const Color base = terrain != nullptr ? terrain->get_material_color(m)
+													  : (is_color_material(m) ? Color(((m >> 10) & 31) / 31.0f, ((m >> 5) & 31) / 31.0f, (m & 31) / 31.0f) : Color(0.5f, 0.5f, 0.5f));
+				const float from[3] = { base.r * 31.0f, base.g * 31.0f, base.b * 31.0f };
+				// Brushing blends a little every frame. Rounded plainly to 5
+				// bits, a small step rounds away every time and the colour stops
+				// short of the paint, the old one showing through; a dither
+				// makes the steps add up on average.
+				const float d = dither(x, y, z, paint_serial);
+				int channel[3];
+				for (int a = 0; a < 3; a++) {
+					channel[a] = std::clamp((int)std::floor(from[a] + (target[a] - from[a]) * t + d), 0, 31);
+				}
+				const MaterialId next = color_material(channel[0], channel[1], channel[2]);
 				if (next != m) {
 					materials[i] = next;
 					any = true;
@@ -634,7 +781,7 @@ std::vector<Vector4> DensityShape::skin_points(int p_key) const {
 	return skin;
 }
 
-void DensityShape::mass_properties(Vector3 &r_centroid, Basis &r_inertia) const {
+void DensityShape::mass_properties_now(Vector3 &r_centroid, Basis &r_inertia) const {
 	const float vs = (float)voxel_size;
 	std::vector<Vector3> points;
 	std::vector<float> weights; // each point's material density
@@ -762,31 +909,37 @@ double DensityShape::get_volume() const {
 void DensityShape::begin_grab() {
 	grab_keys = keys;
 	grab_materials = materials;
+	grab_has_box = false;
 }
 
 void DensityShape::end_grab() {
 	grab_keys.clear();
 	grab_materials.clear();
+	grab_has_box = false;
 }
 
-bool DensityShape::warp(const Vector3 &p_center, const Vector3 &p_delta, double p_radius, bool p_grab, int p_key) {
-	if (keys.empty() || p_radius <= 0.0 || (p_grab && grab_keys.size() != keys.size())) {
+bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector<Vector3> &p_deltas, double p_radius, bool p_grab, int p_key) {
+	const int count = (int)std::min(p_centers.size(), p_deltas.size());
+	if (keys.empty() || count == 0 || p_radius <= 0.0 || (p_grab && grab_keys.size() != keys.size())) {
 		return false;
 	}
-	const float vs = (float)voxel_size, r = (float)p_radius / vs, C = DENSITY_CLAMP;
-	// Room for where it goes (the grid grows as for adding).
+	// Room for where it goes (the grid grows as for adding). A snake hook
+	// may make the voxels coarser to fit; a grab doesn't (it works from the
+	// shape as it began, which must keep its points).
 	{
-		Vector3 a = (p_center - origin) / vs, b = (p_center + p_delta - origin) / vs;
-		Vector3i lo, hi;
-		for (int i = 0; i < 3; i++) {
-			lo[i] = (int)std::floor(std::min(a[i], b[i]) - r - 2.0f);
-			hi[i] = (int)std::ceil(std::max(a[i], b[i]) + r + 2.0f);
+		Vector3 lo_l(1e30f, 1e30f, 1e30f), hi_l(-1e30f, -1e30f, -1e30f);
+		for (int i = 0; i < count; i++) {
+			const Vector3 a = p_centers[i], b = p_grab ? p_centers[i] + p_deltas[i] : p_centers[i] - p_deltas[i];
+			lo_l = lo_l.min(a.min(b));
+			hi_l = hi_l.max(a.max(b));
 		}
+		const Vector3 room = Vector3(1, 1, 1) * (float)(p_radius + 2.0 * voxel_size);
 		const Vector3i old_size = size;
 		const Vector3 old_origin = origin;
-		grow(lo, hi);
+		fit(lo_l - room, hi_l + room, !p_grab);
 		if (p_grab && size != old_size) {
 			// The grab's saved shape must cover the same grid.
+			const float vs = (float)voxel_size;
 			const Vector3i shift = Vector3i(((old_origin - origin) / vs).round());
 			std::vector<std::vector<float>> keys_now = std::move(keys);
 			std::vector<MaterialId> materials_now = std::move(materials);
@@ -805,19 +958,59 @@ bool DensityShape::warp(const Vector3 &p_center, const Vector3 &p_delta, double 
 			origin = origin_now;
 		}
 	}
-	const Vector3 c = (p_center - origin) / vs, delta = p_delta / vs;
+	const float vs = (float)voxel_size, r = (float)p_radius / vs, C = DENSITY_CLAMP;
+	std::vector<Vector3> centers(count), deltas(count);
+	for (int i = 0; i < count; i++) {
+		centers[i] = (p_centers[i] - origin) / vs;
+		deltas[i] = p_deltas[i] / vs;
+	}
+	// The points rewritten (they used to be every point of the grid, each
+	// frame): around each centre (a grab: where it began and where it is
+	// now; a snake hook: this step), and for a grab, every box since it
+	// began, so what it no longer covers goes back to how it was.
+	Vector3 blo(1e30f, 1e30f, 1e30f), bhi(-1e30f, -1e30f, -1e30f);
+	for (int i = 0; i < count; i++) {
+		const Vector3 a = centers[i], b = p_grab ? centers[i] + deltas[i] : centers[i] - deltas[i];
+		blo = blo.min(a.min(b) - Vector3(1, 1, 1) * (r + 1.0f));
+		bhi = bhi.max(a.max(b) + Vector3(1, 1, 1) * (r + 1.0f));
+	}
+	if (p_grab) {
+		// Kept in body space: the grid may grow (and move its origin).
+		Vector3 lo_l = origin + blo * vs, hi_l = origin + bhi * vs;
+		if (grab_has_box) {
+			lo_l = lo_l.min(grab_box_lo);
+			hi_l = hi_l.max(grab_box_hi);
+		}
+		grab_box_lo = lo_l;
+		grab_box_hi = hi_l;
+		grab_has_box = true;
+		blo = (lo_l - origin) / vs;
+		bhi = (hi_l - origin) / vs;
+	}
+	Vector3i lo, hi;
+	for (int a = 0; a < 3; a++) {
+		lo[a] = std::max((int)std::floor(blo[a]), 0);
+		hi[a] = std::min((int)std::ceil(bhi[a]), size[a] - 1);
+		if (lo[a] > hi[a]) {
+			return false;
+		}
+	}
 	bool any = false;
-	const std::vector<MaterialId> materials_from = p_grab ? grab_materials : materials;
+	std::vector<MaterialId> materials_copy;
+	if (!p_grab) {
+		materials_copy = materials;
+	}
+	const std::vector<MaterialId> &materials_from = p_grab ? grab_materials : materials_copy;
 	for (int k = 0; k < (int)keys.size(); k++) {
 		if (p_key >= 0 && k != p_key) {
 			continue;
 		}
-		const std::vector<float> &from = p_grab ? grab_keys[k] : std::vector<float>(keys[k]);
-		const std::vector<float> source_values = from;
+		const std::vector<float> before = keys[k];
+		const std::vector<float> &source_values = p_grab ? grab_keys[k] : before;
 		auto source = [&](const Vector3 &q) {
 			// Trilinear from the source grid (air beyond it).
-			const Vector3 hi((float)(size.x - 1), (float)(size.y - 1), (float)(size.z - 1));
-			const Vector3 cq = q.clamp(Vector3(), hi);
+			const Vector3 top((float)(size.x - 1), (float)(size.y - 1), (float)(size.z - 1));
+			const Vector3 cq = q.clamp(Vector3(), top);
 			const int x0 = (int)cq.x, y0 = (int)cq.y, z0 = (int)cq.z;
 			const int x1 = std::min(x0 + 1, size.x - 1), y1 = std::min(y0 + 1, size.y - 1), z1 = std::min(z0 + 1, size.z - 1);
 			const float fx = cq.x - x0, fy = cq.y - y0, fz = cq.z - z0;
@@ -831,78 +1024,93 @@ bool DensityShape::warp(const Vector3 &p_center, const Vector3 &p_delta, double 
 			const Vector3i i = Vector3i(q.round()).clamp(Vector3i(), size - Vector3i(1, 1, 1));
 			return materials_from[index(i.x, i.y, i.z)];
 		};
-		const std::vector<float> before = keys[k];
 		std::vector<float> &after = keys[k];
+		const bool write_materials = k == 0 || p_key >= 0;
 		const float thickness = 0.4f * r;
-		for (int z = 0; z < size.z; z++) {
-			for (int y = 0; y < size.y; y++) {
-				for (int x = 0; x < size.x; x++) {
+		for (int z = lo.z; z <= hi.z; z++) {
+			for (int y = lo.y; y <= hi.y; y++) {
+				for (int x = lo.x; x <= hi.x; x++) {
 					const Vector3 p((float)x, (float)y, (float)z);
 					const size_t i = index(x, y, z);
 					if (p_grab) {
 						// As the terrain's grab: the material that lands here
 						// came from p - delta * s, s = falloff(|that - c| / r);
-						// the most solid of the roots wins.
+						// the most solid of the roots (of every copy) wins.
 						float value = -INFINITY;
 						Vector3 best_from = p;
-						auto h = [&](float s) { return falloff((p - delta * s - c).length() / r) - s; };
-						const int SCAN = 12;
-						float s0 = 0.0f, h0 = h(0.0f);
-						if (h0 <= 0.0f) {
-							value = source(p);
-						}
-						for (int j = 1; j <= SCAN; j++) {
-							const float s1 = (float)j / SCAN, h1 = h(s1);
-							if ((h0 > 0.0f) != (h1 > 0.0f)) {
-								float a = s0, b = s1;
-								for (int it = 0; it < 8; it++) {
-									const float m = (a + b) * 0.5f;
-									((h(m) > 0.0f) == (h0 > 0.0f) ? a : b) = m;
-								}
-								const Vector3 q = p - delta * ((a + b) * 0.5f);
-								const float v = source(q);
+						for (int cc = 0; cc < count; cc++) {
+							const Vector3 &c = centers[cc], &delta = deltas[cc];
+							// Only material within r of the centre's path can reach
+							// p; otherwise s = 0 is the only root.
+							const float dd = delta.length_squared();
+							const float tt = dd > 0.0f ? std::clamp((p - c).dot(delta) / dd, 0.0f, 1.0f) : 0.0f;
+							if ((p - c - delta * tt).length_squared() >= r * r) {
+								const float v = source(p);
 								if (v > value) {
 									value = v;
-									best_from = q;
+									best_from = p;
+								}
+								continue;
+							}
+							auto h = [&](float s) { return falloff((p - delta * s - c).length() / r) - s; };
+							const int SCAN = 12;
+							float s0 = 0.0f, h0 = h(0.0f);
+							if (h0 <= 0.0f) {
+								const float v = source(p);
+								if (v > value) {
+									value = v;
+									best_from = p;
 								}
 							}
-							s0 = s1;
-							h0 = h1;
+							for (int j = 1; j <= SCAN; j++) {
+								const float s1 = (float)j / SCAN, h1 = h(s1);
+								if ((h0 > 0.0f) != (h1 > 0.0f)) {
+									float a = s0, b = s1;
+									for (int it = 0; it < 8; it++) {
+										const float m = (a + b) * 0.5f;
+										((h(m) > 0.0f) == (h0 > 0.0f) ? a : b) = m;
+									}
+									const Vector3 q = p - delta * ((a + b) * 0.5f);
+									const float v = source(q);
+									if (v > value) {
+										value = v;
+										best_from = q;
+									}
+								}
+								s0 = s1;
+								h0 = h1;
+							}
 						}
 						after[i] = value == -INFINITY ? source(p) : value;
-						if (k == 0 || p_key >= 0) {
+						if (write_materials) {
 							materials[i] = source_material(best_from);
 						}
 					} else {
-						// Snake hook: pulled along a step, keeping a tendril's thickness.
-						const float f = falloff((p - c).length() / r);
-						const Vector3 a = c - delta;
-						const float t = delta.length_squared() > 0.0f ? std::clamp((p - a).dot(delta) / delta.length_squared(), 0.0f, 1.0f) : 0.0f;
-						const float capsule = thickness - (p - (a + delta * t)).length();
-						if (f <= 0.0f && capsule <= -C) {
+						// Snake hook: pulled along a step, keeping a tendril's
+						// thickness (overlapping copies add up).
+						Vector3 displacement;
+						float capsule = -C;
+						for (int cc = 0; cc < count; cc++) {
+							const Vector3 &c = centers[cc], &delta = deltas[cc];
+							displacement += delta * falloff((p - c).length() / r);
+							const Vector3 a = c - delta;
+							const float t = delta.length_squared() > 0.0f ? std::clamp((p - a).dot(delta) / delta.length_squared(), 0.0f, 1.0f) : 0.0f;
+							capsule = std::max(capsule, thickness - (p - (a + delta * t)).length());
+						}
+						if (displacement.length_squared() == 0.0f && capsule <= -C) {
 							continue;
 						}
-						after[i] = std::max(source(p - delta * f), std::min(capsule, C));
-						if (k == 0 || p_key >= 0) {
-							materials[i] = source_material(p - delta * f);
+						after[i] = std::max(source(p - displacement), std::min(capsule, C));
+						if (write_materials) {
+							materials[i] = source_material(p - displacement);
 						}
 					}
 				}
 			}
 		}
-		// Repair, keeping untouched points as they were (see apply_brush).
-		std::vector<float> repaired = after;
-		density_redistance(repaired, size);
-		for (size_t i = 0; i < after.size(); i++) {
-			const bool moved = std::abs(after[i] - before[i]) > 1e-5f;
-			const float r2 = repaired[i], b = before[i];
-			if (moved || (r2 > 0.0f) != (b > 0.0f) || std::abs(r2) < std::abs(b) - 2.0f * DENSITY_STEP) {
-				after[i] = r2;
-			} else {
-				after[i] = b;
-			}
-			any |= after[i] != b;
-		}
+		// Repair, around what moved (see apply_brush).
+		repair(after, before, lo, hi);
+		any |= after != before;
 	}
 	if (any) {
 		edited = true;
@@ -913,7 +1121,7 @@ bool DensityShape::warp(const Vector3 &p_center, const Vector3 &p_delta, double 
 
 // --- Materials, splitting, hulls ------------------------------------------------------
 
-void DensityShape::physical_properties(double &r_mass, double &r_bounce, double &r_friction) const {
+void DensityShape::physical_properties_now(double &r_mass, double &r_bounce, double &r_friction) const {
 	r_mass = 0.0;
 	r_bounce = 0.5;
 	r_friction = 0.5;
@@ -945,6 +1153,28 @@ void DensityShape::physical_properties(double &r_mass, double &r_bounce, double 
 		r_friction = friction / skin;
 	}
 	r_mass = std::max(r_mass, 0.01);
+}
+
+void DensityShape::update_mass_cache() const {
+	if (mass_version == version) {
+		return;
+	}
+	mass_version = version;
+	physical_properties_now(cached_mass, cached_bounce, cached_friction);
+	mass_properties_now(cached_centroid, cached_inertia);
+}
+
+void DensityShape::physical_properties(double &r_mass, double &r_bounce, double &r_friction) const {
+	update_mass_cache();
+	r_mass = cached_mass;
+	r_bounce = cached_bounce;
+	r_friction = cached_friction;
+}
+
+void DensityShape::mass_properties(Vector3 &r_centroid, Basis &r_inertia) const {
+	update_mass_cache();
+	r_centroid = cached_centroid;
+	r_inertia = cached_inertia;
 }
 
 double DensityShape::get_mass() const {

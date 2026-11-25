@@ -24,10 +24,12 @@ namespace godot {
 // level moves, texels still inside it stay where they are and only the newly
 // covered slabs are computed, on a worker thread.
 //
-// Each level is uploaded as an Image::FORMAT_RGB8 2D texture array with one
+// Each level is uploaded as an Image::FORMAT_RGBA8 2D texture array with one
 // layer per z slice (storage z = world texel z mod size), x fastest, then y:
 // layers that changed can be uploaded on their own, a few per frame. The
-// shader interpolates between layers itself. A texel is three bytes: R, the
+// shader interpolates between layers itself: a GPU texel holds the density
+// of its slice (R) and of the next one up (G), so one read gives both, then
+// the material (B, A). Here a texel is three bytes: R, the
 // density at its point in 1/16 of the level's texel size
 // (VoxelWorld::lod_texel) + 128, so coarse levels hold larger distances; G
 // and B, its material (render_bytes(): a texture layer, or a color).

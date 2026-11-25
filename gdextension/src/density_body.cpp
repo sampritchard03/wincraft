@@ -834,6 +834,13 @@ void DensityBody3D::begin_grab() {
 }
 
 bool DensityBody3D::warp(const Vector3 &p_center, const Vector3 &p_delta, double p_radius, bool p_grab) {
+	PackedVector3Array centers, deltas;
+	centers.push_back(p_center);
+	deltas.push_back(p_delta);
+	return warp_copies(centers, deltas, p_radius, p_grab);
+}
+
+bool DensityBody3D::warp_copies(const PackedVector3Array &p_centers, const PackedVector3Array &p_deltas, double p_radius, bool p_grab) {
 	if (shape.is_null()) {
 		return false;
 	}
@@ -841,11 +848,15 @@ bool DensityBody3D::warp(const Vector3 &p_center, const Vector3 &p_delta, double
 		shape = shape->duplicate_shape();
 		own_shape = true;
 	}
-	const Transform3D inv = get_global_transform().affine_inverse();
-	const double s = std::max((double)get_global_transform().basis.get_column(0).length(), 1e-6);
-	const Vector3 local = inv.xform(p_center);
-	const Vector3 delta = inv.basis.xform(p_delta);
-	const bool any = shape->warp(local, delta, p_radius / s, p_grab, edit_key);
+	const Transform3D t = get_global_transform();
+	const Transform3D inv = t.affine_inverse();
+	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
+	std::vector<Vector3> centers, deltas;
+	for (int64_t i = 0; i < std::min(p_centers.size(), p_deltas.size()); i++) {
+		centers.push_back(inv.xform(p_centers[i]));
+		deltas.push_back(inv.basis.xform(p_deltas[i]));
+	}
+	const bool any = shape->warp(centers, deltas, p_radius / s, p_grab, edit_key);
 	if (any) {
 		inertia_dirty = true;
 	}
@@ -972,6 +983,7 @@ void DensityBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("raycast", "from", "direction", "max_distance"), &DensityBody3D::raycast);
 	ClassDB::bind_method(D_METHOD("begin_grab"), &DensityBody3D::begin_grab);
 	ClassDB::bind_method(D_METHOD("warp", "center", "delta", "radius", "grab"), &DensityBody3D::warp);
+	ClassDB::bind_method(D_METHOD("warp_copies", "centers", "deltas", "radius", "grab"), &DensityBody3D::warp_copies);
 	ClassDB::bind_method(D_METHOD("end_grab"), &DensityBody3D::end_grab);
 	ClassDB::bind_static_method("DensityBody3D", D_METHOD("raycast_bodies", "from", "direction", "max_distance"), &DensityBody3D::raycast_bodies);
 	ClassDB::bind_method(D_METHOD("get_density_at", "position"), &DensityBody3D::get_density_at);
@@ -1106,10 +1118,7 @@ double DensityCharacter3D::gap(SculptTerrain *p_terrain, const Vector3 &p_center
 		return best;
 	}
 	const double floor_cos = std::cos(floor_max_angle);
-	for (DensityBody3D *b : all()) {
-		if (b == this || !b->collide_with_bodies || !b->is_inside_tree() || Object::cast_to<DensityCharacter3D>(b) != nullptr || !b->stepped) {
-			continue;
-		}
+	for (DensityBody3D *b : near_bodies) {
 		const double reach = b->bound + p_radius + 1.0;
 		if (b->com.distance_squared_to(p_center) > reach * reach) {
 			continue;
@@ -1140,6 +1149,24 @@ bool DensityCharacter3D::move_and_slide() {
 		return false;
 	}
 	const double floor_cos = std::cos(floor_max_angle);
+	// The bodies it could touch this move. gap() is asked hundreds of times
+	// a move (every sphere, every iteration and substep, stepping up): it
+	// used to go through every body in the world each time.
+	near_bodies.clear();
+	{
+		const double h = std::max(height, 2.0 * radius);
+		const Vector3 middle = feet + Vector3(0, (float)(h * 0.5), 0);
+		const double reach = h * 0.5 + radius + velocity.length() * dt + step_height * 2.0 + floor_snap_length + std::min(radius, MAX_SAMPLE_RADIUS) + 2.0;
+		for (DensityBody3D *b : all()) {
+			if (b == this || !b->collide_with_bodies || !b->is_inside_tree() || !b->stepped || Object::cast_to<DensityCharacter3D>(b) != nullptr) {
+				continue;
+			}
+			const double r = reach + b->bound;
+			if (b->com.distance_squared_to(middle) <= r * r) {
+				near_bodies.push_back(b);
+			}
+		}
+	}
 	bool touched = false;
 	auto classify = [&](const Vector3 &n) {
 		if (n.y >= floor_cos) {

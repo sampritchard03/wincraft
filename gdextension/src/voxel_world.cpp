@@ -797,6 +797,7 @@ void VoxelWorld::load_chunk(const Vector3i &p_chunk, Chunk &r_chunk) const {
 			}
 		}
 		r_chunk.loaded = true;
+		note_loaded(p_chunk);
 		return;
 	}
 	Chunk made;
@@ -811,6 +812,12 @@ void VoxelWorld::load_chunk(const Vector3i &p_chunk, Chunk &r_chunk) const {
 	r_chunk.full = std::move(made.full);
 	r_chunk.full_materials = std::move(made.full_materials);
 	r_chunk.loaded = true;
+	note_loaded(p_chunk);
+}
+
+void VoxelWorld::note_loaded(const Vector3i &p_chunk) const {
+	std::lock_guard<std::mutex> lock(loaded_lock);
+	loaded_set.insert(wrap_chunk(p_chunk));
 }
 
 const VoxelWorld::Chunk *VoxelWorld::loaded_chunk(const Vector3i &p_chunk) const {
@@ -888,25 +895,34 @@ int VoxelWorld::load_near(const Vector3 &p_center, float p_radius, double p_budg
 
 void VoxelWorld::unload_far(const Vector3 &p_center, float p_radius) {
 	// Edits farther out are saved before their points are let go (their
-	// mips stay, for distant views).
+	// mips stay, for distant views). Only chunks known to be loaded are
+	// looked at: going through every chunk of the world (256 x 64 x 256 by
+	// default) every second was a hitch of its own.
+	std::vector<Vector3i> loaded;
+	{
+		std::lock_guard<std::mutex> lock(loaded_lock);
+		loaded.assign(loaded_set.begin(), loaded_set.end());
+	}
 	std::unordered_set<Vector3i, Vector3iHash> to_save;
-	std::vector<Vector3i> far;
-	for (int iy = 0; iy < chunk_counts.y; iy++) {
-		for (int iz = 0; iz < chunk_counts.z; iz++) {
-			for (int ix = 0; ix < chunk_counts.x; ix++) {
-				const Chunk &chunk = chunks[chunk_index(Vector3i(ix, iy, iz))];
-				if (!chunk.loaded) {
-					continue;
-				}
-				const Vector3i c(ix, iy + y_min() / CHUNK, iz);
-				if (wrapped_distance(c, p_center, settings.world_size) <= p_radius) {
-					continue;
-				}
-				far.push_back(c);
-				if (chunk.dirty) {
-					to_save.insert(region_of(c));
-				}
-			}
+	std::vector<Vector3i> far, stale;
+	for (const Vector3i &c : loaded) {
+		const Chunk *chunk = chunk_at(c);
+		if (chunk == nullptr || !chunk->loaded) {
+			stale.push_back(c);
+			continue;
+		}
+		if (wrapped_distance(c, p_center, settings.world_size) <= p_radius) {
+			continue;
+		}
+		far.push_back(c);
+		if (chunk->dirty) {
+			to_save.insert(region_of(c));
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(loaded_lock);
+		for (const Vector3i &c : stale) {
+			loaded_set.erase(c);
 		}
 	}
 	for (const Vector3i &region : to_save) {
@@ -922,6 +938,8 @@ void VoxelWorld::unload_far(const Vector3 &p_center, float p_radius) {
 		chunk.full = std::vector<int8_t>();
 		chunk.full_materials = std::vector<MaterialId>();
 		chunk.loaded = false;
+		std::lock_guard<std::mutex> lock(loaded_lock);
+		loaded_set.erase(c);
 	}
 }
 
@@ -959,23 +977,15 @@ void VoxelWorld::edited_chunks_in(const Vector3i &p_min, const Vector3i &p_max, 
 	// Each edited chunk, in every repeat of the world the box reaches.
 	const int W = settings.world_size;
 	auto ceil_div = [](int a, int b) { return -floor_div(-a, b); };
-	for (int iy = 0; iy < chunk_counts.y; iy++) {
-		const int cy = iy + y_min() / CHUNK;
-		if (cy * CHUNK > p_max.y || cy * CHUNK + CHUNK - 1 < p_min.y) {
+	for (const Vector3i &c : edited_list) {
+		if (c.y * CHUNK > p_max.y || c.y * CHUNK + CHUNK - 1 < p_min.y) {
 			continue;
 		}
-		for (int iz = 0; iz < chunk_counts.z; iz++) {
-			for (int ix = 0; ix < chunk_counts.x; ix++) {
-				if (!chunks[chunk_index(Vector3i(ix, iy, iz))].edited) {
-					continue;
-				}
-				const int kx0 = ceil_div(p_min.x - ix * CHUNK - (CHUNK - 1), W), kx1 = floor_div(p_max.x - ix * CHUNK, W);
-				const int kz0 = ceil_div(p_min.z - iz * CHUNK - (CHUNK - 1), W), kz1 = floor_div(p_max.z - iz * CHUNK, W);
-				for (int kz = kz0; kz <= kz1; kz++) {
-					for (int kx = kx0; kx <= kx1; kx++) {
-						r_chunks.push_back(Vector3i(ix + kx * (W / CHUNK), cy, iz + kz * (W / CHUNK)));
-					}
-				}
+		const int kx0 = ceil_div(p_min.x - c.x * CHUNK - (CHUNK - 1), W), kx1 = floor_div(p_max.x - c.x * CHUNK, W);
+		const int kz0 = ceil_div(p_min.z - c.z * CHUNK - (CHUNK - 1), W), kz1 = floor_div(p_max.z - c.z * CHUNK, W);
+		for (int kz = kz0; kz <= kz1; kz++) {
+			for (int kx = kx0; kx <= kx1; kx++) {
+				r_chunks.push_back(Vector3i(c.x + kx * (W / CHUNK), c.y, c.z + kz * (W / CHUNK)));
 			}
 		}
 	}
@@ -1151,6 +1161,7 @@ VoxelWorld::ChunkData VoxelWorld::edit_chunk(const Vector3i &p_chunk) {
 	}
 	if (!chunk->edited) {
 		chunk->edited = true;
+		edited_list.push_back(wrap_chunk(p_chunk));
 		chunk->mips.resize(MIP_BYTES);
 		chunk->mip_materials.resize(MIP_BYTES);
 	}
@@ -1337,6 +1348,11 @@ bool VoxelWorld::open(const String &p_dir, int p_threads) {
 	// A slot for every chunk of the world, none loaded yet (see load_near()).
 	chunk_counts = Vector3i(settings.world_size / CHUNK, settings.world_height / CHUNK, settings.world_size / CHUNK);
 	chunks.assign((size_t)chunk_counts.x * chunk_counts.y * chunk_counts.z, Chunk());
+	{
+		std::lock_guard<std::mutex> lock(loaded_lock);
+		loaded_set.clear();
+	}
+	edited_list.clear();
 	column_cache.clear();
 	// Which chunks are edited, and their mips (their points stay on disk
 	// until needed).
@@ -1361,6 +1377,11 @@ bool VoxelWorld::open(const String &p_dir, int p_threads) {
 
 void VoxelWorld::close() {
 	chunks.clear();
+	{
+		std::lock_guard<std::mutex> lock(loaded_lock);
+		loaded_set.clear();
+	}
+	edited_list.clear();
 	column_cache.clear();
 	region_index.clear();
 	region_files.clear();
@@ -1503,6 +1524,9 @@ void VoxelWorld::load_region(const Vector3i &p_region) {
 			last_error = "Chunk outside the world in " + path;
 			continue;
 		}
+		if (!chunk->edited) {
+			edited_list.push_back(c);
+		}
 		chunk->edited = true;
 		chunk->dirty = false;
 		chunk->loaded = false;
@@ -1637,18 +1661,7 @@ void VoxelWorld::take_changes(std::vector<ChangedChunk> &r_changes) {
 }
 
 void VoxelWorld::edited_chunk_list(std::vector<Vector3i> &r_chunks) const {
-	r_chunks.clear();
-	const int64_t plane = (int64_t)chunk_counts.x * chunk_counts.z;
-	for (size_t i = 0; i < chunks.size(); i++) {
-		if (!chunks[i].edited) {
-			continue;
-		}
-		const int64_t n = (int64_t)i;
-		const int x = (int)(n % chunk_counts.x);
-		const int z = (int)((n / chunk_counts.x) % chunk_counts.z);
-		const int y = (int)(n / plane) + y_min() / CHUNK;
-		r_chunks.push_back(Vector3i(x, y, z));
-	}
+	r_chunks = edited_list;
 }
 
 bool VoxelWorld::read_chunk(const Vector3i &p_chunk, std::vector<int8_t> &r_density, std::vector<MaterialId> &r_materials) const {
@@ -1666,11 +1679,7 @@ bool VoxelWorld::read_chunk(const Vector3i &p_chunk, std::vector<int8_t> &r_dens
 }
 
 int VoxelWorld::get_edited_chunk_count() const {
-	int count = 0;
-	for (const Chunk &chunk : chunks) {
-		count += chunk.edited;
-	}
-	return count;
+	return (int)edited_list.size();
 }
 
 int VoxelWorld::get_full_chunk_count() const {

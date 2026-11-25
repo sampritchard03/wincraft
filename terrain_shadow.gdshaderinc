@@ -3,7 +3,9 @@
 // plus the physics bodies, so they cast shadows too.
 
 const int SHADOW_STEPS = 96;
-const float SHADOW_DISTANCE = 300.0;
+// (300 cost ~1.7 ms a frame more on an Intel HD 4400, for shadows longer
+// than most scenes have.)
+const float SHADOW_DISTANCE = 150.0;
 
 // The drawn physics bodies (DensityBody3D with `drawn`), nearest the camera
 // first; SculptTerrain sends them every frame. terrain.gdshader draws them;
