@@ -153,6 +153,11 @@ public:
 	// p_dir (creating it if new; empty = don't save). Returns false if the
 	// save can't be used (the world is still generated, unsaved).
 	bool open(const String &p_dir, int p_threads);
+	// For a world opened without a directory (multiplayer: a joined player's
+	// copy): starts saving it in p_dir, emptied first, every edited chunk to
+	// be written by the next save(). False if this world already saves
+	// somewhere, or p_dir can't be made.
+	bool adopt_dir(const String &p_dir);
 	void close();
 
 	// The world's extent: x and z wrap every world_size; y runs from

@@ -299,6 +299,18 @@ bool SculptTerrain::open_world() {
 	return ok;
 }
 
+bool SculptTerrain::save_world_as(const String &p_path) {
+	if (!opened || !save_path.is_empty()) {
+		return false;
+	}
+	if (!world.adopt_dir(p_path)) {
+		report_world_error(world.get_last_error());
+		return false;
+	}
+	save_path = p_path;
+	return save_world();
+}
+
 bool SculptTerrain::save_world() {
 	if (!opened || save_path.is_empty()) {
 		return true;
@@ -664,7 +676,7 @@ Array SculptTerrain::take_changes() {
 	return out;
 }
 
-bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray &p_change) {
+bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray &p_change, bool p_remote) {
 	const int CH = VoxelWorld::CHUNK;
 	const int N = VoxelWorld::CHUNK_POINTS;
 	ERR_FAIL_COND_V(p_change.size() < 4, false);
@@ -680,6 +692,15 @@ bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray 
 	if (chunk.density == nullptr) {
 		return false;
 	}
+	// A stroke in progress here: someone else's change counts as there
+	// before it (so undoing the stroke leaves it).
+	UndoChunk *recorded = nullptr;
+	if (p_remote) {
+		auto found = recording.index.find(world.wrap_chunk(p_chunk));
+		if (found != recording.index.end()) {
+			recorded = &recording.chunks[found->second];
+		}
+	}
 	if (r[0] == 0) {
 		uint32_t count = 0;
 		std::memcpy(&count, r + 1, 4);
@@ -690,6 +711,10 @@ bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray 
 			if (i < N) {
 				chunk.density[i] = (int8_t)p[2];
 				chunk.material[i] = get_u16(p + 3);
+				if (recorded != nullptr) {
+					recorded->density[i] = chunk.density[i];
+					recorded->materials[i] = chunk.material[i];
+				}
 			}
 		}
 	} else {
@@ -697,6 +722,10 @@ bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray 
 		std::memcpy(chunk.density, r + 1, N);
 		for (int i = 0; i < N; i++) {
 			chunk.material[i] = get_u16(r + 1 + N + i * 2);
+		}
+		if (recorded != nullptr) {
+			std::memcpy(recorded->density.data(), chunk.density, N);
+			std::memcpy(recorded->materials.data(), chunk.material, N * sizeof(MaterialId));
 		}
 	}
 	world.update_mips(p_chunk);
@@ -1462,6 +1491,10 @@ void SculptTerrain::end_stroke() {
 	}
 	undo_serial++;
 	recording.index.clear();
+	finish_step(recording);
+	if (recording.chunks.empty()) {
+		return; // it changed nothing in the end
+	}
 	undo_bytes += recording.bytes();
 	undo_stack.push_back(std::move(recording));
 	recording = UndoStep();
@@ -1478,15 +1511,52 @@ void SculptTerrain::end_stroke() {
 	undo_stack.erase(undo_stack.begin(), undo_stack.begin() + drop);
 }
 
-void SculptTerrain::swap_step(UndoStep &r_step) {
+void SculptTerrain::finish_step(UndoStep &r_step) {
+	std::vector<int8_t> density;
+	std::vector<MaterialId> materials;
+	std::vector<UndoChunk> kept;
+	for (UndoChunk &c : r_step.chunks) {
+		if (!world.read_chunk(c.chunk, density, materials)) {
+			continue;
+		}
+		for (int i = 0; i < VoxelWorld::CHUNK_POINTS; i++) {
+			if (density[i] != c.density[i] || materials[i] != c.materials[i]) {
+				c.points.push_back((uint16_t)i);
+				c.density_before.push_back(c.density[i]);
+				c.material_before.push_back(c.materials[i]);
+				c.density_after.push_back(density[i]);
+				c.material_after.push_back(materials[i]);
+			}
+		}
+		c.density = std::vector<int8_t>();
+		c.materials = std::vector<MaterialId>();
+		if (!c.points.empty()) {
+			kept.push_back(std::move(c));
+		}
+	}
+	r_step.chunks = std::move(kept);
+}
+
+void SculptTerrain::swap_step(UndoStep &r_step, bool p_undo) {
 	const int CH = VoxelWorld::CHUNK;
 	for (UndoChunk &saved : r_step.chunks) {
 		const VoxelWorld::ChunkData current = world.edit_chunk(saved.chunk);
 		if (current.density == nullptr) {
 			continue;
 		}
-		std::swap_ranges(saved.density.begin(), saved.density.end(), current.density);
-		std::swap_ranges(saved.materials.begin(), saved.materials.end(), current.material);
+		// Only points still as the stroke left them (undo) / as they were
+		// before it (redo): anything changed since stays.
+		const std::vector<int8_t> &from_d = p_undo ? saved.density_after : saved.density_before;
+		const std::vector<MaterialId> &from_m = p_undo ? saved.material_after : saved.material_before;
+		const std::vector<int8_t> &to_d = p_undo ? saved.density_before : saved.density_after;
+		const std::vector<MaterialId> &to_m = p_undo ? saved.material_before : saved.material_after;
+		for (size_t k = 0; k < saved.points.size(); k++) {
+			const uint16_t i = saved.points[k];
+			if (current.density[i] == from_d[k] && current.material[i] == from_m[k]) {
+				current.density[i] = to_d[k];
+				current.material[i] = to_m[k];
+			}
+		}
 		world.update_mips(saved.chunk);
 		clipmap.refresh(world, saved.chunk * CH, saved.chunk * CH + Vector3i(CH - 1, CH - 1, CH - 1));
 		mark_edited(saved.chunk * CH, saved.chunk * CH + Vector3i(CH - 1, CH - 1, CH - 1));
@@ -1500,7 +1570,7 @@ bool SculptTerrain::undo() {
 	}
 	UndoStep step = std::move(undo_stack.back());
 	undo_stack.pop_back();
-	swap_step(step);
+	swap_step(step, true);
 	redo_stack.push_back(std::move(step));
 	return true;
 }
@@ -1512,7 +1582,7 @@ bool SculptTerrain::redo() {
 	}
 	UndoStep step = std::move(redo_stack.back());
 	redo_stack.pop_back();
-	swap_step(step);
+	swap_step(step, false);
 	undo_stack.push_back(std::move(step));
 	return true;
 }
@@ -1852,6 +1922,7 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_thread_count"), &SculptTerrain::get_thread_count);
 
 	ClassDB::bind_method(D_METHOD("open_world"), &SculptTerrain::open_world);
+	ClassDB::bind_method(D_METHOD("save_world_as", "path"), &SculptTerrain::save_world_as);
 	ClassDB::bind_method(D_METHOD("get_world_settings"), &SculptTerrain::get_world_settings);
 	ClassDB::bind_method(D_METHOD("set_world_settings", "settings"), &SculptTerrain::set_world_settings);
 	ClassDB::bind_method(D_METHOD("get_edited_chunks"), &SculptTerrain::get_edited_chunks);
@@ -1860,7 +1931,7 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_change_tracking", "on"), &SculptTerrain::set_change_tracking);
 	ClassDB::bind_method(D_METHOD("is_change_tracking"), &SculptTerrain::is_change_tracking);
 	ClassDB::bind_method(D_METHOD("take_changes"), &SculptTerrain::take_changes);
-	ClassDB::bind_method(D_METHOD("apply_change", "chunk", "change"), &SculptTerrain::apply_change);
+	ClassDB::bind_method(D_METHOD("apply_change", "chunk", "change", "remote"), &SculptTerrain::apply_change, DEFVAL(true));
 	ClassDB::bind_method(D_METHOD("save_world"), &SculptTerrain::save_world);
 	ClassDB::bind_method(D_METHOD("update_view", "camera_position", "wait"), &SculptTerrain::update_view, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material"), &SculptTerrain::apply_brush, DEFVAL(-1));

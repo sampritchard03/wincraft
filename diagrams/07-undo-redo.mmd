@@ -17,7 +17,7 @@ flowchart TD
         U1 -- no --> U3["cancel lift: put it back"]
         U0 -- no --> U4["pop entry"]
         U4 --> U5{"Kind"}
-        U5 -- terrain --> U6["terrain.undo()"]
+        U5 -- terrain --> U6["terrain.undo(): put back only<br/>points still as the stroke left them"]
         U5 -- body --> U7["shape = before,<br/>remove split-off parts"]
         U5 -- selection --> U8["restore sel_before"]
         U6 & U7 & U8 --> U9["move entry to future (redo)"]

@@ -58,17 +58,20 @@ and the timeline animates `pose`.
 Run from a terminal with `--headless --script bake_frog.gd` after editing the
 model in Blender.
 
-## [12. Multiplayer (steps 1-4 built; step 5 planned)](12-multiplayer.mmd)
+## [12. Multiplayer (all five steps built)](12-multiplayer.mmd)
 
     godot-4 --path . -- --host [--port 24565] [--name Sam]
-    godot-4 --path . -- --join 192.168.1.20[:24565] [--name Alex]
+    godot-4 --path . -- --join 192.168.1.20[:24565] [--name Alex] [--backup-port 24566]
 
 The joining player generates the host's world from its settings, receives
 its edited chunks, and plays unsaved; everyone sees each other as coloured
 capsules with names, which objects bounce off. Sculpting is shared: every
 tool's changes (and undo / redo) go out as the voxel values they changed,
-which the host puts in one order for everyone. Physics is shared and spread
-out: the world is split into 256-voxel regions, the host gives each region
-with objects in it to a player (the nearest at first, then rebalanced every
-2 s by load and computer speed), and each object is simulated by its
-region's owner, or by whoever is using it. The rest see copies that follow.
+which the host puts in one order for everyone; undo only takes back your
+own changes. Physics is shared and spread out: the world is split into
+256-voxel regions, the host gives each region with objects in it to a
+player (the nearest at first, then rebalanced every 2 s by load and computer
+speed), and each object is simulated by its region's owner, or by whoever
+is using it. If the host leaves, the first player who joined takes over
+(hosting on its --backup-port, saving to user://shared/<world>) and the
+rest reconnect to it.

@@ -1,5 +1,5 @@
 ---
-title: 12. Multiplayer (steps 1-4 built; step 5 planned)
+title: 12. Multiplayer (all five steps built)
 ---
 flowchart TB
     subgraph S1["Step 1: shared world and players (built: network.gd)"]
@@ -29,9 +29,11 @@ flowchart TB
         peers4 -->|"objects handed to<br/>their region's owner (every 0.5 s,<br/>unless in use)"| rowner4["Nearby objects simulated together"]
     end
 
-    subgraph S5["Step 5: finishing"]
+    subgraph S5["Step 5: finishing (built)"]
         direction LR
-        undo["Per-player undo<br/>(own strokes only)"] ~~~ save["Saving each region's edits"] ~~~ drop["Recovering when the host<br/>drops out (another takes over<br/>as directory and relay)"]
+        undo["Undo puts back only points<br/>still as your stroke left them:<br/>others' edits since are kept"]
+        succ["Host keeps a succession list<br/>(join order, address, --backup-port)"] -->|"host leaves"| first["First in the list hosts;<br/>takes every object;<br/>saves to user://shared/world-id"]
+        succ -->|"host leaves"| rest["The rest reconnect to it<br/>(next in list after 10 s),<br/>catch up as if joining,<br/>send edits made meanwhile"]
     end
 
     S1 --> S2 --> S3 --> S4 --> S5

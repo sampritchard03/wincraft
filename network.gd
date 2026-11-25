@@ -4,8 +4,10 @@ extends Node
 ##
 ## Start the game with arguments after "--":
 ##   godot-4 --path . -- --host [--port 24565] [--name Sam]
-##   godot-4 --path . -- --join 192.168.1.20[:24565] [--name Alex]
-## Without them it is single-player, as before.
+##   godot-4 --path . -- --join 192.168.1.20[:24565] [--name Alex] [--backup-port 24566]
+## Without them it is single-player, as before. --backup-port: where this
+## computer hosts if it has to take over (two players on one computer need
+## different ones).
 ##
 ## The host plays its own saved world. A player who joins gets the host's
 ## generator settings (so their computer generates the same ground) and the
@@ -50,6 +52,16 @@ extends Node
 ## fast updates only to players within INTEREST_RADIUS of an object; the rest
 ## get one a second.
 ##
+## Step 5. Undo: SculptTerrain's undo puts back only points still as your
+## stroke left them, so undoing never wipes out others' edits since. When
+## the host leaves: everyone has the whole world and every object, so the
+## first player in the host's succession list (join order, with the address
+## and --backup-port the host saw) starts hosting, and the rest reconnect to
+## it (or the next, if it can't be reached in RECONNECT_TIMEOUT). The new host
+## takes over every object and saves the world to user://shared/<world id>
+## (never over its own single-player world); the others catch up from it as
+## if joining. Edits made meanwhile are kept and sent once reconnected.
+##
 ## Terrain edits stay in the host's one order: every computer applies every
 ## edit anyway (each keeps the whole world), so ordering them per region
 ## would spread no work, only add ways for copies to differ.
@@ -68,6 +80,7 @@ const MAX_PLAYERS := 8
 const SEND_INTERVAL := 0.05  # seconds between player updates
 const CHUNKS_PER_FRAME := 8  # sent to a joining player each frame
 const EDIT_INTERVAL := 0.1  # seconds between batches of terrain changes
+const RECONNECT_TIMEOUT := 10.0  # seconds to reach a new host before trying the next
 
 enum Mode { OFFLINE, HOST, CLIENT }
 
@@ -77,6 +90,18 @@ var address := ""
 var port := DEFAULT_PORT
 var player_name := ""
 var status := ""
+var backup_port := DEFAULT_PORT
+## This computer, for the succession list and object ids (peer ids start over
+## when a new host takes over; this doesn't).
+var token := "%08x%04x" % [randi(), Time.get_ticks_usec() & 0xffff]
+## The shared world's name (the host's save folder and seed): a new host saves to user://shared/<world_id>.
+var world_id := ""
+## Host: who takes over if it leaves, in order ({id, token, address, port,
+## name}); everyone gets a copy.
+var roster: Array = []
+var candidates: Array = []  # still to try, after the host left
+var resyncing := false  # reconnected to a new host: catching up with its world
+var connect_deadline := 0.0
 
 ## Joining: the host's settings and how many chunks are still to come.
 var host_settings: Dictionary = {}
@@ -166,6 +191,9 @@ func configure_from_args() -> bool:
 			"--name":
 				player_name = value
 				i += 1
+			"--backup-port":
+				backup_port = int(value)
+				i += 1
 		i += 1
 	if mode == Mode.CLIENT and ":" in address:
 		port = int(address.get_slice(":", 1))
@@ -193,9 +221,12 @@ func start_host() -> void:
 		status = "Hosting failed (port %d)" % port
 		return
 	multiplayer.multiplayer_peer = peer
-	multiplayer.peer_connected.connect(_on_peer_connected)
-	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+	_connect_once(multiplayer.peer_connected, _on_peer_connected)
+	_connect_once(multiplayer.peer_disconnected, _on_peer_disconnected)
 	world.terrain.set_change_tracking(true)
+	if world_id.is_empty():
+		var folder: String = world.terrain.save_path.get_file() if not world.terrain.save_path.is_empty() else "world"
+		world_id = "%s-%d" % [folder, world.terrain.get_world_settings().seed]
 	status = "Hosting on port %d" % port
 	print("Network: ", status)
 
@@ -208,14 +239,29 @@ func start_client() -> void:
 		_fail("Couldn't connect to %s:%d: %s" % [address, port, error_string(error)])
 		return
 	multiplayer.multiplayer_peer = peer
-	multiplayer.connected_to_server.connect(func() -> void:
-		status = "Connected, waiting for the world..."
-		print("Network: connected to ", address))
-	multiplayer.connection_failed.connect(func() -> void: _fail("Couldn't reach %s:%d" % [address, port]))
-	multiplayer.server_disconnected.connect(_on_server_disconnected)
-	multiplayer.peer_disconnected.connect(_on_peer_disconnected)
+	_connect_signals_as_client()
 	status = "Connecting to %s:%d..." % [address, port]
 	print("Network: ", status)
+
+func _connect_signals_as_client() -> void:
+	_connect_once(multiplayer.connected_to_server, _on_connected_to_server)
+	_connect_once(multiplayer.connection_failed, _on_connection_failed)
+	_connect_once(multiplayer.server_disconnected, _on_server_disconnected)
+	_connect_once(multiplayer.peer_disconnected, _on_peer_disconnected)
+
+func _connect_once(p_signal: Signal, p_callable: Callable) -> void:
+	if not p_signal.is_connected(p_callable):
+		p_signal.connect(p_callable)
+
+func _on_connected_to_server() -> void:
+	status = "Connected, waiting for the world..."
+	print("Network: connected to ", address)
+
+func _on_connection_failed() -> void:
+	if synced:
+		_try_next_candidate()  # (a new host after the old one left)
+	else:
+		_fail("Couldn't reach %s:%d" % [address, port])
 
 func _fail(p_message: String) -> void:
 	push_error(p_message)
@@ -236,7 +282,7 @@ func _on_peer_connected(p_id: int) -> void:
 	var chunks: Array = world.terrain.get_edited_chunks()
 	outgoing[p_id] = chunks
 	print("Network: player %d joined, sending %d edited chunks" % [p_id, chunks.size()])
-	_welcome.rpc_id(p_id, world.terrain.get_world_settings(), _wrapped(world.player.global_position), chunks.size())
+	_welcome.rpc_id(p_id, world.terrain.get_world_settings(), _wrapped(world.player.global_position), chunks.size(), world_id)
 	# Every object, with its owner (they appear once the joiner's world is ready).
 	for id in bodies:
 		var b = bodies[id]
@@ -266,10 +312,18 @@ func _send_chunks() -> void:
 # --- Joining: receiving the world ---------------------------------------------------
 
 @rpc("authority", "call_remote", "reliable")
-func _welcome(p_settings: Dictionary, p_host_position: Vector3, p_chunk_count: int) -> void:
+func _welcome(p_settings: Dictionary, p_host_position: Vector3, p_chunk_count: int, p_world_id: String) -> void:
+	world_id = p_world_id
+	chunks_expected = p_chunk_count
+	_hello.rpc_id(1, player_name, backup_port, token)
+	if resyncing:
+		# A new host, after the old one left: its world replaces ours.
+		status = "Catching up with the new host: %d chunks" % p_chunk_count
+		print("Network: ", status)
+		_check_resynced()
+		return
 	host_settings = p_settings
 	host_spawn = p_host_position
-	chunks_expected = p_chunk_count
 	status = "Receiving the world..."
 	print("Network: world settings received, %d edited chunks to come" % p_chunk_count)
 	settings_received.emit()
@@ -285,6 +339,9 @@ func _apply_chunks(p_coords: Array, p_data: Array) -> void:
 	for i in p_coords.size():
 		world.terrain.set_chunk_data(p_coords[i], p_data[i])
 	chunks_received += p_coords.size()
+	if resyncing:
+		_check_resynced()
+		return
 	status = "Receiving the world: %d / %d chunks" % [chunks_received, chunks_expected]
 	_check_synced()
 
@@ -305,12 +362,140 @@ func _check_synced() -> void:
 	joined.emit()
 
 
+func _connected() -> bool:
+	return multiplayer.multiplayer_peer != null and \
+			multiplayer.multiplayer_peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED
+
+
+# --- When the host leaves (step 5) --------------------------------------------------
+
+## Each player, on joining a host: where it would host if it had to take over.
+@rpc("any_peer", "call_remote", "reliable")
+func _hello(p_name: String, p_port: int, p_token: String) -> void:
+	if not multiplayer.is_server():
+		return
+	var id := multiplayer.get_remote_sender_id()
+	var enet := multiplayer.multiplayer_peer as ENetMultiplayerPeer
+	var where := enet.get_peer(id).get_remote_address() if enet != null and enet.get_peer(id) != null else "127.0.0.1"
+	roster = roster.filter(func(e: Dictionary) -> bool: return e.token != p_token)
+	roster.append({"id": id, "token": p_token, "address": where, "port": p_port, "name": p_name})
+	_roster.rpc(roster)
+
+@rpc("authority", "call_remote", "reliable")
+func _roster(p_roster: Array) -> void:
+	roster = p_roster
+
+func _on_server_disconnected() -> void:
+	if not synced:
+		_fail("The host left before the world arrived")
+		return
+	print("Network: the host left")
+	for id in remotes.keys():
+		_remove_remote(id)
+	multiplayer.multiplayer_peer = null
+	_flush_edits()  # (kept: there's no host to send them to)
+	resyncing = true
+	chunks_received = 0
+	chunks_expected = -1
+	candidates = roster.duplicate()
+	_try_next_candidate()
+
+## The next player in the succession list: us (we host), or someone to
+## reconnect to; nobody left: play on alone.
+func _try_next_candidate() -> void:
+	multiplayer.multiplayer_peer = null
+	while not candidates.is_empty():
+		var c: Dictionary = candidates.pop_front()
+		if c.token == token:
+			_become_host()
+			return
+		address = c.address
+		port = c.port
+		var peer := ENetMultiplayerPeer.new()
+		if peer.create_client(address, port) != OK:
+			continue
+		multiplayer.multiplayer_peer = peer
+		_connect_signals_as_client()
+		connect_deadline = _now() + RECONNECT_TIMEOUT
+		status = "The host left: reconnecting to %s (%s:%d)..." % [c.name, address, port]
+		print("Network: ", status)
+		return
+	_go_offline("The host left: playing on alone (unsaved)")
+
+func _become_host() -> void:
+	mode = Mode.HOST
+	resyncing = false
+	port = backup_port
+	start_host()
+	if mode != Mode.HOST:
+		_go_offline("The host left, and hosting here failed (port %d): playing on alone" % port)
+		return
+	# Our edits are the world now; every object is simulated here until the
+	# regions are given out again.
+	unconfirmed.clear()
+	for id in bodies:
+		var b = bodies[id]
+		if is_instance_valid(b):
+			b.set_meta("net_owner", 1)
+			_simulate_here(b, true)
+	region_owners.clear()
+	peer_speed.clear()
+	peer_strain.clear()
+	roster.clear()
+	var saved := ""
+	if world.terrain.save_path.is_empty() and not world_id.is_empty():
+		var path := "user://shared".path_join(world_id)
+		if world.terrain.save_world_as(path):
+			saved = ", saving to " + ProjectSettings.globalize_path(path)
+	status = "The host left: you are the host now (port %d%s)" % [port, saved]
+	print("Network: ", status)
+
+## Caught up with a new host: our kept edits go back on top, and to it.
+func _check_resynced() -> void:
+	if not resyncing or chunks_expected < 0 or chunks_received < chunks_expected:
+		return
+	resyncing = false
+	_flush_edits()
+	var kept := unconfirmed
+	unconfirmed = []
+	for batch in kept:
+		_apply_changes(batch[1], false)
+		next_batch_id += 1
+		unconfirmed.append([next_batch_id, batch[1]])
+		_submit_edits.rpc_id(1, next_batch_id, batch[1])
+	status = "Rejoined: %s is hosting" % address
+	print("Network: ", status, " (%d kept edit batches sent)" % kept.size())
+
+func _go_offline(p_status: String) -> void:
+	status = p_status
+	print("Network: ", status)
+	resyncing = false
+	world.terrain.set_change_tracking(false)
+	unconfirmed.clear()
+	for id in remotes.keys():
+		_remove_remote(id)
+	for b in bodies.values():  # everything is ours now
+		if is_instance_valid(b):
+			_simulate_here(b, true)
+			for key in ["net_id", "net_owner", "net_sim", "net_frozen", "net_target", "net_turn", "net_shape", "net_sent"]:
+				b.remove_meta(key)
+	bodies.clear()
+	multiplayer.multiplayer_peer = null
+	mode = Mode.OFFLINE
+
+
 # --- Sculpting ---------------------------------------------------------------------------
 
 ## Sends what this computer's edits changed since last time (to the host, or
-## from the host straight to everyone).
+## from the host straight to everyone). Without a host (it left; catching up
+## with a new one) they're kept, to send once back (_rejoined()).
 func _flush_edits() -> void:
 	if not world.terrain.is_change_tracking():
+		return
+	if mode == Mode.CLIENT and (resyncing or not _connected()):
+		var kept: Array = world.terrain.take_changes()
+		if not kept.is_empty():
+			unconfirmed.append([0, kept])  # (0: not sent yet)
 		return
 	var changes: Array = world.terrain.take_changes()
 	if changes.is_empty() or multiplayer.multiplayer_peer == null:
@@ -357,12 +542,13 @@ func _apply_edits(p_origin: int, p_batch_id: int, p_changes: Array) -> void:
 	_flush_edits()
 	_apply_changes(p_changes)
 	for batch in unconfirmed:
-		_apply_changes(batch[1])
+		_apply_changes(batch[1], false)
 	batches_received += 1
 
-func _apply_changes(p_changes: Array) -> void:
+## p_remote: another player's changes (false: our own, put back on top).
+func _apply_changes(p_changes: Array, p_remote := true) -> void:
 	for i in range(0, p_changes.size() - 1, 2):
-		world.terrain.apply_change(p_changes[i], p_changes[i + 1])
+		world.terrain.apply_change(p_changes[i], p_changes[i + 1], p_remote)
 
 
 # --- Physics objects ---------------------------------------------------------------
@@ -470,7 +656,7 @@ func _scan_bodies() -> void:
 			if b is DensityBody3D and not b is DensityCharacter3D and b.pickable and b.shape != null \
 					and not b.has_meta("net_id") and not b.has_meta("net_avatar") and not b.is_queued_for_deletion():
 				next_body += 1
-				var id := "%d:%d" % [me, next_body]
+				var id := "%s:%d" % [token, next_body]
 				b.set_meta("net_id", id)
 				b.set_meta("net_owner", me)
 				b.set_meta("net_sim", true)
@@ -487,6 +673,7 @@ func _spawn(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
 
 func _spawn_now(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
 	if bodies.has(p_id):
+		_set_owner_now(p_id, p_owner)  # (a new host telling us who has it now)
 		return
 	var shape := DensityShape.from_dict(p_desc.shape)
 	var b: DensityBody3D
@@ -827,6 +1014,8 @@ func _on_peer_disconnected(p_id: int) -> void:
 	_remove_remote(p_id)
 	outgoing.erase(p_id)
 	if multiplayer.is_server():
+		roster = roster.filter(func(e: Dictionary) -> bool: return e.id != p_id)
+		_roster.rpc(roster)
 		# Their objects: simulated here from now on.
 		for id in bodies.keys():
 			var b = bodies[id]
@@ -834,25 +1023,6 @@ func _on_peer_disconnected(p_id: int) -> void:
 				b.set_meta("net_owner", 1)
 				_simulate_here(b, true)
 				_set_owner.rpc(id, 1)
-
-func _on_server_disconnected() -> void:
-	if not synced:
-		_fail("The host left before the world arrived")
-		return
-	status = "The host left: playing on alone (unsaved)"
-	print("Network: ", status)
-	world.terrain.set_change_tracking(false)
-	unconfirmed.clear()
-	for id in remotes.keys():
-		_remove_remote(id)
-	for b in bodies.values():  # everything is ours now
-		if is_instance_valid(b):
-			_simulate_here(b, true)
-			for key in ["net_id", "net_owner", "net_sim", "net_frozen", "net_target", "net_turn", "net_shape", "net_sent"]:
-				b.remove_meta(key)
-	bodies.clear()
-	multiplayer.multiplayer_peer = null
-	mode = Mode.OFFLINE
 
 ## Sends this player's state to everyone (the host relays to the others).
 @rpc("any_peer", "call_remote", "unreliable_ordered")
@@ -938,6 +1108,11 @@ func _process(delta: float) -> void:
 	if mode == Mode.CLIENT and not synced:
 		world.info_label.text = status  # (world.gd isn't running yet)
 		return
+	if mode == Mode.CLIENT and resyncing and not _connected() and _now() > connect_deadline:
+		_try_next_candidate()  # (couldn't reach that one in time)
+		return
+	if not _connected():
+		return  # (reconnecting: nothing can be sent yet)
 	edit_timer += delta
 	if edit_timer >= EDIT_INTERVAL:
 		edit_timer = 0.0

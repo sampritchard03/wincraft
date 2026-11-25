@@ -1280,6 +1280,38 @@ bool VoxelWorld::read_settings() {
 	return true;
 }
 
+bool VoxelWorld::adopt_dir(const String &p_dir) {
+	if (!dir.is_empty() || p_dir.is_empty()) {
+		last_error = "adopt_dir: this world already saves somewhere (or no directory given)";
+		return false;
+	}
+	const String target = ProjectSettings::get_singleton()->globalize_path(p_dir);
+	if (DirAccess::make_dir_recursive_absolute(target) != OK) {
+		last_error = "Could not create " + target;
+		return false;
+	}
+	// An older save there (of an earlier session) goes: this copy replaces it.
+	const PackedStringArray files = DirAccess::get_files_at(target);
+	for (int64_t i = 0; i < files.size(); i++) {
+		const String name = files[i];
+		if ((name.begins_with("r.") && name.ends_with(".bin")) || name == "world.cfg" || name.ends_with(".tmp")) {
+			DirAccess::remove_absolute(target.path_join(name));
+		}
+	}
+	dir = target;
+	region_files.clear();
+	if (!write_settings()) {
+		dir = String();
+		return false;
+	}
+	for (Chunk &chunk : chunks) {
+		if (chunk.edited) {
+			chunk.dirty = true;
+		}
+	}
+	return true;
+}
+
 bool VoxelWorld::open(const String &p_dir, int p_threads) {
 	close();
 	bool ok = true;

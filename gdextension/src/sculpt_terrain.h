@@ -121,6 +121,10 @@ public:
 	// Opens the world at save_path (empty = don't save). Returns false (and
 	// prints why) if it can't, in which case the world still runs, unsaved.
 	bool open_world();
+	// Multiplayer: a world opened unsaved (a joined player's copy) starts
+	// saving at p_path (emptied first), all of it written now. False (and
+	// nothing changed) if it already saves somewhere.
+	bool save_world_as(const String &p_path);
 
 	// --- Sharing the world (multiplayer) --------------------------------------
 	// Every generator setting (world type, seed, sizes, noise...), as the
@@ -144,7 +148,10 @@ public:
 	void set_change_tracking(bool p_on) { world.set_change_tracking(p_on); }
 	bool is_change_tracking() const { return world.is_change_tracking(); }
 	Array take_changes();
-	bool apply_change(const Vector3i &p_chunk, const PackedByteArray &p_change);
+	// p_remote: another player's change (true), or one of this computer's own
+	// being put back on top (false). Another player's change that lands
+	// during a stroke counts as having been there before it, for undo.
+	bool apply_change(const Vector3i &p_chunk, const PackedByteArray &p_change, bool p_remote = true);
 	// Writes all changes now. Returns false if a write failed.
 	bool save_world();
 	// Moves the clipmap to follow p_camera_position, uploads changed levels,
@@ -438,16 +445,33 @@ private:
 		const std::vector<MaterialId> &materials_before, const std::vector<MaterialId> &materials_after);
 	// A stroke's undo entry: each chunk it changed, as it was before (or,
 	// on the redo stack, as it was after). Undo and redo swap them in.
+	// A stroke's undo step: per chunk, the points it changed, with their
+	// values before and after. Undo puts back only points still as the stroke
+	// left them, and redo only ones still as they were before it, so undoing
+	// your own stroke never wipes out edits made since by someone else
+	// (multiplayer). Alone it's the same as swapping whole chunks: strokes
+	// undo newest first.
 	struct UndoChunk {
 		Vector3i chunk;
-		std::vector<int8_t> density;
+		std::vector<int8_t> density; // while recording: the whole chunk as it was before the stroke
 		std::vector<MaterialId> materials;
+		std::vector<uint16_t> points; // when done: the points the stroke changed...
+		std::vector<int8_t> density_before, density_after; // ... and their values
+		std::vector<MaterialId> material_before, material_after;
 	};
 	struct UndoStep {
 		std::vector<UndoChunk> chunks;
 		std::unordered_map<Vector3i, size_t, Vector3iHash> index; // chunk -> position in `chunks` (while recording)
-		size_t bytes() const { return chunks.size() * (size_t)VoxelWorld::CHUNK_POINTS * (1 + sizeof(MaterialId)); }
+		size_t bytes() const {
+			size_t total = 0;
+			for (const UndoChunk &c : chunks) {
+				total += c.density.size() * (1 + sizeof(MaterialId)) + c.points.size() * (2 + 2 + 2 * sizeof(MaterialId)) + 64;
+			}
+			return total;
+		}
 	};
+	// Turns the recorded chunks into the points the stroke changed.
+	void finish_step(UndoStep &r_step);
 	static constexpr int MAX_UNDO_STEPS = 100;
 	static constexpr size_t MAX_UNDO_BYTES = 256u << 20;
 	std::vector<UndoStep> undo_stack, redo_stack; // most recent last
@@ -455,8 +479,8 @@ private:
 	size_t undo_bytes = 0;
 	// Records chunk p_chunk's data (about to change) into the stroke.
 	void record_chunk(const Vector3i &p_chunk, const VoxelWorld::ChunkData &p_data);
-	// Swaps the chunks of p_step with the world's, refreshing the view.
-	void swap_step(UndoStep &r_step);
+	// Undoes (p_undo) or redoes p_step's points, refreshing the view.
+	void swap_step(UndoStep &r_step, bool p_undo);
 	// Grab: the terrain as it was when the grab began, captured chunk by chunk.
 	struct SnapshotChunk {
 		std::vector<float> density;
