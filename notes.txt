@@ -1,0 +1,10 @@
+Entire world is currently sent when logging into multiplayer 
+world,should only send chunks necessary for player to load in.
+
+Symmetry does not work on physics objects
+
+Physics objects have a small size limit
+
+Painted objects have the color underneath show through sometimes
+
+Player name tag large
