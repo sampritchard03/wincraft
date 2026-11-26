@@ -130,7 +130,17 @@ bool DensityBody3D::shape_changed() const {
 	if (shape.is_null()) {
 		return false;
 	}
-	return shape->get_version() != shape_version || (int)std::lround(pose) != probe_key;
+	return shape->get_version() != shape_version || nearest_frame() != probe_frame;
+}
+
+int DensityBody3D::nearest_frame() const {
+	if (shape.is_null() || shape->get_key_count() == 0) {
+		return -1;
+	}
+	int a, b;
+	float t;
+	shape->pose_frames(pose, a, b, t, key_weights);
+	return t < 0.5f ? a : b;
 }
 
 void DensityBody3D::update_inertia() {
@@ -142,7 +152,7 @@ void DensityBody3D::update_inertia() {
 		const DensityShape *grid = shape.ptr();
 		// A grid: its solid's mass spread (key 0), its skin as probes.
 		shape_version = grid->get_version();
-		probe_key = std::clamp((int)std::lround(pose), 0, grid->get_key_count() - 1);
+		probe_frame = nearest_frame();
 		if (auto_material_properties) {
 			grid->physical_properties(mass, bounce, friction);
 			mass *= scale * scale * scale;
@@ -157,7 +167,7 @@ void DensityBody3D::update_inertia() {
 				inertia.rows[a][b] = mass * (unit.rows[a][b] * scale * scale + (a == b ? shift.length_squared() : 0.0) - shift[a] * shift[b]);
 			}
 		}
-		for (const Vector4 &p : grid->probes(probe_key)) {
+		for (const Vector4 &p : grid->probes(probe_frame)) {
 			local_offsets.push_back((Vector3(p.x, p.y, p.z) - com_local) * scale);
 			local_radii.push_back(p.w * (float)scale);
 		}
@@ -708,6 +718,51 @@ void DensityBody3D::set_pose(double p_value) {
 	// A new nearest key's probes: the next step picks them up (shape_changed()).
 }
 
+void DensityBody3D::set_key_weights(const PackedFloat32Array &p_weights) {
+	key_weights = p_weights;
+}
+
+void DensityBody3D::set_key_weight(int p_key, double p_weight) {
+	ERR_FAIL_COND(p_key < 0 || p_key > 4096);
+	if (p_key >= key_weights.size()) {
+		if (p_weight == 0.0) {
+			return;
+		}
+		key_weights.resize(p_key + 1); // (new ones 0)
+	}
+	key_weights.set(p_key, (float)p_weight);
+}
+
+double DensityBody3D::get_key_weight(int p_key) const {
+	return p_key >= 0 && p_key < key_weights.size() ? key_weights[p_key] : 0.0;
+}
+
+bool DensityBody3D::_set(const StringName &p_name, const Variant &p_value) {
+	const String name = p_name;
+	if (!name.begins_with("key_weight/")) {
+		return false;
+	}
+	set_key_weight((int)name.get_slicec('/', 1).to_int(), (double)p_value);
+	return true;
+}
+
+bool DensityBody3D::_get(const StringName &p_name, Variant &r_ret) const {
+	const String name = p_name;
+	if (!name.begins_with("key_weight/")) {
+		return false;
+	}
+	r_ret = get_key_weight((int)name.get_slicec('/', 1).to_int());
+	return true;
+}
+
+void DensityBody3D::_get_property_list(List<PropertyInfo> *p_list) const {
+	// One per key (saved as key_weights).
+	const int keys = shape.is_valid() ? shape->get_key_count() : 0;
+	for (int k = 0; k < keys; k++) {
+		p_list->push_back(PropertyInfo(Variant::FLOAT, vformat("key_weight/%d", k), PROPERTY_HINT_RANGE, "-1,2,0.001", PROPERTY_USAGE_EDITOR));
+	}
+}
+
 void DensityBody3D::set_auto_material_properties(bool p_value) {
 	auto_material_properties = p_value;
 	inertia_dirty = true;
@@ -740,8 +795,8 @@ double DensityBody3D::distance_at(const Vector3 &p_point, Vector3 &r_normal) {
 	}
 	if (shape.is_valid()) {
 		const Vector3 local = to_local(p_point);
-		r_normal = rotation.xform(shape->get_normal(local, pose));
-		return shape->get_density(local, pose) * scale;
+		r_normal = rotation.xform(shape->get_normal(local, pose, key_weights));
+		return shape->get_density(local, pose, key_weights) * scale;
 	}
 	double best = -1e30;
 	r_normal = Vector3(0, 1, 0);
@@ -763,7 +818,7 @@ double DensityBody3D::density_at(const Vector3 &p_point) {
 	}
 	if (shape.is_valid()) {
 		const Vector3 local = to_local(p_point);
-		return shape->get_density(local, pose) * scale;
+		return shape->get_density(local, pose, key_weights) * scale;
 	}
 	double best = -1e30;
 	for (size_t i = 0; i < world_centers.size(); i++) {
@@ -800,7 +855,7 @@ bool DensityBody3D::apply_brush(const Vector3 &p_center, double p_radius, double
 	const Transform3D t = get_global_transform();
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
 	const Vector3 local = t.affine_inverse().xform(p_center);
-	const bool any = shape->apply_brush(local, p_radius / s, p_strength / s, p_mode, p_material, edit_key);
+	const bool any = shape->apply_brush(local, p_radius / s, p_strength / s, p_mode, p_material, edit_key, pose, key_weights);
 	if (any) {
 		inertia_dirty = true;
 		wake();
@@ -819,7 +874,7 @@ bool DensityBody3D::paint_color(const Vector3 &p_center, double p_radius, const 
 	const Transform3D t = get_global_transform();
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
 	const Vector3 local = t.affine_inverse().xform(p_center);
-	return shape->paint_color(local, p_radius / s, p_color, p_opacity, p_hardness);
+	return shape->paint_color(local, p_radius / s, p_color, p_opacity, p_hardness, pose, key_weights);
 }
 
 void DensityBody3D::begin_grab() {
@@ -856,7 +911,7 @@ bool DensityBody3D::warp_copies(const PackedVector3Array &p_centers, const Packe
 		centers.push_back(inv.xform(p_centers[i]));
 		deltas.push_back(inv.basis.xform(p_deltas[i]));
 	}
-	const bool any = shape->warp(centers, deltas, p_radius / s, p_grab, edit_key);
+	const bool any = shape->warp(centers, deltas, p_radius / s, p_grab, edit_key, pose, key_weights);
 	if (any) {
 		inertia_dirty = true;
 	}
@@ -974,6 +1029,10 @@ void DensityBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_shape"), &DensityBody3D::get_shape);
 	ClassDB::bind_method(D_METHOD("set_pose", "pose"), &DensityBody3D::set_pose);
 	ClassDB::bind_method(D_METHOD("get_pose"), &DensityBody3D::get_pose);
+	ClassDB::bind_method(D_METHOD("set_key_weights", "weights"), &DensityBody3D::set_key_weights);
+	ClassDB::bind_method(D_METHOD("get_key_weights"), &DensityBody3D::get_key_weights);
+	ClassDB::bind_method(D_METHOD("set_key_weight", "key", "weight"), &DensityBody3D::set_key_weight);
+	ClassDB::bind_method(D_METHOD("get_key_weight", "key"), &DensityBody3D::get_key_weight);
 	ClassDB::bind_method(D_METHOD("set_auto_center_of_mass", "enabled"), &DensityBody3D::set_auto_center_of_mass);
 	ClassDB::bind_method(D_METHOD("is_auto_center_of_mass"), &DensityBody3D::is_auto_center_of_mass);
 	ClassDB::bind_method(D_METHOD("set_edit_key", "key"), &DensityBody3D::set_edit_key);
@@ -997,8 +1056,9 @@ void DensityBody3D::_bind_methods() {
 
 	ADD_GROUP("Shape", "");
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "shape", PROPERTY_HINT_RESOURCE_TYPE, "DensityShape"), "set_shape", "get_shape");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pose", PROPERTY_HINT_RANGE, "0,16,0.001,or_greater"), "set_pose", "get_pose");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "edit_key", PROPERTY_HINT_RANGE, "-1,16,1"), "set_edit_key", "get_edit_key");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pose", PROPERTY_HINT_RANGE, "0,64,0.001,or_greater"), "set_pose", "get_pose");
+	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "key_weights", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_key_weights", "get_key_weights");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "edit_key", PROPERTY_HINT_RANGE, "-1,64,1,or_greater"), "set_edit_key", "get_edit_key");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_VECTOR4_ARRAY, "spheres"), "set_spheres", "get_spheres");
 	ADD_GROUP("Physics", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "mass", PROPERTY_HINT_RANGE, "0.001,1000,0.001,or_greater"), "set_mass", "get_mass");

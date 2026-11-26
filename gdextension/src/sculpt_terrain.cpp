@@ -752,12 +752,13 @@ void SculptTerrain::mark_edited(const Vector3i &p_min, const Vector3i &p_max) {
 }
 
 int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key) {
-	const uint64_t id = p_body->get_instance_id();
+	// Shared by every body drawing this shape in this frame (frogs share one).
+	const uint64_t id = p_shape->get_instance_id();
 	const int layers = std::clamp(p_shape->get_size().z, 1, GRID_SLOT);
 	int found = -1;
 	for (int i = 0; i < (int)grid_slots.size(); i++) {
 		const GridSlot &s = grid_slots[i];
-		if (s.body == id && s.key == p_key && s.shape == p_shape.ptr()) {
+		if (s.shape == id && s.key == p_key) {
 			found = i;
 			break;
 		}
@@ -800,9 +801,8 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 		GridSlot s;
 		s.base = base;
 		s.count = layers;
-		s.body = id;
 		s.key = p_key;
-		s.shape = p_shape.ptr();
+		s.shape = id;
 		grid_slots.push_back(s);
 		found = (int)grid_slots.size() - 1;
 	}
@@ -867,8 +867,8 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 	material->set_shader_parameter("body_colors", colors);
 	material->set_shader_parameter("body_sphere_count", sphere_count);
 
-	// Grids: each pose key in a slot of the atlas (uploaded when new or
-	// sculpted), the two keys around the body's pose blended by the shader.
+	// Grids: each pose frame in a slot of the atlas (uploaded when new or
+	// sculpted), the two frames around the body's pose blended by the shader.
 	if (body_atlas.is_null()) {
 		TypedArray<Image> layers;
 		layers.resize(GRID_SLOTS * GRID_SLOT);
@@ -902,9 +902,9 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		if (shape.is_null() || shape->get_key_count() == 0) {
 			continue;
 		}
-		int ka, kb;
+		int ka, kb; // frames (the keys and in-betweens)
 		float blend;
-		shape->pose_keys(d.body->get_pose(), ka, kb, blend);
+		shape->pose_frames(d.body->get_pose(), ka, kb, blend, d.body->get_key_weights());
 		const int slot_a = grid_slot(d.body, shape, ka);
 		const int slot_b = kb == ka ? slot_a : grid_slot(d.body, shape, kb);
 		if (slot_a < 0 || slot_b < 0) {

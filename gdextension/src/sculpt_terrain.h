@@ -402,9 +402,8 @@ private:
 	void bind_bodies(const Vector3 &p_camera);
 	Ref<Texture2DArray> body_atlas;
 	struct GridSlot {
-		uint64_t body = 0;
-		int key = -1;
-		const void *shape = nullptr;
+		uint64_t shape = 0; // its instance id
+		int key = -1; // frame
 		int64_t version = -1;
 		uint64_t used = 0;
 		int base = 0, count = 0; // its layers

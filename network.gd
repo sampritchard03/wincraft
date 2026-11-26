@@ -74,6 +74,8 @@ extends Node
 ## keep the player near 0 (_wrap_player()), differently on each computer.
 ## Each receiver puts a remote player at the repeat nearest its own.
 
+const BodyAnimation := preload("res://body_animation.gd")
+
 signal settings_received  ## joining: open the world with host_settings, then call world_opened()
 signal joined  ## joining: every edited chunk has arrived and been applied
 signal join_failed
@@ -725,7 +727,24 @@ func _describe(p_body: DensityBody3D) -> Dictionary:
 	var frozen: bool = p_body.freeze if p_body.get_meta("net_sim", true) else p_body.get_meta("net_frozen", false)
 	return {"scene": p_body.scene_file_path, "shape": p_body.shape.to_dict(), "props": props,
 			"position": _wrapped(p_body.global_position), "turn": p_body.global_basis.get_rotation_quaternion(),
-			"velocity": p_body.linear_velocity, "spin": p_body.angular_velocity, "frozen": frozen, "pose": p_body.pose}
+			"velocity": p_body.linear_velocity, "spin": p_body.angular_velocity, "frozen": frozen, "pose": _pose_of(p_body), "animation": BodyAnimation.to_dict(p_body)}
+
+## A body's pose: its `pose`, or [pose, key weights] while it weighs keys in.
+func _pose_of(p_body: DensityBody3D) -> Variant:
+	var weights: PackedFloat32Array = p_body.key_weights
+	for w in weights:
+		if w != 0.0:
+			return [p_body.pose, weights]
+	return p_body.pose
+
+func _set_pose(p_body: DensityBody3D, p_pose: Variant) -> void:
+	if p_pose is Array:
+		p_body.pose = p_pose[0]
+		p_body.key_weights = p_pose[1]
+	else:
+		p_body.pose = p_pose
+		if not p_body.key_weights.is_empty():
+			p_body.key_weights = PackedFloat32Array()
 
 ## Finds objects made here (thrown, dropped, P, imported, cut off) and gives
 ## them ids, and objects removed here (X, broken, fallen out), and tells
@@ -779,7 +798,8 @@ func _spawn_now(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
 	b.global_transform = Transform3D(Basis(p_desc.turn), _nearest_repeat(p_desc.position))
 	b.linear_velocity = p_desc.velocity
 	b.angular_velocity = p_desc.spin
-	b.pose = p_desc.pose
+	_set_pose(b, p_desc.pose)
+	BodyAnimation.apply(b, p_desc.get("animation", {}))
 	b.freeze = p_desc.frozen
 	_simulate_here(b, p_owner == multiplayer.get_unique_id())
 
@@ -796,7 +816,7 @@ func _despawn(p_id: String) -> void:
 ## Where the objects simulated here are, and their shapes when sculpted.
 ## Moving ones: every BODY_INTERVAL to players within INTEREST_RADIUS, every
 ## REST_INTERVAL to the rest; ones at rest: every REST_INTERVAL to everyone.
-## A state: id, wrapped position, turn, velocity, spin, pose, flags (1 frozen,
+## A state: id, wrapped position, turn, velocity, spin, pose (see _pose_of()), flags (1 frozen,
 ## 2 sleeping, 4 in use).
 func _send_bodies() -> void:
 	var now := _now()
@@ -824,7 +844,7 @@ func _send_bodies() -> void:
 			b.set_meta("net_sent", now)
 		var flags := (1 if b.freeze else 0) | (2 if b.sleeping else 0) | (4 if _in_use(b) else 0)
 		var state := [id, _wrapped(b.global_position), b.global_basis.get_rotation_quaternion(),
-				b.linear_velocity, b.angular_velocity, b.pose, flags]
+				b.linear_velocity, b.angular_velocity, _pose_of(b), flags]
 		for peer in peers:
 			if everyone or _peer_near(peer, b.global_position):
 				batches[peer].append_array(state)
@@ -860,7 +880,7 @@ func _states(p_batch: Array) -> void:
 		b.set_meta("net_turn", p_batch[i + 2])
 		b.linear_velocity = p_batch[i + 3]  # what objects here bounce off
 		b.angular_velocity = p_batch[i + 4]  # (kept, for a hand-over)
-		b.pose = p_batch[i + 5]
+		_set_pose(b, p_batch[i + 5])
 		var flags: int = p_batch[i + 6]
 		b.set_meta("net_frozen", flags & 1 != 0)
 		b.set_meta("net_sleeping", flags & 2 != 0)

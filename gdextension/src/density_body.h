@@ -5,6 +5,7 @@
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/variant/basis.hpp>
 #include <godot_cpp/variant/color.hpp>
+#include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_vector4_array.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
 
@@ -100,11 +101,21 @@ public:
 	// property (an AnimationPlayer track on "pose").
 	void set_pose(double p_value);
 	double get_pose() const { return pose; }
+	// Keys weighed in on top of the pose, one weight per key (0: none, 1:
+	// all of it; see DensityShape): several at once add up. Also properties
+	// "key_weight/0", "key_weight/1"... (one per key of the shape) to
+	// animate each on a track of its own.
+	void set_key_weights(const PackedFloat32Array &p_weights);
+	PackedFloat32Array get_key_weights() const { return key_weights; }
+	void set_key_weight(int p_key, double p_weight);
+	double get_key_weight(int p_key) const;
 	// The shape's centre of mass is its solid's centroid (off: center_of_mass).
 	void set_auto_center_of_mass(bool p_value);
 	bool is_auto_center_of_mass() const { return auto_center_of_mass; }
 	// Which key brushes edit: -1 = all of them (the usual: sculpting a frog
-	// changes every pose), or one, to sculpt a single pose.
+	// changes the shape itself, where the brush is on it in the pose shown,
+	// so it shows in every pose), or one, to sculpt a single pose (grab and
+	// snake hook move its parts; see DensityShape).
 	void set_edit_key(int p_value) { edit_key = p_value; }
 	int get_edit_key() const { return edit_key; }
 	// A shape's mass, bounce and friction come from its materials (stone
@@ -182,6 +193,9 @@ public:
 
 protected:
 	static void _bind_methods();
+	bool _set(const StringName &p_name, const Variant &p_value);
+	bool _get(const StringName &p_name, Variant &r_ret) const;
+	void _get_property_list(List<PropertyInfo> *p_list) const;
 	void _notification(int p_what);
 
 	PackedVector4Array spheres;
@@ -211,7 +225,10 @@ protected:
 	int edit_key = -1;
 	bool own_shape = false;
 	int64_t shape_version = -1; // the shape's, when the probes were made
-	int probe_key = -1;
+	int probe_frame = -1; // the shape frame the probes are of
+	PackedFloat32Array key_weights;
+	// The shape frame nearest how it looks now (see DensityShape::pose_frames()).
+	int nearest_frame() const;
 	bool stepped = false; // the step state below has been filled in
 	Vector3 com_local; // centre of mass in the node's space (unscaled)
 

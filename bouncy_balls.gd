@@ -11,6 +11,8 @@ extends Node3D
 ## Balls are saved to objects.cfg in the world's save directory. Only balls
 ## near the player are loaded (see stream()).
 
+const BodyAnimation := preload("res://body_animation.gd")
+
 @export var ball_radius := 3.0
 @export var throw_speed := 220.0
 @export var bounce := 0.8
@@ -114,6 +116,8 @@ func _entry_of(p_ball: DensityBody3D) -> Dictionary:
 		"sleeping": p_ball.sleeping,
 		"mass": p_ball.mass,
 		"frozen": p_ball.freeze,
+		"key_weights": p_ball.key_weights,
+		"animation": BodyAnimation.to_dict(p_ball),  # its animations, and the one it plays
 	}
 
 func _restore(p_entry: Dictionary, p_position: Vector3) -> void:
@@ -126,6 +130,8 @@ func _restore(p_entry: Dictionary, p_position: Vector3) -> void:
 	ball.sleeping = p_entry.get("sleeping", false)
 	ball.mass = p_entry.get("mass", 1.0)
 	ball.freeze = p_entry.get("frozen", false)
+	ball.key_weights = p_entry.get("key_weights", PackedFloat32Array())
+	BodyAnimation.apply(ball, p_entry.get("animation", {}))
 
 ## p_to - p_from the short way round the wrapping world (x and z).
 func _offset_from(p_from: Vector3, p_to: Vector3) -> Vector3:

@@ -2,19 +2,32 @@ extends Node
 ## The object editor: press M looking at a ball, frog or other body to edit
 ## it (M again to leave). The body holds still and a panel and timeline
 ## appear. The usual tools sculpt and paint it (the panel's "Sculpt" picks
-## whether brushes change every pose key or just one).
+## whether brushes change the shape itself or one key).
 ##
-## Pose keys: a body's shape can hold several keys (like a mesh's shape
-## keys); its `pose` blends between them (1.5 = halfway from key 1 to key 2).
-## The pose slider sets it; with Auto key on, each change is keyed at the
-## current frame.
+## Shape keys: a body's shape can hold several keys (like a mesh's shape
+## keys), each with a name and a weight slider: a key at 1 shows all of it,
+## and several at once add up (a mouth key and a leg key both at 1: mouth
+## open and leg out). Key 0 is the plain shape the others are added to.
+## Clicking a key's name makes it the current key (the key buttons act on
+## it, and "Sculpt: Current key" sculpts it). "Add key" makes a new key of
+## how the body looks now and makes it current. Grab or snake hook on one key
+## moves its parts (weighing it in then moves them there, keeping their
+## shape), other brushes add to that key only. Sculpting "All keys" changes
+## the shape itself where the brush is on it as shown, so what you add
+## follows the part it's on in every key.
 ##
-## Animation: I keys the pose at the current frame, U removes the keys there,
-## Y plays / pauses, , and . step a frame (Shift: to the previous / next
-## key). Tab frees the mouse for the panels (settings, animations, export).
+## Animation: each weight is keyed on a track of its own (".:key_weight/2"
+## ...), with Auto key as you move its slider; I keys every weight in use at
+## the current frame, U removes the keys there, Y plays / pauses, , and .
+## step a frame (Shift: to the previous / next key). Tab frees the mouse for
+## the panels (settings, animations, export). "Plays by itself" picks the
+## animation the body plays on its own when not being edited (a ball's
+## "ball1", say): it's saved with the world's objects.
 ##
 ## The animations live on the body itself, in its AnimationPlayer (made if
 ## it has none), so the frog's AnimationTree, say, can play what you make here.
+
+const BodyAnimation := preload("res://body_animation.gd")
 
 var world: Node  # world.gd
 var active := false
@@ -45,8 +58,14 @@ var timeline_panel: PanelContainer
 var title_label: Label
 var help_label: Label
 var status_label: Label
-var pose_slider: HSlider
+var weights_box: VBoxContainer
+var weight_sliders: Array[HSlider] = []
+var key_buttons: Array[Button] = []
 var edit_key_select: OptionButton
+var key_name_edit: LineEdit
+var plays_select: OptionButton
+var current_key := 0  # the key the key buttons act on
+var sculpt_target := -1  # what brushes edit: -1 all keys, -2 the current key, else that key
 var physics_check: CheckBox
 var auto_com_check: CheckBox
 var autokey_check: CheckBox
@@ -133,25 +152,22 @@ func open(p_body: DensityBody3D) -> void:
 	body.angular_velocity = Vector3.ZERO
 	# Its own copy to edit (frogs share one shape).
 	body.shape = body.shape.duplicate_shape()
-	anim_tree = null
-	for child in body.get_children():
-		if child is AnimationTree:
-			anim_tree = child
+	anim_tree = BodyAnimation.tree_of(body)
 	if anim_tree != null:
 		tree_was_active = anim_tree.active
 		anim_tree.active = false
-	player = null
-	for child in body.get_children():
-		if child is AnimationPlayer:
-			player = child
-	if player == null:
-		player = AnimationPlayer.new()
-		player.name = "AnimationPlayer"
-		body.add_child(player)
+	player = BodyAnimation.player_of(body, true)
+	player.stop()  # (what it plays by itself: on again when the editor closes)
 	if not player.has_animation_library(""):
 		player.add_animation_library("", AnimationLibrary.new())
 	var names := player.get_animation_list()
-	anim_name = names[0] if not names.is_empty() else ""
+	var plays: String = BodyAnimation.get_plays(body)
+	anim_name = plays if plays != "" else (names[0] if not names.is_empty() else "")
+	if not _has_pose_tracks():
+		body.pose = 0.0  # (keys are weighed in on top of key 0)
+	current_key = clampi(current_key, 0, maxi(body.shape.get_key_count() - 1, 0))
+	sculpt_target = -1
+	body.edit_key = -1
 	time = 0.0
 	playing = false
 	physics_check.set_pressed_no_signal(false)
@@ -169,10 +185,14 @@ func close() -> void:
 		body.edit_key = -1
 		body.freeze = was_frozen
 		body.sleeping = false
+		if is_instance_valid(player):
+			player.stop()
 		if anim_tree != null and is_instance_valid(anim_tree):
-			if is_instance_valid(player):
-				player.stop()
 			anim_tree.active = tree_was_active
+		# Back to what it plays by itself (if anything).
+		var plays: String = BodyAnimation.get_plays(body)
+		if plays != "":
+			BodyAnimation.set_plays(body, plays)
 	body = null
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
@@ -198,9 +218,7 @@ func _process(_delta: float) -> void:
 		seen_keys = body.shape.get_key_count()
 		_refresh_ui()
 	if playing:
-		updating_ui = true
-		pose_slider.value = body.pose
-		updating_ui = false
+		_show_weights()
 	_draw_center_of_mass()
 	_update_status()
 	timeline.queue_redraw()
@@ -251,15 +269,47 @@ func _new_animation(p_name := "anim") -> void:
 	_show_time()
 	_refresh_ui()
 
-## Keys the body's pose at the current time (only with two or more keys:
-## with one there is nothing to blend).
+## Keys the body's key weights that are in use (not 0, or already on a
+## track) at the current time.
 func _insert_keys() -> void:
 	if not is_instance_valid(body) or body.shape.get_key_count() < 2:
 		return
 	if _anim() == null:
 		_new_animation()
-	_set_key(_anim(), NodePath(".:pose"), Animation.TYPE_VALUE, body.pose)
+	for k in body.shape.get_key_count():
+		var path := _weight_path(k)
+		if body.get_key_weight(k) != 0.0 or _anim().find_track(path, Animation.TYPE_VALUE) >= 0:
+			_set_key(_anim(), path, Animation.TYPE_VALUE, body.get_key_weight(k))
 	timeline.queue_redraw()
+
+## Whether any of the body's animations moves its `pose` (the frog's do:
+## left alone then).
+func _has_pose_tracks() -> bool:
+	for anim_key in player.get_animation_list():
+		if player.get_animation(anim_key).find_track(NodePath(".:pose"), Animation.TYPE_VALUE) >= 0:
+			return true
+	return false
+
+func _weight_path(p_key: int) -> NodePath:
+	return NodePath(".:key_weight/%d" % p_key)
+
+## Keys one key weight at the current time.
+func _insert_weight_key(p_key: int) -> void:
+	if not is_instance_valid(body):
+		return
+	if _anim() == null:
+		_new_animation()
+	_set_key(_anim(), _weight_path(p_key), Animation.TYPE_VALUE, body.get_key_weight(p_key))
+	timeline.queue_redraw()
+
+## The weight sliders as the body has them.
+func _show_weights() -> void:
+	if not is_instance_valid(body):
+		return
+	updating_ui = true
+	for k in weight_sliders.size():
+		weight_sliders[k].value = body.get_key_weight(k)
+	updating_ui = false
 
 func _set_key(p_anim: Animation, p_path: NodePath, p_type: Animation.TrackType, p_value) -> void:
 	var track := p_anim.find_track(p_path, p_type)
@@ -352,10 +402,7 @@ func _show_time() -> void:
 	player.seek(time, true)
 	if not playing:
 		player.pause()
-	if pose_slider != null and is_instance_valid(body):
-		updating_ui = true
-		pose_slider.value = body.pose
-		updating_ui = false
+	_show_weights()
 
 
 # --- Drawing --------------------------------------------------------------------
@@ -394,31 +441,68 @@ func _make_panels() -> void:
 	side_panel.offset_right = -8
 	side_panel.offset_top = 72
 	side_panel.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	# Down to just above the timeline (it'd go under it, unclickable, with
+	# many keys), scrolling when there's more.
+	side_panel.anchor_bottom = 1.0
+	side_panel.offset_bottom = -166
 	ui.add_child(side_panel)
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	side_panel.add_child(scroll)
 	var box := VBoxContainer.new()
 	box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	side_panel.add_child(box)
+	scroll.add_child(box)
 	title_label = Label.new()
 	box.add_child(title_label)
-	pose_slider = _slider(box, "Pose (blends the shape's keys)", 0.0, 1.0, func(v: float) -> void:
-		if is_instance_valid(body):
-			body.pose = v
-			if auto_key:
-				_insert_keys())
+	box.add_child(_label("Shape keys (click a name: current key; weights add up)"))
+	weights_box = VBoxContainer.new()
+	box.add_child(weights_box)
+	var key_row := HBoxContainer.new()
+	box.add_child(key_row)
+	_button(key_row, "Add key", _add_key)
+	_button(key_row, "<", func() -> void: _move_key(-1))
+	_button(key_row, ">", func() -> void: _move_key(1))
+	_button(key_row, "Reset", _reset_key)
+	_button(key_row, "Remove", _remove_key)
+	key_name_edit = LineEdit.new()
+	key_name_edit.placeholder_text = "Name the current key (Enter)"
+	key_name_edit.text_submitted.connect(func(t: String) -> void:
+		_rename_key(t)
+		key_name_edit.text = ""
+		key_name_edit.release_focus())
+	box.add_child(key_name_edit)
 	box.add_child(_label("Sculpt"))
 	edit_key_select = OptionButton.new()
 	edit_key_select.focus_mode = Control.FOCUS_NONE
 	edit_key_select.item_selected.connect(func(i: int) -> void:
 		if not updating_ui and is_instance_valid(body):
-			body.edit_key = i - 1)  # item 0: all keys
+			sculpt_target = edit_key_select.get_item_id(i)
+			_apply_sculpt_target())
 	box.add_child(edit_key_select)
 	physics_check = _check(box, "Physics on (test it; off puts it back)", _set_physics)
 	auto_com_check = _check(box, "Auto centre of mass", func(on: bool) -> void:
 		if is_instance_valid(body):
 			body.auto_center_of_mass = on)
 	_button(box, "Centre of mass at the crosshair", _set_com_here)
-	autokey_check = _check(box, "Auto key the pose slider", func(on: bool) -> void: auto_key = on)
+	autokey_check = _check(box, "Auto key the weight sliders", func(on: bool) -> void: auto_key = on)
 	autokey_check.set_pressed_no_signal(true)
+	# (Here, not along the bottom: that row is full.)
+	box.add_child(_label("Plays by itself (when not editing)"))
+	plays_select = OptionButton.new()
+	plays_select.focus_mode = Control.FOCUS_NONE
+	plays_select.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	plays_select.clip_text = true
+	plays_select.item_selected.connect(func(i: int) -> void:
+		if updating_ui or not is_instance_valid(body):
+			return
+		# Kept as the body's own: it starts when the editor closes (and
+		# whenever the body is loaded again).
+		var chosen := "" if i == 0 else plays_select.get_item_text(i)
+		if chosen == "":
+			body.remove_meta(BodyAnimation.META)
+		else:
+			body.set_meta(BodyAnimation.META, chosen))
+	box.add_child(plays_select)
 	var files := HBoxContainer.new()
 	box.add_child(files)
 	_button(files, "Export model", _export_model)
@@ -457,6 +541,8 @@ func _make_panels() -> void:
 		var wanted := t.strip_edges()
 		if _anim() != null and wanted != "" and not player.has_animation(wanted):
 			_library().rename_animation(anim_name, wanted)
+			if BodyAnimation.get_plays(body) == anim_name:
+				body.set_meta(BodyAnimation.META, wanted)
 			anim_name = wanted
 		anim_name_edit.text = ""
 		anim_name_edit.release_focus()
@@ -467,6 +553,8 @@ func _make_panels() -> void:
 			if playing:
 				_toggle_play()
 			player.stop()
+			if BodyAnimation.get_plays(body) == anim_name:
+				body.remove_meta(BodyAnimation.META)
 			_library().remove_animation(anim_name)
 			var names := player.get_animation_list()
 			anim_name = names[0] if not names.is_empty() else ""
@@ -494,7 +582,7 @@ func _make_panels() -> void:
 	rows.add_child(status_label)
 	help_label = Label.new()
 	help_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	help_label.text = "The usual tools sculpt and paint the body.   M: leave   I: key the pose   U: delete key   Y: play   , .: frame (Shift: key)   Tab: mouse for these panels"
+	help_label.text = "The usual tools sculpt and paint the body.   M: leave   I: key the weights   U: delete key   Y: play   , .: frame (Shift: key)   Tab: mouse for these panels"
 	rows.add_child(help_label)
 
 func _label(p_text: String) -> Label:
@@ -575,15 +663,58 @@ func _refresh_ui() -> void:
 	updating_ui = true
 	var shape: DensityShape = body.shape
 	var keys := shape.get_key_count()
-	title_label.text = "Object editor: %s   (%d pose keys)" % [body.name, keys]
-	pose_slider.max_value = maxf(keys - 1, 0.001)
-	pose_slider.editable = keys > 1
-	pose_slider.value = body.pose
+	current_key = clampi(current_key, 0, maxi(keys - 1, 0))
+	if sculpt_target >= keys:
+		sculpt_target = -1
+	title_label.text = "Object editor: %s   (%d shape keys)" % [body.name, keys]
 	edit_key_select.clear()
-	edit_key_select.add_item("All keys")
+	edit_key_select.add_item("All keys (the shape itself)", -1)
+	edit_key_select.add_item("Current key (%s)" % shape.get_key_label(current_key), -2)
 	for k in keys:
-		edit_key_select.add_item("Key %d only" % k)
-	edit_key_select.select(clampi(body.edit_key + 1, 0, keys))
+		edit_key_select.add_item("%s only" % shape.get_key_label(k), k)
+	edit_key_select.select(edit_key_select.get_item_index(sculpt_target))
+	_apply_sculpt_target()
+	# A row per key: its name (click: the current key) and weight (key 0 is
+	# usually the plain shape the others are added to: its slider only
+	# works once it has a weight).
+	for child in weights_box.get_children():
+		child.queue_free()
+	weight_sliders.clear()
+	key_buttons.clear()
+	for k in keys:
+		var row := HBoxContainer.new()
+		weights_box.add_child(row)
+		var name_button := Button.new()
+		name_button.text = shape.get_key_label(k)
+		name_button.toggle_mode = true
+		name_button.button_pressed = k == current_key
+		name_button.focus_mode = Control.FOCUS_NONE
+		name_button.custom_minimum_size.x = 96
+		name_button.clip_text = true
+		name_button.tooltip_text = "Make %s the current key" % shape.get_key_label(k)
+		var picked := k
+		name_button.pressed.connect(func() -> void: _set_current_key(picked))
+		row.add_child(name_button)
+		key_buttons.append(name_button)
+		var slider := HSlider.new()
+		slider.min_value = 0.0
+		slider.max_value = 1.0
+		slider.step = 0.01
+		slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		slider.focus_mode = Control.FOCUS_NONE
+		slider.value = body.get_key_weight(k)
+		slider.editable = k > 0 or body.get_key_weight(0) != 0.0
+		var key := k
+		slider.value_changed.connect(func(v: float) -> void:
+			if updating_ui or not is_instance_valid(body):
+				return
+			body.set_key_weight(key, v)
+			if auto_key:
+				_insert_weight_key(key)
+			if current_key != key:
+				_set_current_key(key))
+		row.add_child(slider)
+		weight_sliders.append(slider)
 	auto_com_check.set_pressed_no_signal(body.auto_center_of_mass)
 	anim_select.clear()
 	var names := player.get_animation_list()
@@ -595,14 +726,135 @@ func _refresh_ui() -> void:
 	if anim != null:
 		length_spin.value = anim.length
 		loop_check.set_pressed_no_signal(anim.loop_mode != Animation.LOOP_NONE)
+	plays_select.clear()
+	plays_select.add_item("(nothing)")
+	var plays: String = BodyAnimation.get_plays(body)
+	for i in names.size():
+		plays_select.add_item(names[i])
+		if names[i] == plays:
+			plays_select.select(i + 1)
 	updating_ui = false
+
+## The key the key buttons act on.
+func _current_key() -> int:
+	return clampi(current_key, 0, maxi(body.shape.get_key_count() - 1, 0))
+
+## (In place: a slider being dragged stays.)
+func _set_current_key(p_key: int) -> void:
+	current_key = p_key
+	for k in key_buttons.size():
+		key_buttons[k].set_pressed_no_signal(k == current_key)
+	var at := edit_key_select.get_item_index(-2)
+	if at >= 0:
+		edit_key_select.set_item_text(at, "Current key (%s)" % body.shape.get_key_label(current_key))
+	_apply_sculpt_target()
+
+## Brushes edit what "Sculpt" says (the current key follows it).
+func _apply_sculpt_target() -> void:
+	if not is_instance_valid(body):
+		return
+	body.edit_key = _current_key() if sculpt_target == -2 else sculpt_target
+
+func _rename_key(p_name: String) -> void:
+	if not is_instance_valid(body) or body.shape.get_key_count() == 0:
+		return
+	var k := _current_key()
+	_change_shape(func(s: DensityShape) -> void: s.set_key_name(k, p_name))
+
+## After keys moved: animation tracks and the body's weights follow them
+## (p_map[old] = new, -1 removed).
+func _remap_keys(p_map: PackedInt32Array) -> void:
+	BodyAnimation.remap_weight_tracks(body, p_map)
+	var old: PackedFloat32Array = body.key_weights
+	var weights := PackedFloat32Array()
+	weights.resize(body.shape.get_key_count())
+	for i in mini(old.size(), p_map.size()):
+		if p_map[i] >= 0 and p_map[i] < weights.size():
+			weights[p_map[i]] = old[i]
+	body.key_weights = weights
+
+## Changes a copy of the body's shape with p_change (given the copy), as one undo step.
+func _change_shape(p_change: Callable) -> void:
+	if not is_instance_valid(body):
+		return
+	var before: DensityShape = body.shape
+	var after: DensityShape = before.duplicate_shape()
+	p_change.call(after)
+	body.shape = after
+	world._push_history({"body": body, "before": before, "after": after,
+			"part_shapes": [], "part_transform": body.global_transform, "parts": []})
+	_refresh_ui()
+
+## A new last key, as the body looks now (pose and key weights), picked for
+## sculpting and shown.
+func _add_key() -> void:
+	if not is_instance_valid(body):
+		return
+	var added := body.shape.get_key_count()
+	if added == 0:
+		return
+	var weights: PackedFloat32Array = body.key_weights
+	_change_shape(func(s: DensityShape) -> void: s.add_key(body.pose, weights))
+	# Shown as it was: the new key alone, at 1 (it has the others in it).
+	var shown := PackedFloat32Array()
+	shown.resize(added + 1)
+	shown[added] = 1.0
+	body.key_weights = shown
+	body.pose = 0.0
+	current_key = added
+	if auto_key:
+		_insert_keys()
+	_refresh_ui()
+
+## Moves the current key one place earlier (-1) or later (1).
+func _move_key(p_by: int) -> void:
+	if not is_instance_valid(body):
+		return
+	var k := _current_key()
+	var to := k + p_by
+	if to < 0 or to >= body.shape.get_key_count():
+		return
+	_change_shape(func(s: DensityShape) -> void: s.move_key(k, to))
+	var map := PackedInt32Array(range(body.shape.get_key_count()))
+	map[k] = to
+	map[to] = k
+	_remap_keys(map)
+	current_key = to
+	if sculpt_target == k:
+		sculpt_target = to
+	elif sculpt_target == to:
+		sculpt_target = k
+	_refresh_ui()
+
+## The current key back to the plain shape (no motion, nothing of its own).
+func _reset_key() -> void:
+	if not is_instance_valid(body):
+		return
+	var k := _current_key()
+	_change_shape(func(s: DensityShape) -> void: s.reset_key(k))
+
+func _remove_key() -> void:
+	if not is_instance_valid(body) or body.shape.get_key_count() <= 1:
+		return
+	var k := _current_key()
+	var count := body.shape.get_key_count()
+	_change_shape(func(s: DensityShape) -> void: s.remove_key(k))
+	var map := PackedInt32Array()
+	for i in count:
+		map.append(-1 if i == k else (i if i < k else i - 1))
+	_remap_keys(map)
+	if sculpt_target >= 0:
+		sculpt_target = -1
+	current_key = maxi(k - 1, 0)
+	body.pose = minf(body.pose, body.shape.get_key_count() - 1)
+	_refresh_ui()
 
 func _update_status() -> void:
 	var anim := _anim()
 	var frame := roundi(time * fps)
-	status_label.text = "%s   frame %d / %d (%.2f s)   pose %.2f" % [anim_name if anim != null else "(no animation: I keys one)", frame,
-			roundi(anim.length * fps) if anim != null else 0, time, body.pose]
-	world.info_label.text = "Object editor - %d pose keys   %d FPS" % [body.shape.get_key_count(), Engine.get_frames_per_second()]
+	status_label.text = "%s   frame %d / %d (%.2f s)   current key: %s" % [anim_name if anim != null else "(no animation: I keys one)", frame,
+			roundi(anim.length * fps) if anim != null else 0, time, body.shape.get_key_label(_current_key())]
+	world.info_label.text = "Object editor - %d shape keys   %d FPS" % [body.shape.get_key_count(), Engine.get_frames_per_second()]
 
 
 # --- Files --------------------------------------------------------------------------
@@ -666,7 +918,7 @@ func export_scene_to(path: String) -> void:
 		root.name = path.get_file().get_basename().validate_node_name()
 		root.shape = body.shape.duplicate_shape()
 		for property in ["mass", "bounce", "friction", "gravity_scale", "linear_damp", "angular_damp", "rolling_resistance",
-				"auto_material_properties", "auto_center_of_mass", "center_of_mass", "collide_with_bodies", "drawn", "color", "material", "pose"]:
+				"auto_material_properties", "auto_center_of_mass", "center_of_mass", "collide_with_bodies", "drawn", "color", "material", "pose", "key_weights"]:
 			root.set(property, body.get(property))
 		var animator := AnimationPlayer.new()
 		animator.name = "AnimationPlayer"
@@ -696,7 +948,7 @@ class Timeline extends Control:
 		draw_rect(Rect2(Vector2.ZERO, size), Color(0.08, 0.08, 0.1, 0.9))
 		var anim: Animation = editor._anim()
 		if anim == null or anim.length <= 0.0:
-			draw_string(get_theme_default_font(), Vector2(8, h * 0.6), "No animation yet: move the pose slider and press I (or New)")
+			draw_string(get_theme_default_font(), Vector2(8, h * 0.6), "No animation yet: move a key's weight slider (or press I, or New)")
 			return
 		var fps: float = editor.fps
 		var frames := roundi(anim.length * fps)

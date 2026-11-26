@@ -506,7 +506,7 @@ void SculptTerrain::stamp_shape(const Ref<DensityShape> &p_shape, const Transfor
 				if (d > before[i]) {
 					after[i] = d;
 					if (d > -2.0f) {
-						materials_after[i] = (MaterialId)(p_material >= 0 ? p_material : p_shape->get_material_at(local));
+						materials_after[i] = (MaterialId)(p_material >= 0 ? p_material : p_shape->get_material_at(local, p_pose));
 					}
 				}
 				if (d > -0.5f) {
