@@ -220,6 +220,27 @@ void SculptTerrain::set_prepass_material(const Ref<ShaderMaterial> &p_material) 
 	bind_material();
 }
 
+void SculptTerrain::set_extra_materials(const Array &p_materials) {
+	extra_materials = p_materials;
+	bind_material();
+}
+
+std::vector<Ref<ShaderMaterial>> SculptTerrain::clip_materials() const {
+	std::vector<Ref<ShaderMaterial>> list;
+	for (const Ref<ShaderMaterial> &m : { material, prepass_material }) {
+		if (m.is_valid()) {
+			list.push_back(m);
+		}
+	}
+	for (int64_t i = 0; i < extra_materials.size(); i++) {
+		const Ref<ShaderMaterial> m = extra_materials[i];
+		if (m.is_valid()) {
+			list.push_back(m);
+		}
+	}
+	return list;
+}
+
 void SculptTerrain::set_view_distance(double p_value) {
 	view_distance = std::max(p_value, 16.0);
 	bind_material();
@@ -364,10 +385,8 @@ void SculptTerrain::update_view(const Vector3 &p_camera_position, bool p_wait) {
 	if (changed) {
 		bind_material();
 	}
-	for (const Ref<ShaderMaterial> &m : { material, prepass_material }) {
-		if (m.is_valid()) {
-			m->set_shader_parameter("view_position", p_camera_position);
-		}
+	for (const Ref<ShaderMaterial> &m : clip_materials()) {
+		m->set_shader_parameter("view_position", p_camera_position);
 	}
 	// Keep the area around the camera in memory (a few milliseconds' worth
 	// of loading a frame), and now and then let go of what's far away.
@@ -452,10 +471,7 @@ void SculptTerrain::bind_material() {
 	while (count < clipmap.get_level_count() && clipmap.level(count).published && clip_textures[count].is_valid()) {
 		count++;
 	}
-	for (const Ref<ShaderMaterial> &m : { material, prepass_material }) {
-		if (m.is_null()) {
-			continue;
-		}
+	for (const Ref<ShaderMaterial> &m : clip_materials()) {
 		for (int l = 0; l < MAX_CLIP_LEVELS; l++) {
 			m->set_shader_parameter(vformat("clip_texture%d", l), clip_textures[l]);
 		}
@@ -748,6 +764,7 @@ bool SculptTerrain::apply_change(const Vector3i &p_chunk, const PackedByteArray 
 
 void SculptTerrain::mark_edited(const Vector3i &p_min, const Vector3i &p_max) {
 	cache_generation++;
+	edit_serial++;
 	DensityBody3D::wake_near(Vector3(p_min), Vector3(p_max + Vector3i(1, 1, 1)), world.world_size());
 }
 
@@ -1921,6 +1938,9 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_material"), &SculptTerrain::get_material);
 	ClassDB::bind_method(D_METHOD("set_prepass_material", "material"), &SculptTerrain::set_prepass_material);
 	ClassDB::bind_method(D_METHOD("get_prepass_material"), &SculptTerrain::get_prepass_material);
+	ClassDB::bind_method(D_METHOD("set_extra_materials", "materials"), &SculptTerrain::set_extra_materials);
+	ClassDB::bind_method(D_METHOD("get_extra_materials"), &SculptTerrain::get_extra_materials);
+	ClassDB::bind_method(D_METHOD("get_edit_serial"), &SculptTerrain::get_edit_serial);
 	ClassDB::bind_method(D_METHOD("set_clip_size", "size"), &SculptTerrain::set_clip_size);
 	ClassDB::bind_method(D_METHOD("get_clip_size"), &SculptTerrain::get_clip_size);
 	ClassDB::bind_method(D_METHOD("set_clip_levels", "levels"), &SculptTerrain::set_clip_levels);

@@ -23,7 +23,14 @@ add_library(wincraft_native SHARED
 )
 target_link_libraries(wincraft_native PRIVATE godot-cpp Threads::Threads)
 
-if(WIN32)
+set(WINCRAFT_ARCH x86_64)
+if(ANDROID)
+    # Meta Quest (and other Android XR headsets): arm64. Built with the NDK's
+    # toolchain file and ANDROID_STL=c++_static (see build.sh), so the APK
+    # needs no libc++_shared.so beside it.
+    set(WINCRAFT_PLATFORM android)
+    set(WINCRAFT_ARCH arm64)
+elseif(WIN32)
     set(WINCRAFT_PLATFORM windows)
     if(MINGW)
         # Self-contained DLL: no libstdc++ / libgcc / winpthread DLLs needed beside it.
@@ -39,7 +46,7 @@ set_target_properties(wincraft_native PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     POSITION_INDEPENDENT_CODE ON
     PREFIX "lib"
-    OUTPUT_NAME "wincraft_native.${WINCRAFT_PLATFORM}.${GODOTCPP_TARGET}.x86_64"
+    OUTPUT_NAME "wincraft_native.${WINCRAFT_PLATFORM}.${GODOTCPP_TARGET}.${WINCRAFT_ARCH}"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )

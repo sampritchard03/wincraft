@@ -99,6 +99,13 @@ public:
 	// Gets the same clipmap parameters as `material` (terrain_prepass.gdshader).
 	void set_prepass_material(const Ref<ShaderMaterial> &p_material);
 	Ref<ShaderMaterial> get_prepass_material() const { return prepass_material; }
+	// More materials that read the clipmap (the sun shadow maps' passes): they
+	// get the same clipmap parameters as `material`.
+	void set_extra_materials(const Array &p_materials);
+	Array get_extra_materials() const { return extra_materials; }
+	// Changes whenever the terrain does (any edit, undo, another player's
+	// change, a received chunk): for things computed from it to redo.
+	int64_t get_edit_serial() const { return edit_serial; }
 	void set_clip_size(int p_size);
 	int get_clip_size() const { return clip_size; }
 	void set_clip_levels(int p_levels);
@@ -333,6 +340,10 @@ private:
 	double autosave_interval = 30.0;
 	Ref<ShaderMaterial> material;
 	Ref<ShaderMaterial> prepass_material;
+	Array extra_materials;
+	int64_t edit_serial = 0;
+	// material, prepass_material and extra_materials (the valid ones).
+	std::vector<Ref<ShaderMaterial>> clip_materials() const;
 	int clip_size = 256;
 	int clip_levels = 4;
 	// 109, 218, 436, 872, 1744, 3488, 6976, 13952

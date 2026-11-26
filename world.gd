@@ -55,6 +55,12 @@ var editor: ObjectEditor
 ## Multiplayer (network.gd): hosting or joining, from the command line.
 const Network := preload("res://network.gd")
 var network: Network
+## VR (vr.gd): a headset, if one is running (Meta Quest through OpenXR).
+const VR := preload("res://vr.gd")
+var vr: VR
+## Sun shadows from shadow maps (sun_shadows.gd).
+const SunShadows := preload("res://sun_shadows.gd")
+var sun_shadows: SunShadows
 ## The ball or frog the brush is on this frame (null: the terrain).
 var target_body: DensityBody3D = null
 ## A body being sculpted is held still for the stroke (it would roll away
@@ -311,12 +317,19 @@ func _finish_ready(p_start: int) -> void:
 	material.set_shader_parameter("use_prepass", use_prepass)
 	prepass_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS if use_prepass else SubViewport.UPDATE_DISABLED
 	terrain.update_view(camera.global_position)  # builds and uploads the clipmap
+	sun_shadows = SunShadows.new(terrain)
+	add_child(sun_shadows)
 	_sync_prepass_camera()
 	print("World opened in %d ms" % (Time.get_ticks_msec() - p_start))
 
 	get_viewport().size_changed.connect(_fit_screen)
 	_fit_screen()
 	_make_symmetry_visuals()
+	vr = VR.new()
+	vr.name = "VR"
+	vr.world = self
+	add_child(vr)
+	vr.start()
 	if network.mode == Network.Mode.HOST:
 		network.start_host()
 	network.world_ready()
@@ -768,6 +781,8 @@ func _process(delta: float) -> void:
 		off = 0.0
 	camera_lag = off
 	camera.global_position = eye + Vector3.UP * camera_lag
+	if vr != null and vr.active:
+		vr.follow(player.global_position)  # the headset decides where the camera is
 
 	_sculpt(delta)
 	_update_gizmo()
@@ -775,6 +790,7 @@ func _process(delta: float) -> void:
 	_update_box()
 	_record_history()
 	terrain.update_view(camera.global_position)  # also sends the drawn bodies to the shader
+	sun_shadows.update(camera.global_position)
 
 	_sync_prepass_camera()
 

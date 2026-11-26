@@ -267,7 +267,9 @@ void vertex() {
 
 void fragment() {
 	vec3 rd = view_ray(SCREEN_UV, INV_PROJECTION_MATRIX, INV_VIEW_MATRIX);
-	vec3 ro = CAMERA_POSITION_WORLD;
+	// In VR each eye's rays start at that eye (EYE_OFFSET, view space; zero
+	// without multiview), so the two views have the right parallax.
+	vec3 ro = CAMERA_POSITION_WORLD + mat3(INV_VIEW_MATRIX) * EYE_OFFSET;
 	vec3 sun = normalize(sun_direction);
 
 	// Projection [1][1] = 1 / tan(fov / 2): a pixel spans 2 / ([1][1] * height).
@@ -349,7 +351,7 @@ void fragment() {
 		float shadow_fade = smoothstep(300.0, 700.0, t);
 		float shadow = 0.0;
 		if (diffuse > 0.0) {
-			shadow = shadow_fade < 1.0 ? mix(sun_shadow(p, n, sun, scale), 1.0, shadow_fade) : 1.0;
+			shadow = shadow_fade < 1.0 ? mix(sun_map_on ? sun_map_shadow(p, n, sun, scale) : sun_shadow(p, n, sun, scale), 1.0, shadow_fade) : 1.0;
 		}
 		float ao = ambient_occlusion(p, n, scale) * body_occlusion(p, n, sphere, grid);
 		vec3 sky_light = mix(horizon_color * 0.5, sky_color, 0.5 + 0.5 * n.y) * ambient_strength;
