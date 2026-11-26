@@ -281,6 +281,67 @@ int trace_spheres(vec3 ro, vec3 rd, out float r_t) {
 	return hit;
 }
 
+// Sun shadow maps (sun_shadows.gd, terrain_sun_map.gdshader): for each texel
+// of a square facing the sun, how far its ray from sun_map_origin went before
+// meeting the ground (/ sun_map_depth). Map 0 is fine and near the camera, map
+// 1 coarse and wide. Off (sun_map_on false) until both have been drawn.
+uniform bool sun_map_on = false;
+uniform sampler2D sun_map0 : filter_nearest;
+uniform sampler2D sun_map1 : filter_nearest;
+uniform vec3 sun_map_origin0;
+uniform vec3 sun_map_origin1;
+uniform float sun_map_extent0 = 256.0;
+uniform float sun_map_extent1 = 1536.0;
+uniform float sun_map_depth0 = 512.0;
+uniform float sun_map_depth1 = 1500.0;
+uniform vec3 sun_map_right;
+uniform vec3 sun_map_up;
+uniform float sun_map_size = 512.0;
+
+// One map's verdict at p (1 lit, 0 shadow, between at an edge): four texels
+// around it compared and blended (so edges are smooth, not texel squares).
+// r_covered: whether p is inside the map at all.
+float sun_map_lookup(sampler2D p_map, vec3 p_origin, float p_extent, float p_depth, vec3 p, vec3 sun, float p_bias, out bool r_covered) {
+	vec3 rel = p - p_origin;
+	vec2 uv = vec2(dot(rel, sun_map_right), dot(rel, sun_map_up)) / p_extent + 0.5;
+	float t = -dot(rel, sun); // how far along its texel's ray p is
+	r_covered = all(greaterThan(uv, vec2(0.01))) && all(lessThan(uv, vec2(0.99))) && t > 0.0 && t < p_depth;
+	if (!r_covered) {
+		return 1.0;
+	}
+	vec2 texel = uv * sun_map_size - 0.5;
+	vec2 b = floor(texel);
+	vec2 f = texel - b;
+	ivec2 c = ivec2(b);
+	int last = int(sun_map_size) - 1;
+	float lit[4];
+	for (int k = 0; k < 4; k++) {
+		ivec2 q = clamp(c + ivec2(k & 1, k >> 1), ivec2(0), ivec2(last));
+		lit[k] = t - p_bias <= texelFetch(p_map, q, 0).r * p_depth ? 1.0 : 0.0;
+	}
+	return mix(mix(lit[0], lit[1], f.x), mix(lit[2], lit[3], f.x), f.y);
+}
+
+// The sun shadow from the maps (the bodies' own shadows as sun_shadow()).
+float sun_map_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
+	vec3 start = p + n * 0.5 * scale;
+	if (sphere_shadow(start, sun) || grid_shadow(start, sun)) {
+		return 0.0;
+	}
+	// A texel's ray sees its whole square as one depth: on a slope, part of
+	// the square is nearer the sun than its middle. Allow for that.
+	float ndl = max(dot(n, sun), 0.05);
+	float slope = min(sqrt(1.0 - ndl * ndl) / ndl, 4.0);
+	bool covered;
+	float texel0 = sun_map_extent0 / sun_map_size;
+	float lit = sun_map_lookup(sun_map0, sun_map_origin0, sun_map_extent0, sun_map_depth0, p, sun, texel0 * (1.0 + slope) + 0.5 * scale, covered);
+	if (covered) {
+		return lit;
+	}
+	float texel1 = sun_map_extent1 / sun_map_size;
+	return sun_map_lookup(sun_map1, sun_map_origin1, sun_map_extent1, sun_map_depth1, p, sun, texel1 * (1.0 + slope) + 0.5 * scale, covered);
+}
+
 // 1 = sunlit, 0 = shadowed: hard shadows. A ray is in shadow only once a
 // sample lands inside solid; passing close to a surface doesn't count
 // (scoring near misses gave soft edges, but they depend on where samples

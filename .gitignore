@@ -15,3 +15,8 @@ gdextension/build/
 *.bak
 *.old
 ~*
+
+# Exported Android packages (Meta Quest)
+/build/
+*.apk
+*.aab

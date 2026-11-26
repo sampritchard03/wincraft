@@ -257,6 +257,11 @@ protected:
 	float smallest = 1.0f; // smallest sphere radius
 	Basis inverse_inertia_local; // about the centre of mass, scaled
 	bool inertia_dirty = true;
+	// A capsule (DensityCharacter3D): other bodies' distances to it are worked
+	// out from it exactly (capsule_radius > 0), not from its spheres, of which
+	// a big one has thousands. Its axis, node space.
+	double capsule_radius = 0.0;
+	Vector3 capsule_a, capsule_b;
 	Transform3D written; // what the last step set, to spot teleports
 	bool has_written = false;
 	double still_time = 0.0;
@@ -279,6 +284,8 @@ protected:
 	void integrate(double p_h, const Vector3 &p_gravity);
 	void collide_terrain(SculptTerrain *p_terrain, double p_rest_speed);
 	void add_contact(const Vector3 &p_position, const Vector3 &p_normal, uint64_t p_body, int p_sphere);
+	// How far inside the capsule (capsule_radius) a world point is, and the way out.
+	double capsule_inside(const Vector3 &p_point, Vector3 &r_normal) const;
 	// Velocity of a world point moving with the body.
 	Vector3 point_velocity(const Vector3 &p_point) const;
 	void push(const Vector3 &p_impulse, const Vector3 &p_point);
@@ -350,8 +357,41 @@ private:
 	// The spheres it collides with (offset from the feet, radius); the
 	// lowest first. See rebuild_spheres().
 	std::vector<Vector4> samples;
+	// Well under the ~7.9 voxels the terrain's density tells distances to: its
+	// distances understate more the farther out they are, and bigger samples
+	// (7 was tried) left a big player standing several voxels above the ground.
 	static constexpr double MAX_SAMPLE_RADIUS = 5.0;
 	std::vector<DensityBody3D *> near_bodies;
+	// The samples in patches (spatially, a few dozen whatever the size): a
+	// patch whose bounding sphere the ground can't reach (by the terrain's
+	// coarse data, SculptTerrain.clear_distance()) and no near body touches
+	// is skipped whole. A big player's samples are mostly far from anything.
+	struct Patch {
+		Vector3 centre; // from the feet
+		double reach = 0.0; // bounding radius of its samples
+		int level = 0; // coarse level whose distances cover the reach (-1: always check)
+		std::vector<int> members; // samples (small patches) or small patches (big ones)
+	};
+	// Two tiers: big patches (a fraction of the radius across, a few dozen)
+	// hold small ones (~SMALL_PATCH voxels), which hold the samples. A big
+	// one clear of the ground skips all of its small ones; on the ground,
+	// only the small ones near it check their samples.
+	static constexpr double SMALL_PATCH = 12.0;
+	std::vector<Patch> patches; // big
+	std::vector<Patch> small_patches;
+	// Remembered checks (worst_gap()): for each patch (big, then small) and
+	// sample, where the feet were and how far they may move before it needs
+	// checking again (<= 0: check).
+	mutable std::vector<float> patch_margin, sample_margin;
+	mutable std::vector<Vector3> patch_feet, sample_feet;
+	mutable int64_t remembered_serial = -1;
+	void forget_checks();
+	void build_patches();
+	// The smallest gap() of the capsule's samples at p_feet (and that one's
+	// normal), skipping patches that are certainly clear: then it's at least
+	// CLEAR_GAP.
+	static constexpr double CLEAR_GAP = 0.5;
+	double worst_gap(SculptTerrain *p_terrain, const Vector3 &p_feet, Vector3 &r_normal) const;
 };
 
 } // namespace godot

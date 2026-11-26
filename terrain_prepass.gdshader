@@ -19,7 +19,9 @@ void vertex() {
 
 void fragment() {
 	vec3 rd = view_ray(SCREEN_UV, INV_PROJECTION_MATRIX, INV_VIEW_MATRIX);
-	vec3 ro = CAMERA_POSITION_WORLD;
+	// In VR each eye's rays start at that eye (EYE_OFFSET, view space; zero
+	// without multiview), so the two views have the right parallax.
+	vec3 ro = CAMERA_POSITION_WORLD + mat3(INV_VIEW_MATRIX) * EYE_OFFSET;
 	// One pixel here is two of the full image. The full image's rays are
 	// within 0.71 of its pixels of this ray, and count a surface within 1 of
 	// its pixels as a hit; the density can change ~1.7x faster than distance.

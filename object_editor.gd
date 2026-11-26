@@ -431,7 +431,7 @@ func _make_panels() -> void:
 	ui.set_anchors_preset(Control.PRESET_FULL_RECT)
 	ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	ui.visible = false
-	world.info_label.get_parent().add_child.call_deferred(ui)
+	world.hud.add_child.call_deferred(ui)
 
 	# Settings: on the right.
 	side_panel = PanelContainer.new()
