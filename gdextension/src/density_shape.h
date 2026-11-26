@@ -13,7 +13,9 @@
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/vector4.hpp>
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -62,6 +64,7 @@ class DensityShape : public Resource {
 	GDCLASS(DensityShape, Resource)
 
 public:
+	~DensityShape();
 	static constexpr int MAX_SIZE = 64; // the drawing atlas's slot (SculptTerrain::GRID_SLOT)
 	// Building past MAX_SIZE points a side makes the voxels coarser (twice
 	// as big each time) rather than stopping, up to this voxel size.
@@ -166,7 +169,7 @@ public:
 	int64_t get_version() const { return version; }
 
 	// --- For DensityBody3D and SculptTerrain --------------------------------
-	// Collision probes of frame p_frame (see pose_frames()): points just
+	// Collision probes of frame p_frame (see pose_blend()): points just
 	// inside the surface, each a sphere (xyz in body space, w radius).
 	const std::vector<Vector4> &probes(int p_frame) const;
 	// All of frame p_frame's skin points (probes() takes every n-th of them).
@@ -177,8 +180,30 @@ public:
 	// One z slice of frame p_frame for the atlas: MAX_SIZE^2 RGB8 texels like
 	// the clipmap's (R density + 128, G B material, see render_bytes()).
 	void fill_slice(int p_frame, int p_z, uint8_t *r_texels) const;
-	// Frames around a pose (and key weights) and the blend between them.
-	void pose_frames(double p_pose, int &r_a, int &r_b, float &r_t, const PackedFloat32Array &p_weights = PackedFloat32Array()) const;
+	// How the shape looks in a pose (and key weights): up to MAX_BLEND
+	// frames, their densities blended by weight (summing to 1), the heaviest
+	// first. With several key weights between steps, the frames are the
+	// corners of the simplex round the mix (so the blend moves smoothly
+	// whichever weight changes).
+	static constexpr int MAX_BLEND = 4;
+	struct Blend {
+		int frames[MAX_BLEND] = { 0, 0, 0, 0 };
+		float weights[MAX_BLEND] = { 1.0f, 0.0f, 0.0f, 0.0f };
+		int count = 1;
+	};
+	// The frames of a pose (made if new, not worked out: see frame_ready()).
+	void pose_blend(double p_pose, const PackedFloat32Array &p_weights, Blend &r_blend) const;
+	// Whether frame p_frame is worked out for the shape as it is now (and
+	// still kept: a key weight mix's frame can be dropped for room).
+	bool frame_ready(int p_frame) const;
+	// Has frame p_frame worked out on a background thread, unless it's ready
+	// or on its way (a body shows the frames it has meanwhile).
+	void request_frame(int p_frame) const;
+	// The density (and its way out) of a blend at a point of the body's space.
+	double get_blend_density(const Vector3 &p_local, const Blend &p_blend) const;
+	Vector3 get_blend_normal(const Vector3 &p_local, const Blend &p_blend) const;
+	// Stops the background thread (the library unloading).
+	static void shutdown_worker();
 	// Whether some key weight is in use.
 	static bool has_weights(const PackedFloat32Array &p_weights);
 	int get_frame_count() const;
@@ -248,12 +273,42 @@ private:
 	mutable int next_combo = COMBO_BASE;
 	mutable uint64_t combo_clock = 0;
 	mutable std::recursive_mutex frame_mutex;
+	// Background work (request_frame()): a copy of what frames are made of
+	// (the worker reads it while the shape is edited), and the frames on
+	// their way, collected into their places when done.
+	struct Source {
+		Vector3i size;
+		std::vector<float> rest;
+		std::vector<Key> keys;
+		std::vector<MaterialId> materials;
+		int64_t version = -1;
+	};
+	struct Job {
+		std::shared_ptr<const Source> source;
+		std::vector<float> weights;
+		int frame = 0;
+		Frame result;
+		std::atomic<bool> done{ false };
+		std::atomic<bool> cancelled{ false };
+	};
+	mutable std::shared_ptr<const Source> source;
+	mutable std::vector<std::shared_ptr<Job>> jobs;
+	void collect_jobs() const;
+	void cancel_jobs(int p_frame) const; // -1: all
+	// Where frame p_frame is kept (null: dropped), and its key weights.
+	Frame *frame_slot(int p_frame) const;
+	std::vector<float> frame_weights(int p_frame) const;
+	// Keys' weights -> the shape in that pose (see resolve_weights()), from
+	// any copy of the shape.
+	static void resolve_source(const Vector3i &p_size, const std::vector<float> &p_rest, const std::vector<Key> &p_keys,
+			const std::vector<MaterialId> &p_materials, const std::vector<float> &p_weights, bool p_residual, Frame &r_frame);
+	float sample_blend(const Vector3 &p_grid, const Blend &p_blend) const;
 	// Each key's weight in a pose with key weights: r_weights (one per key).
 	// Returns whether any key weight is in use.
 	bool pose_weights(double p_pose, const PackedFloat32Array &p_weights, std::vector<float> &r_weights) const;
-	// The frame of a mix of key weights (rounded steps), made if new;
-	// p_keep: a frame not to drop for room.
-	int combo_frame(const std::vector<int16_t> &p_steps, int p_keep) const;
+	// The frame of a mix of key weights (rounded steps), made if new (the
+	// least recently used dropped for room).
+	int combo_frame(const std::vector<int16_t> &p_steps) const;
 	void update_mass_cache() const;
 	void physical_properties_now(double &r_mass, double &r_bounce, double &r_friction) const;
 	void mass_properties_now(Vector3 &r_centroid, Basis &r_inertia) const;

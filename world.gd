@@ -11,6 +11,13 @@ extends Node
 @export var screen : SubViewportContainer
 @export var camera : Camera3D
 @export var forg_scene : PackedScene
+## What G drops (Shift+G switches): a frog or a chiggin.
+const CHIGGIN_SCENE := preload("res://chiggin.tscn")
+const CREATURE_NAMES := ["Frog", "Chiggin"]
+var creature := 0
+## A message shown in the status panel for a moment (notice_until, msec).
+var notice := ""
+var notice_until := 0
 ## Half-resolution pass that tells the terrain shader where rays can start
 ## (see terrain_prepass.gdshader). Its camera follows `camera`. Off unless
 ## use_prepass: at 320x180 it cost more than it saved (about 0.6 ms a frame
@@ -88,6 +95,11 @@ var gun_distance := 0.0
 var gun_point := Vector3.ZERO
 ## Select fill acts once per click.
 var fill_clicked := false
+## Physics objects picked with the selection tools (clicking one; right
+## click lets it go). Never at the same time as selected ground: selecting
+## either lets the other go. P turns them into ground, Ctrl+P saves one.
+var selected_bodies: Array[DensityBody3D] = []
+var body_clicked := false
 ## The file dialog open for Ctrl+P / Ctrl+O, if any.
 var file_dialog: FileDialog
 var held_shape_before: DensityShape  # the held body's shape before the stroke (for undo)
@@ -623,6 +635,7 @@ func _input(event: InputEvent) -> void:
 				else:
 					_apply_floating()
 					terrain.clear_selection()
+					_clear_body_selection()
 			KEY_P:
 				_selection_to_body()
 			KEY_B:
@@ -633,7 +646,11 @@ func _input(event: InputEvent) -> void:
 				var ball_material := block if block < material_names.size() else -1
 				balls.throw(camera.global_position, -camera.global_basis.z, player.velocity, ball_material)
 			KEY_G:
-				_spawn_frog()
+				if event.shift_pressed:
+					creature = (creature + 1) % CREATURE_NAMES.size()
+					_notify("G drops: %s (Shift+G switches)" % CREATURE_NAMES[creature])
+				else:
+					_spawn_frog()
 			KEY_X:
 				# Removes the ball or frog under the crosshair.
 				var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
@@ -878,6 +895,7 @@ func _process(delta: float) -> void:
 	t = _time_step("vr", t)
 
 	_sculpt(delta)
+	_update_body_selection()
 	t = _time_step("sculpt", t)
 	_update_gizmo()
 	_update_geometry()
@@ -999,9 +1017,14 @@ func _make_player() -> void:
 	camera.get_parent().add_child(player)
 	player.global_position = camera.global_position - Vector3.UP * player_height
 
-## A frog (forg.tscn, a DensityBody3D) dropped where the crosshair points.
+func _notify(p_text: String) -> void:
+	notice = p_text
+	notice_until = Time.get_ticks_msec() + 2500
+
+## A frog (forg.tscn) or a chiggin (chiggin.tscn), whichever Shift+G last
+## picked, dropped where the crosshair points.
 func _spawn_frog() -> void:
-	var frog := forg_scene.instantiate() as Node3D
+	var frog := (CHIGGIN_SCENE if creature == 1 else forg_scene).instantiate() as Node3D
 	var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
 	var spawn: Vector3 = hit + Vector3.UP * 20.0 if hit != null else camera.global_position - camera.global_basis.z * 30.0
 	camera.get_parent().add_child(frog)
@@ -1331,8 +1354,17 @@ func _select(p_hit, p_sculpting: bool) -> void:
 	var right := p_sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
 	if not (left or right):
 		fill_clicked = false
-	if p_hit == null or target_body != null:
+	if not (left or right):
+		body_clicked = false
+	if target_body != null and tool in [Tool.SELECT_PAINT, Tool.SELECT_FILL]:
+		if (left or right) and not body_clicked:
+			body_clicked = true
+			_select_body(target_body, left)
 		return
+	if p_hit == null or body_clicked:
+		return  # (body_clicked: a click that began on a body)
+	if (left or right) and not selected_bodies.is_empty():
+		_clear_body_selection()  # (ground and bodies aren't selected together)
 	if tool == Tool.SELECT_PAINT and (left or right):
 		terrain.select_sphere(p_hit, brush_radius, left)
 	elif tool == Tool.SELECT_FILL and (left or right) and not fill_clicked:
@@ -1343,9 +1375,79 @@ func _select(p_hit, p_sculpting: bool) -> void:
 		else:
 			terrain.select_similar(p_hit, radius, brush_strength / 32.0, true)
 
+func _select_body(p_body: DensityBody3D, p_on: bool) -> void:
+	if p_on:
+		terrain.clear_selection()
+		if not p_body in selected_bodies:
+			selected_bodies.append(p_body)
+		p_body.highlighted = true
+	else:
+		selected_bodies.erase(p_body)
+		p_body.highlighted = false
+
+func _clear_body_selection() -> void:
+	for b in selected_bodies:
+		if is_instance_valid(b):
+			b.highlighted = false
+	selected_bodies.clear()
+
+## Drops selected bodies that are gone, and all of them once ground is
+## selected (by any tool).
+func _update_body_selection() -> void:
+	for i in range(selected_bodies.size() - 1, -1, -1):
+		if not is_instance_valid(selected_bodies[i]) or not selected_bodies[i].is_inside_tree():
+			selected_bodies.remove_at(i)
+	if not selected_bodies.is_empty() and terrain.has_selection():
+		_clear_body_selection()
+
+## P with bodies selected: each becomes ground where it is (selected, to
+## move on with), and goes. Its grid is lined up with the terrain's (and
+## turned square to it when it's nearly so), so no detail is lost to
+## resampling. Ctrl+Z takes the ground away again, but doesn't bring the
+## body back.
+func _bodies_to_terrain() -> void:
+	terrain.begin_stroke()
+	for body in selected_bodies:
+		if not is_instance_valid(body) or body.shape == null:
+			continue
+		network.use(body)
+		terrain.stamp_shape(body.shape, _snapped_transform(body), -1, true, body.pose)
+		body.highlighted = false
+		balls.remove(body)
+	terrain.end_stroke()
+	selected_bodies.clear()
+
+func _snapped_transform(p_body: DensityBody3D) -> Transform3D:
+	var t := p_body.global_transform
+	var sc := t.basis.get_scale()
+	var rot := t.basis.orthonormalized()
+	# Within 10 degrees of square to the world: square.
+	var square := Basis()
+	var ok := true
+	for a in 3:
+		var column := rot[a]
+		var axis := Vector3.ZERO
+		var biggest := column.abs().max_axis_index()
+		axis[biggest] = signf(column[biggest])
+		ok = ok and column.angle_to(axis) < deg_to_rad(10.0)
+		square[a] = axis
+	if ok and absf(square.determinant() - 1.0) < 0.01:
+		rot = square
+	var uniform := sc.x if is_equal_approx(sc.x, sc.y) and is_equal_approx(sc.y, sc.z) else 0.0
+	if uniform > 0.0 and absf(uniform - roundf(uniform)) < 0.05:
+		sc = Vector3.ONE * maxf(roundf(uniform), 1.0)  # (whole sizes: voxel for voxel)
+	var b := Basis(rot[0] * sc.x, rot[1] * sc.y, rot[2] * sc.z)
+	# The shape's first grid point on a whole voxel of the terrain.
+	var first := b * p_body.shape.get_origin()
+	return Transform3D(b, (t.origin + first).round() - first)
+
 ## P: the selection becomes a physics object (taken out of the terrain:
-## Ctrl+Z puts the ground back, but not the object away).
+## Ctrl+Z puts the ground back, but not the object away); with bodies
+## selected, they become ground instead.
 func _selection_to_body() -> void:
+	if not selected_bodies.is_empty():
+		_bodies_to_terrain()
+		return
 	if not terrain.has_selection():
 		return
 	var shape: DensityShape = terrain.selection_to_shape(true)
@@ -1374,9 +1476,13 @@ func _update_physics_gun(p_delta: float) -> void:
 ## Ctrl+P: saves the selection (shape, colours and materials) as a
 ## DensityShape file, which a body's `shape` can use (a frog's, say).
 func _export_selection() -> void:
-	if not terrain.has_selection():
+	var shape: DensityShape = null
+	if not selected_bodies.is_empty() and is_instance_valid(selected_bodies[0]):
+		shape = selected_bodies[0].shape.duplicate_shape()  # a physics object's model (its keys too)
+	elif terrain.has_selection():
+		shape = terrain.selection_to_shape(false)
+	if shape == null:
 		return
-	var shape: DensityShape = terrain.selection_to_shape(false)
 	_open_file_dialog(FileDialog.FILE_MODE_SAVE_FILE, func(path: String) -> void:
 		var error := ResourceSaver.save(shape, path)
 		if error != OK:
@@ -1416,6 +1522,8 @@ func _set_player_height(p_height: float) -> void:
 	player.step_height = STEP_HEIGHT * size_scale
 
 func _tool_hint() -> String:
+	if Time.get_ticks_msec() < notice_until:
+		return notice
 	match tool:
 		Tool.EXTRUDE:
 			return "Extrude: drag on the selection, out or back in (within the brush radius; Shift: all of it)"

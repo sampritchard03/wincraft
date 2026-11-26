@@ -29,7 +29,9 @@ uniform vec4 grid_rows0[MAX_GRID_BODIES];
 uniform vec4 grid_rows1[MAX_GRID_BODIES];
 uniform vec4 grid_rows2[MAX_GRID_BODIES];
 uniform vec4 grid_size[MAX_GRID_BODIES]; // points a side, w: world size of a grid voxel
-uniform vec4 grid_pose[MAX_GRID_BODIES]; // first layer of the key below the pose, of the one above, the blend
+uniform vec4 grid_pose[MAX_GRID_BODIES]; // first layer of each of up to 4 frames blended (the heaviest first)
+uniform vec4 grid_blend[MAX_GRID_BODIES]; // their weights (summing to 1; 0: unused)
+uniform float grid_highlight[MAX_GRID_BODIES]; // 1: a selected body (tinted like selected ground)
 uniform vec4 grid_bound[MAX_GRID_BODIES]; // bounding sphere: centre, radius
 uniform int grid_count = 0;
 vec3 grid_point(int i, vec3 p) {
@@ -46,15 +48,22 @@ float grid_slot_density(vec3 c, float layer0, float z_last) {
 	return (mix(below, above, c.z - z0) * 255.0 - 128.0) / 16.0;
 }
 
-// Grid body i's density at its grid point q (grid voxels): its pose's two
-// keys blended; beyond the grid, the edge's value less how far out.
+// Grid body i's density at its grid point q (grid voxels): its pose's
+// frames blended; beyond the grid, the edge's value less how far out.
 float grid_rest_density(int i, vec3 q) {
 	vec3 last = grid_size[i].xyz - 1.0;
 	vec3 c = clamp(q, vec3(0.0), last);
 	vec4 pose = grid_pose[i];
-	float d = grid_slot_density(c, pose.x, last.z);
-	if (pose.z > 0.0) {
-		d = mix(d, grid_slot_density(c, pose.y, last.z), pose.z);
+	vec4 w = grid_blend[i];
+	float d = grid_slot_density(c, pose.x, last.z) * w.x;
+	if (w.y > 0.0) {
+		d += grid_slot_density(c, pose.y, last.z) * w.y;
+		if (w.z > 0.0) {
+			d += grid_slot_density(c, pose.z, last.z) * w.z;
+			if (w.w > 0.0) {
+				d += grid_slot_density(c, pose.w, last.z) * w.w;
+			}
+		}
 	}
 	return d - length(q - c);
 }

@@ -21,6 +21,7 @@ static void initialize_wincraft(ModuleInitializationLevel p_level) {
 static void uninitialize_wincraft(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_SCENE) {
 		WorkerPool::get().shutdown(); // before the library (their code) goes
+		DensityShape::shutdown_worker();
 	}
 }
 

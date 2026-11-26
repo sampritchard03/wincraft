@@ -1,0 +1,30 @@
+[gd_scene format=3]
+
+[ext_resource type="DensityShape" path="res://chiggin_shape.res" id="1_shape"]
+[ext_resource type="Script" path="res://chiggin.gd" id="2_script"]
+[ext_resource type="Animation" path="res://chiggin/chiggin_idle.tres" id="3_idle"]
+[ext_resource type="Animation" path="res://chiggin/chiggin_walk.tres" id="4_walk"]
+[ext_resource type="Animation" path="res://chiggin/chiggin_flap.tres" id="5_flap"]
+[ext_resource type="Animation" path="res://chiggin/chiggin_head_turn.tres" id="6_head"]
+
+[sub_resource type="AnimationLibrary" id="AnimationLibrary_chiggin"]
+_data = {
+&"chiggin_flap": ExtResource("5_flap"),
+&"chiggin_head_turn": ExtResource("6_head"),
+&"chiggin_idle": ExtResource("3_idle"),
+&"chiggin_walk": ExtResource("4_walk")
+}
+
+[node name="Chiggin" type="DensityBody3D"]
+shape = ExtResource("1_shape")
+bounce = 0.2
+gravity_scale = 0.212
+angular_damp = 1.0
+auto_material_properties = false
+auto_center_of_mass = false
+center_of_mass = Vector3(0.5, -5, 0)
+drawn = true
+script = ExtResource("2_script")
+
+[node name="AnimationPlayer" type="AnimationPlayer" parent="."]
+libraries/ = SubResource("AnimationLibrary_chiggin")

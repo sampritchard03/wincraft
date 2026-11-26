@@ -137,10 +137,54 @@ int DensityBody3D::nearest_frame() const {
 	if (shape.is_null() || shape->get_key_count() == 0) {
 		return -1;
 	}
-	int a, b;
-	float t;
-	shape->pose_frames(pose, a, b, t, key_weights);
-	return t < 0.5f ? a : b;
+	return get_blend().frames[0];
+}
+
+const DensityShape::Blend &DensityBody3D::get_blend() const {
+	if (shape.is_null() || shape->get_key_count() == 0) {
+		shown = DensityShape::Blend();
+		return shown;
+	}
+	DensityShape::Blend want;
+	shape->pose_blend(pose, key_weights, want);
+	// Frames not worked out yet are worked out in the background; meanwhile
+	// it looks as it did (or as much of the new look as is ready), rather
+	// than stopping the game for them.
+	DensityShape::Blend ready;
+	ready.count = 0;
+	float total = 0.0f;
+	for (int i = 0; i < want.count; i++) {
+		if (shape->frame_ready(want.frames[i])) {
+			ready.frames[ready.count] = want.frames[i];
+			ready.weights[ready.count] = want.weights[i];
+			total += want.weights[i];
+			ready.count++;
+		} else {
+			shape->request_frame(want.frames[i]);
+		}
+	}
+	if (ready.count == want.count) {
+		shown = want;
+		shown_shape = shape.ptr();
+		return shown;
+	}
+	bool old_ready = shown_shape == shape.ptr() && shown.count > 0;
+	for (int i = 0; i < shown.count && old_ready; i++) {
+		old_ready = shape->frame_ready(shown.frames[i]);
+	}
+	if (old_ready) {
+		return shown;
+	}
+	if (ready.count > 0 && total > 1e-4f) {
+		for (int i = 0; i < ready.count; i++) {
+			ready.weights[i] /= total;
+		}
+		shown = ready;
+	} else {
+		shown = want; // nothing to show yet: worked out now, when drawn
+	}
+	shown_shape = shape.ptr();
+	return shown;
 }
 
 void DensityBody3D::update_inertia() {
@@ -795,8 +839,9 @@ double DensityBody3D::distance_at(const Vector3 &p_point, Vector3 &r_normal) {
 	}
 	if (shape.is_valid()) {
 		const Vector3 local = to_local(p_point);
-		r_normal = rotation.xform(shape->get_normal(local, pose, key_weights));
-		return shape->get_density(local, pose, key_weights) * scale;
+		const DensityShape::Blend &b = get_blend();
+		r_normal = rotation.xform(shape->get_blend_normal(local, b));
+		return shape->get_blend_density(local, b) * scale;
 	}
 	if (capsule_radius > 0.0) {
 		Vector3 d;
@@ -824,7 +869,7 @@ double DensityBody3D::density_at(const Vector3 &p_point) {
 	}
 	if (shape.is_valid()) {
 		const Vector3 local = to_local(p_point);
-		return shape->get_density(local, pose, key_weights) * scale;
+		return shape->get_blend_density(local, get_blend()) * scale;
 	}
 	if (capsule_radius > 0.0) {
 		Vector3 d;
@@ -1072,6 +1117,8 @@ void DensityBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_auto_material_properties"), &DensityBody3D::is_auto_material_properties);
 	ClassDB::bind_method(D_METHOD("set_pickable", "pickable"), &DensityBody3D::set_pickable);
 	ClassDB::bind_method(D_METHOD("is_pickable"), &DensityBody3D::is_pickable);
+	ClassDB::bind_method(D_METHOD("set_highlighted", "highlighted"), &DensityBody3D::set_highlighted);
+	ClassDB::bind_method(D_METHOD("is_highlighted"), &DensityBody3D::is_highlighted);
 	ClassDB::bind_method(D_METHOD("split_disconnected"), &DensityBody3D::split_disconnected);
 	ClassDB::bind_method(D_METHOD("get_drawn_shape"), &DensityBody3D::get_drawn_shape);
 
@@ -1092,6 +1139,7 @@ void DensityBody3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_material_properties"), "set_auto_material_properties", "is_auto_material_properties");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "auto_center_of_mass"), "set_auto_center_of_mass", "is_auto_center_of_mass");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pickable"), "set_pickable", "is_pickable");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "highlighted", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_NONE), "set_highlighted", "is_highlighted");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "center_of_mass", PROPERTY_HINT_NONE, "suffix:voxels"), "set_center_of_mass", "get_center_of_mass");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "freeze"), "set_freeze", "is_freeze");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "can_sleep"), "set_can_sleep", "is_able_to_sleep");

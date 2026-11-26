@@ -905,11 +905,14 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		grid_slots.clear();
 		material->set_shader_parameter("body_atlas", body_atlas);
 	}
-	PackedVector4Array rows0, rows1, rows2, sizes, poses, bounds;
-	for (PackedVector4Array *a : { &rows0, &rows1, &rows2, &sizes, &poses, &bounds }) {
+	PackedVector4Array rows0, rows1, rows2, sizes, poses, blends, bounds;
+	for (PackedVector4Array *a : { &rows0, &rows1, &rows2, &sizes, &poses, &blends, &bounds }) {
 		a->resize(MAX_GRID_BODIES);
 	}
 	frame_clock = slot_clock;
+	PackedFloat32Array highlights;
+	highlights.resize(MAX_GRID_BODIES);
+	highlights.fill(0.0f);
 	int grid_count = 0;
 	for (const Drawn &d : grid_bodies) {
 		if (grid_count >= MAX_GRID_BODIES) {
@@ -919,12 +922,18 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		if (shape.is_null() || shape->get_key_count() == 0) {
 			continue;
 		}
-		int ka, kb; // frames (the keys and in-betweens)
-		float blend;
-		shape->pose_frames(d.body->get_pose(), ka, kb, blend, d.body->get_key_weights());
-		const int slot_a = grid_slot(d.body, shape, ka);
-		const int slot_b = kb == ka ? slot_a : grid_slot(d.body, shape, kb);
-		if (slot_a < 0 || slot_b < 0) {
+		// Its frames (keys, in-betweens, key weight mixes), each in a slot.
+		const DensityShape::Blend &blend = d.body->get_blend();
+		float slots[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
+		float weights[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
+		bool placed = true;
+		for (int f = 0; f < blend.count && placed; f++) {
+			const int slot = grid_slot(d.body, shape, blend.frames[f]);
+			placed = slot >= 0;
+			slots[f] = (float)slot;
+			weights[f] = blend.weights[f];
+		}
+		if (!placed) {
 			break;
 		}
 		// World point -> grid point: (B^-1 (p - T) - origin) / voxel_size, for
@@ -944,7 +953,9 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		const Vector3i n = shape->get_size();
 		// Densities times the smallest scale are safe world distances to step.
 		sizes.set(grid_count, Vector4((float)n.x, (float)n.y, (float)n.z, vs * s_min));
-		poses.set(grid_count, Vector4((float)slot_a, (float)slot_b, blend, 0.0f));
+		poses.set(grid_count, Vector4(slots[0], slots[1], slots[2], slots[3]));
+		blends.set(grid_count, Vector4(weights[0], weights[1], weights[2], weights[3]));
+		highlights.set(grid_count, d.body->is_highlighted() ? 1.0f : 0.0f);
 		const Vector3 c = d.body->get_global_center_of_mass();
 		bounds.set(grid_count, Vector4(c.x, c.y, c.z, (float)d.body->get_bound_radius() * s_max / s_first + vs * s_max));
 		grid_count++;
@@ -954,6 +965,8 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 	material->set_shader_parameter("grid_rows2", rows2);
 	material->set_shader_parameter("grid_size", sizes);
 	material->set_shader_parameter("grid_pose", poses);
+	material->set_shader_parameter("grid_blend", blends);
+	material->set_shader_parameter("grid_highlight", highlights);
 	material->set_shader_parameter("grid_bound", bounds);
 	material->set_shader_parameter("grid_count", grid_count);
 }
@@ -1405,6 +1418,18 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 	//   terrain generator gives those everywhere on purpose; rewriting them
 	//   across the whole edit box would leave a crease along its edges.
 	const float REPAIR_TOLERANCE = 2.0f * DENSITY_STEP;
+	//   One exception: a point that was near a surface the edit took away
+	//   (it says the surface is within GHOST_BAND, and the repair finds it
+	//   much farther) takes the repaired value. Left alone, the old
+	//   surface's skin of near-zero air stays where the ground was, and rays
+	//   (which count anything within a few voxels as a hit from afar, see
+	//   HIT_LIMIT in terrain_common.gdshaderinc) draw it as specks and
+	//   streaks: round a lifted selection, in a box cut, an inset. The
+	//   generator's own small underestimates are well inside the margin.
+	const float GHOST_BAND = 4.5f;
+	auto ghost = [&](float p_before, float p_after) {
+		return (p_after > 0.0f) == (p_before > 0.0f) && std::abs(p_before) < GHOST_BAND && std::abs(p_after) > std::abs(p_before) * 1.5f + 0.25f;
+	};
 	// Only points within reach of what the brush changed (the distances it
 	// can affect: up to DENSITY_CLAMP away) may be repaired at all: farther
 	// out the repair can only be "correcting" the generator's own estimates,
@@ -1457,7 +1482,7 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 				float steps;
 				if (brushed[i]) {
 					steps = p_dither ? std::floor(after[i] * 16.0f + dither(x, y, z, brush_strokes)) : std::nearbyint(after[i] * 16.0f);
-				} else if (reachable[i] && ((after[i] > 0.0f) != (before[i] > 0.0f) || std::abs(after[i]) < std::abs(before[i]) - REPAIR_TOLERANCE)) {
+				} else if (reachable[i] && ((after[i] > 0.0f) != (before[i] > 0.0f) || std::abs(after[i]) < std::abs(before[i]) - REPAIR_TOLERANCE || ghost(before[i], after[i]))) {
 					steps = std::nearbyint(after[i] * 16.0f);
 				} else {
 					steps = std::nearbyint(before[i] * 16.0f);

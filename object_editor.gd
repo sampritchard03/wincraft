@@ -146,6 +146,7 @@ func open(p_body: DensityBody3D) -> void:
 	world.network.use(p_body)  # (multiplayer: edited here, so simulated here)
 	body = p_body
 	active = true
+	body.set_meta("editing", true)  # (a creature's own script holds off meanwhile)
 	was_frozen = body.freeze
 	body.freeze = true
 	body.linear_velocity = Vector3.ZERO
@@ -182,6 +183,7 @@ func close() -> void:
 	ui.visible = false
 	line_mesh.clear_surfaces()
 	if is_instance_valid(body):
+		body.remove_meta("editing")
 		body.edit_key = -1
 		body.freeze = was_frozen
 		body.sleeping = false

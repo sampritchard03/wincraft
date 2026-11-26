@@ -126,6 +126,9 @@ public:
 	// previews.
 	void set_pickable(bool p_value) { pickable = p_value; }
 	bool is_pickable() const { return pickable; }
+	// Drawn tinted like the selected ground (a selected body).
+	void set_highlighted(bool p_value) { highlighted = p_value; }
+	bool is_highlighted() const { return highlighted; }
 	// After cutting: the parts no longer joined to the biggest, as shapes in
 	// this body's space (this one keeps the biggest). Make bodies of them
 	// with this body's transform.
@@ -179,6 +182,10 @@ public:
 
 	// The grid it draws (its shape).
 	Ref<DensityShape> get_drawn_shape() { return shape; }
+	// How its shape looks now: the frames of its pose and key weights that
+	// are worked out (DensityShape::pose_blend(); the rest are worked out in
+	// the background, and until then it keeps the look it had).
+	const DensityShape::Blend &get_blend() const;
 
 	// --- Used by SculptTerrain ---------------------------------------------
 	// Every body in the tree (any viewport).
@@ -222,13 +229,16 @@ protected:
 	bool auto_center_of_mass = true;
 	bool auto_material_properties = true;
 	bool pickable = true;
+	bool highlighted = false;
 	int edit_key = -1;
 	bool own_shape = false;
 	int64_t shape_version = -1; // the shape's, when the probes were made
 	int probe_frame = -1; // the shape frame the probes are of
 	PackedFloat32Array key_weights;
-	// The shape frame nearest how it looks now (see DensityShape::pose_frames()).
+	// The shape frame nearest how it looks now (the heaviest of get_blend()).
 	int nearest_frame() const;
+	mutable DensityShape::Blend shown;
+	mutable const DensityShape *shown_shape = nullptr;
 	bool stepped = false; // the step state below has been filled in
 	Vector3 com_local; // centre of mass in the node's space (unscaled)
 

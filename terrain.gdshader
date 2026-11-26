@@ -338,7 +338,7 @@ void fragment() {
 			albedo = material.yzw;
 		}
 
-		if (selection_on && grid < 0 && sphere < 0 && selected_at(p, n)) {
+		if ((selection_on && grid < 0 && sphere < 0 && selected_at(p, n)) || (grid >= 0 && grid_highlight[grid] > 0.5)) {
 			// Tinted, with a slow pulse so it reads as a selection, not paint.
 			albedo = mix(albedo, selection_tint, 0.45 + 0.12 * sin(TIME * 4.0));
 		}

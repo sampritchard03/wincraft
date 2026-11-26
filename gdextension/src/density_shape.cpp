@@ -1,5 +1,6 @@
 #include "density_shape.h"
 
+#include "parallel.h"
 #include "sculpt_terrain.h"
 
 #include <godot_cpp/core/class_db.hpp>
@@ -9,6 +10,9 @@
 #include <godot_cpp/variant/plane.hpp>
 
 #include <algorithm>
+#include <condition_variable>
+#include <functional>
+#include <thread>
 #include <cmath>
 #include <cstring>
 
@@ -703,6 +707,7 @@ void DensityShape::update_layout() const {
 			key_steps[k] = std::max(key_steps[k], 4);
 		}
 	}
+	cancel_jobs(-1);
 	combos.clear();
 	next_combo = COMBO_BASE;
 }
@@ -739,26 +744,25 @@ bool DensityShape::pose_weights(double p_pose, const PackedFloat32Array &p_weigh
 	return any;
 }
 
-int DensityShape::combo_frame(const std::vector<int16_t> &p_steps, int p_keep) const {
+int DensityShape::combo_frame(const std::vector<int16_t> &p_steps) const {
 	for (Combo &c : combos) {
 		if (c.steps == p_steps) {
 			c.used = ++combo_clock;
 			return c.id;
 		}
 	}
-	// Room: as many as about 48 MB holds, 4 to 64.
+	// Room: as many as about 96 MB holds, 8 to 512 (several weights
+	// animated at once visit many mixes, over and over).
 	const size_t per = std::max<size_t>(count() * (sizeof(float) + sizeof(MaterialId) + sizeof(Vector3)), 1);
-	const size_t most = std::clamp<size_t>(((size_t)48 << 20) / per, 4, 64);
+	const size_t most = std::clamp<size_t>(((size_t)96 << 20) / per, 8, 512);
 	while (combos.size() >= most) {
-		size_t oldest = combos.size();
-		for (size_t i = 0; i < combos.size(); i++) {
-			if (combos[i].id != p_keep && (oldest == combos.size() || combos[i].used < combos[oldest].used)) {
+		size_t oldest = 0;
+		for (size_t i = 1; i < combos.size(); i++) {
+			if (combos[i].used < combos[oldest].used) {
 				oldest = i;
 			}
 		}
-		if (oldest == combos.size()) {
-			break;
-		}
+		cancel_jobs(combos[oldest].id);
 		combos.erase(combos.begin() + oldest);
 	}
 	Combo c;
@@ -804,81 +808,288 @@ int DensityShape::key_frame(int p_key) const {
 	return f;
 }
 
-void DensityShape::pose_frames(double p_pose, int &r_a, int &r_b, float &r_t, const PackedFloat32Array &p_weights) const {
+void DensityShape::pose_blend(double p_pose, const PackedFloat32Array &p_weights, Blend &r_blend) const {
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
 	update_layout();
+	r_blend = Blend();
 	std::vector<float> w;
 	if (has_weights(p_weights) && pose_weights(p_pose, p_weights, w)) {
-		// Each weight rounded down to its steps, and the mix one step up in
-		// every key between steps: blended by how far between they are.
+		// Each weight in its steps: the mix is inside the cube of step
+		// corners round it, and in that, in the simplex (Freudenthal's)
+		// from the corner below it stepping up one key at a time, the keys
+		// farthest past their step first. Its corners' weights move
+		// smoothly whichever key weight changes (two keys between steps
+		// don't jump when one of them crosses a step).
 		const int k_count = (int)keys.size();
-		std::vector<int16_t> lo(k_count), hi(k_count);
-		float between = 0.0f;
-		int parts = 0;
+		std::vector<int16_t> steps(k_count);
+		std::vector<std::pair<float, int>> between; // (how far past its step, key)
 		for (int k = 0; k < k_count; k++) {
 			const float x = w[k] * key_steps[k];
 			const float f = std::floor(x + 1e-4f);
-			lo[k] = (int16_t)f;
-			const float frac = x - f;
-			hi[k] = (int16_t)(f + (frac > 1e-3f ? 1.0f : 0.0f));
-			if (frac > 1e-3f) {
-				between += frac;
-				parts++;
+			steps[k] = (int16_t)f;
+			if (x - f > 1e-3f) {
+				between.push_back({ x - f, k });
 			}
 		}
-		r_a = combo_frame(lo, -1);
-		r_b = parts > 0 ? combo_frame(hi, r_a) : r_a;
-		r_t = parts > 0 ? between / (float)parts : 0.0f;
+		std::sort(between.begin(), between.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+		struct Corner {
+			std::vector<int16_t> steps;
+			float weight;
+		};
+		std::vector<Corner> corners;
+		corners.push_back({ steps, 1.0f - (between.empty() ? 0.0f : between[0].first) });
+		for (size_t j = 0; j < between.size(); j++) {
+			steps[between[j].second]++;
+			const float next = j + 1 < between.size() ? between[j + 1].first : 0.0f;
+			corners.push_back({ steps, between[j].first - next });
+		}
+		// The heaviest (up to MAX_BLEND; more keys between steps at once are rare).
+		std::stable_sort(corners.begin(), corners.end(), [](const Corner &a, const Corner &b) { return a.weight > b.weight; });
+		float total = 0.0f;
+		int n = 0;
+		for (size_t j = 0; j < corners.size() && n < MAX_BLEND; j++) {
+			if (corners[j].weight <= 1e-4f && n > 0) {
+				break;
+			}
+			r_blend.frames[n] = combo_frame(corners[j].steps);
+			r_blend.weights[n] = std::max(corners[j].weight, 0.0f);
+			total += r_blend.weights[n];
+			n++;
+		}
+		r_blend.count = n;
+		for (int j = 0; j < n; j++) {
+			r_blend.weights[j] = total > 1e-6f ? r_blend.weights[j] / total : (j == 0 ? 1.0f : 0.0f);
+		}
 		return;
 	}
 	const int last = std::max((int)keys.size() - 1, 0);
 	const double p = std::clamp(p_pose, 0.0, (double)last);
 	const int a = std::min((int)p, last);
-	if (a >= last) {
-		r_a = r_b = key_frame(last);
-		r_t = 0.0f;
+	if (a >= last || gap_frames.empty()) {
+		r_blend.frames[0] = key_frame(last);
 		return;
 	}
 	const int n = gap_frames[a];
 	const double x = (p - a) * n;
 	const int j = std::clamp((int)x, 0, n - 1);
-	r_a = key_frame(a) + j;
-	r_b = r_a + 1;
-	r_t = (float)std::clamp(x - j, 0.0, 1.0);
-	if (r_t <= 0.0f) {
-		r_b = r_a;
+	const float t = (float)std::clamp(x - j, 0.0, 1.0);
+	const int below = key_frame(a) + j;
+	if (t <= 1e-4f) {
+		r_blend.frames[0] = below;
+		return;
 	}
+	const bool up = t > 0.5f;
+	r_blend.frames[0] = up ? below + 1 : below;
+	r_blend.weights[0] = up ? t : 1.0f - t;
+	r_blend.frames[1] = up ? below : below + 1;
+	r_blend.weights[1] = up ? 1.0f - t : t;
+	r_blend.count = 2;
+}
+
+DensityShape::Frame *DensityShape::frame_slot(int p_frame) const {
+	if (p_frame >= COMBO_BASE) {
+		for (Combo &c : combos) {
+			if (c.id == p_frame) {
+				return &c.frame;
+			}
+		}
+		return nullptr; // (dropped for room)
+	}
+	if (frames.empty()) {
+		return nullptr;
+	}
+	return &frames[std::clamp(p_frame, 0, (int)frames.size() - 1)];
+}
+
+std::vector<float> DensityShape::frame_weights(int p_frame) const {
+	if (p_frame >= COMBO_BASE) {
+		for (const Combo &c : combos) {
+			if (c.id == p_frame) {
+				return c.weights;
+			}
+		}
+		return std::vector<float>(keys.size(), 0.0f);
+	}
+	int a, b;
+	float t;
+	frame_keys(std::clamp(p_frame, 0, std::max((int)frames.size() - 1, 0)), a, b, t);
+	std::vector<float> w(keys.size(), 0.0f);
+	if (!keys.empty()) {
+		w[std::clamp(a, 0, (int)keys.size() - 1)] += 1.0f - t;
+		w[std::clamp(b, 0, (int)keys.size() - 1)] += t;
+	}
+	return w;
 }
 
 const DensityShape::Frame &DensityShape::frame(int p_frame) const {
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
 	update_layout();
+	collect_jobs();
 	static const Frame none;
-	if (p_frame >= COMBO_BASE) {
-		for (Combo &c : combos) {
-			if (c.id == p_frame) {
-				if (c.frame.version != version) {
-					resolve_weights(c.weights, true, c.frame);
-					c.frame.version = version;
-				}
-				return c.frame;
-			}
-		}
-		return none; // (dropped for room)
-	}
-	if (frames.empty()) {
+	Frame *f = frame_slot(p_frame);
+	if (f == nullptr) {
 		return none;
 	}
-	const int at = std::clamp(p_frame, 0, (int)frames.size() - 1);
-	Frame &f = frames[at];
-	if (f.version != version) {
-		int a, b;
-		float t;
-		frame_keys(at, a, b, t);
-		resolve(a, b, t, true, f);
-		f.version = version;
+	if (f->version != version) {
+		cancel_jobs(p_frame); // (needed now)
+		resolve_weights(frame_weights(p_frame), true, *f);
+		f->version = version;
 	}
-	return f;
+	return *f;
+}
+
+bool DensityShape::frame_ready(int p_frame) const {
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	update_layout();
+	collect_jobs();
+	const Frame *f = frame_slot(p_frame);
+	if (f != nullptr && p_frame >= COMBO_BASE) {
+		for (Combo &c : combos) {
+			if (c.id == p_frame) {
+				c.used = ++combo_clock; // (shown: kept)
+			}
+		}
+	}
+	return f != nullptr && f->version == version;
+}
+
+// One thread working out frames in the background, the latest asked for first.
+namespace {
+class FrameWorker {
+public:
+	static FrameWorker &get() {
+		static FrameWorker *worker = new FrameWorker(); // (never deleted: shutdown() joins)
+		return *worker;
+	}
+	void push(std::function<void()> &&p_job) {
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (stopping) {
+				return;
+			}
+			queue.push_back(std::move(p_job));
+			if (!thread.joinable()) {
+				thread = std::thread([this] { loop(); });
+			}
+		}
+		wake.notify_one();
+	}
+	void shutdown() {
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			stopping = true;
+			queue.clear();
+		}
+		wake.notify_all();
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+
+private:
+	std::mutex mutex;
+	std::condition_variable wake;
+	std::vector<std::function<void()>> queue;
+	std::thread thread;
+	bool stopping = false;
+	void loop() {
+		while (true) {
+			std::function<void()> job;
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				wake.wait(lock, [&] { return stopping || !queue.empty(); });
+				if (stopping) {
+					return;
+				}
+				job = std::move(queue.back());
+				queue.pop_back();
+			}
+			job();
+		}
+	}
+};
+} // namespace
+
+void DensityShape::shutdown_worker() {
+	FrameWorker::get().shutdown();
+}
+
+void DensityShape::request_frame(int p_frame) const {
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	update_layout();
+	collect_jobs();
+	const Frame *f = frame_slot(p_frame);
+	if (f == nullptr || f->version == version) {
+		return;
+	}
+	for (const std::shared_ptr<Job> &j : jobs) {
+		if (j->frame == p_frame) {
+			return; // on its way
+		}
+	}
+	if (source == nullptr || source->version != version) {
+		auto copy = std::make_shared<Source>();
+		copy->size = size;
+		copy->rest = rest;
+		copy->keys.reserve(keys.size());
+		for (const Key &k : keys) {
+			Key c;
+			c.motion = k.motion;
+			c.residual = k.residual;
+			copy->keys.push_back(std::move(c)); // (not the name: Strings stay on this thread)
+		}
+		copy->materials = materials;
+		copy->version = version;
+		source = copy;
+	}
+	auto job = std::make_shared<Job>();
+	job->source = source;
+	job->weights = frame_weights(p_frame);
+	job->frame = p_frame;
+	jobs.push_back(job);
+	FrameWorker::get().push([job]() {
+		if (job->cancelled.load(std::memory_order_acquire)) {
+			return;
+		}
+		const Source &src = *job->source;
+		resolve_source(src.size, src.rest, src.keys, src.materials, job->weights, true, job->result);
+		job->done.store(true, std::memory_order_release);
+	});
+}
+
+void DensityShape::collect_jobs() const {
+	for (size_t i = 0; i < jobs.size();) {
+		Job &j = *jobs[i];
+		if (j.source->version != version) {
+			j.cancelled.store(true, std::memory_order_release); // (the shape changed)
+		} else if (j.done.load(std::memory_order_acquire)) {
+			Frame *f = frame_slot(j.frame);
+			if (f != nullptr && f->version != version) {
+				*f = std::move(j.result);
+				f->version = version;
+			}
+		} else {
+			i++;
+			continue;
+		}
+		jobs.erase(jobs.begin() + i);
+	}
+}
+
+void DensityShape::cancel_jobs(int p_frame) const {
+	for (size_t i = 0; i < jobs.size();) {
+		if (p_frame < 0 || jobs[i]->frame == p_frame) {
+			jobs[i]->cancelled.store(true, std::memory_order_release);
+			jobs.erase(jobs.begin() + i);
+		} else {
+			i++;
+		}
+	}
+}
+
+DensityShape::~DensityShape() {
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	cancel_jobs(-1);
 }
 
 void DensityShape::resolve(int p_a, int p_b, float p_t, bool p_residual, Frame &r_frame) const {
@@ -891,27 +1102,34 @@ void DensityShape::resolve(int p_a, int p_b, float p_t, bool p_residual, Frame &
 }
 
 void DensityShape::resolve_weights(const std::vector<float> &p_weights, bool p_residual, Frame &r_frame) const {
-	const size_t n = count();
+	resolve_source(size, rest, keys, materials, p_weights, p_residual, r_frame);
+}
+
+void DensityShape::resolve_source(const Vector3i &p_size, const std::vector<float> &p_rest, const std::vector<Key> &p_keys,
+		const std::vector<MaterialId> &p_materials, const std::vector<float> &p_weights, bool p_residual, Frame &r_frame) {
+	const Vector3i size = p_size;
+	const size_t n = (size_t)size.x * size.y * size.z;
+	auto index = [&](int x, int y, int z) { return ((size_t)z * size.y + y) * size.x + x; };
 	const float C = DENSITY_CLAMP;
 	r_frame.density.assign(n, -C);
 	r_frame.materials.clear();
 	r_frame.to_rest.clear();
-	if (keys.empty() || rest.size() != n) {
+	if (p_keys.empty() || p_rest.size() != n) {
 		return;
 	}
 	// The keys that count, and how much.
 	std::vector<std::pair<const std::vector<Vector3> *, float>> motions;
 	std::vector<std::pair<const std::vector<float> *, float>> residuals;
-	for (size_t k = 0; k < keys.size() && k < p_weights.size(); k++) {
+	for (size_t k = 0; k < p_keys.size() && k < p_weights.size(); k++) {
 		const float w = p_weights[k];
 		if (std::abs(w) < 1e-6f) {
 			continue;
 		}
-		if (!keys[k].motion.empty()) {
-			motions.push_back({ &keys[k].motion, w });
+		if (!p_keys[k].motion.empty()) {
+			motions.push_back({ &p_keys[k].motion, w });
 		}
-		if (p_residual && !keys[k].residual.empty()) {
-			residuals.push_back({ &keys[k].residual, w });
+		if (p_residual && !p_keys[k].residual.empty()) {
+			residuals.push_back({ &p_keys[k].residual, w });
 		}
 	}
 	auto residual_at = [&](size_t i) {
@@ -923,18 +1141,24 @@ void DensityShape::resolve_weights(const std::vector<float> &p_weights, bool p_r
 	};
 	std::vector<Vector3> m;
 	bool moves = false;
+	Vector3 reach; // the most any solid point moves, per axis
 	if (!motions.empty() && size.x > 1 && size.y > 1 && size.z > 1) {
 		m.assign(n, Vector3());
 		for (size_t i = 0; i < n; i++) {
 			for (const auto &mo : motions) {
 				m[i] += (*mo.first)[i] * mo.second;
 			}
-			moves |= m[i].length_squared() > 1e-8f;
+			if (m[i].length_squared() > 1e-8f) {
+				moves = true;
+				if (p_rest[i] > -C + 1e-3f) {
+					reach = reach.max(m[i].abs());
+				}
+			}
 		}
 	}
 	if (!moves) {
 		for (size_t i = 0; i < n; i++) {
-			r_frame.density[i] = std::clamp(rest[i] + residual_at(i), -C, C);
+			r_frame.density[i] = std::clamp(p_rest[i] + residual_at(i), -C, C);
 		}
 		return;
 	}
@@ -942,114 +1166,147 @@ void DensityShape::resolve_weights(const std::vector<float> &p_weights, bool p_r
 	// some points of the posed grid: those take the density there (trilinear
 	// within the cell), the most solid where cells overlap.
 	std::vector<float> best(n, -INFINITY);
-	std::vector<MaterialId> mats(n, MAT_STONE);
 	std::vector<Vector3> to_rest(n);
-	for (int cz = 0; cz + 1 < size.z; cz++) {
-		for (int cy = 0; cy + 1 < size.y; cy++) {
-			for (int cx = 0; cx + 1 < size.x; cx++) {
-				float v[8];
-				Vector3 P[8];
-				size_t ci[8];
-				float most = -INFINITY;
-				for (int c = 0; c < 8; c++) {
-					ci[c] = index(cx + (c & 1), cy + ((c >> 1) & 1), cz + (c >> 2));
-					v[c] = rest[ci[c]];
-					most = std::max(most, v[c]);
-				}
-				if (most <= -C + 1e-3f) {
-					continue; // air: what uncovered points are anyway
-				}
-				Vector3 lo(INFINITY, INFINITY, INFINITY), hi(-INFINITY, -INFINITY, -INFINITY);
-				bool rigid = true;
-				for (int c = 0; c < 8; c++) {
-					P[c] = Vector3((float)(cx + (c & 1)), (float)(cy + ((c >> 1) & 1)), (float)(cz + (c >> 2))) + m[ci[c]];
-					lo = lo.min(P[c]);
-					hi = hi.max(P[c]);
-					rigid &= (m[ci[c]] - m[ci[0]]).length_squared() < 1e-8f;
-				}
-				Vector3i glo, ghi;
-				bool empty = false;
-				for (int a = 0; a < 3; a++) {
-					glo[a] = std::max((int)std::ceil(lo[a] - 1e-4f), 0);
-					ghi[a] = std::min((int)std::floor(hi[a] + 1e-4f), size[a] - 1);
-					empty |= glo[a] > ghi[a];
-				}
-				if (empty) {
-					continue;
-				}
-				for (int gz = glo.z; gz <= ghi.z; gz++) {
-					for (int gy = glo.y; gy <= ghi.y; gy++) {
-						for (int gx = glo.x; gx <= ghi.x; gx++) {
-							const Vector3 g((float)gx, (float)gy, (float)gz);
-							Vector3 u;
-							if (rigid) {
-								u = g - P[0];
-							} else {
-								// Newton's method on the cell's trilinear map.
-								u = Vector3(0.5f, 0.5f, 0.5f);
-								bool found = false;
-								for (int it = 0; it < 8; it++) {
-									Vector3 X, du, dv, dw;
-									for (int c = 0; c < 8; c++) {
-										const float wx = (c & 1) ? u.x : 1.0f - u.x, wy = ((c >> 1) & 1) ? u.y : 1.0f - u.y, wz = (c >> 2) ? u.z : 1.0f - u.z;
-										const float sx = (c & 1) ? 1.0f : -1.0f, sy = ((c >> 1) & 1) ? 1.0f : -1.0f, sz = (c >> 2) ? 1.0f : -1.0f;
-										X += P[c] * (wx * wy * wz);
-										du += P[c] * (sx * wy * wz);
-										dv += P[c] * (wx * sy * wz);
-										dw += P[c] * (wx * wy * sz);
-									}
-									const Vector3 r = X - g;
-									if (r.length_squared() < 1e-6f) {
-										found = true;
-										break;
-									}
-									const Basis J(du.x, dv.x, dw.x, du.y, dv.y, dw.y, du.z, dv.z, dw.z);
-									const float det = J.determinant();
-									if (std::abs(det) < 1e-6f) {
-										break;
-									}
-									u -= J.inverse().xform(r);
-									u = u.clamp(Vector3(-0.5f, -0.5f, -0.5f), Vector3(1.5f, 1.5f, 1.5f));
-								}
-								if (!found) {
-									continue;
-								}
+	auto scatter = [&](int cx, int cy, int cz) {
+		float v[8];
+		Vector3 P[8];
+		size_t ci[8];
+		float most = -INFINITY;
+		for (int c = 0; c < 8; c++) {
+			ci[c] = index(cx + (c & 1), cy + ((c >> 1) & 1), cz + (c >> 2));
+			v[c] = p_rest[ci[c]];
+			most = std::max(most, v[c]);
+		}
+		if (most <= -C + 1e-3f) {
+			return; // air: what uncovered points are anyway
+		}
+		Vector3 lo(INFINITY, INFINITY, INFINITY), hi(-INFINITY, -INFINITY, -INFINITY);
+		bool rigid = true;
+		Vector3 mean;
+		for (int c = 0; c < 8; c++) {
+			P[c] = Vector3((float)(cx + (c & 1)), (float)(cy + ((c >> 1) & 1)), (float)(cz + (c >> 2))) + m[ci[c]];
+			lo = lo.min(P[c]);
+			hi = hi.max(P[c]);
+			rigid &= (m[ci[c]] - m[ci[0]]).length_squared() < 1e-8f;
+			mean += m[ci[c]];
+		}
+		mean /= 8.0f;
+		Vector3i glo, ghi;
+		for (int a = 0; a < 3; a++) {
+			glo[a] = std::max((int)std::ceil(lo[a] - 1e-4f), 0);
+			ghi[a] = std::min((int)std::floor(hi[a] + 1e-4f), size[a] - 1);
+			if (glo[a] > ghi[a]) {
+				return;
+			}
+		}
+		// The cell's trilinear map as a polynomial in (u, v, w).
+		const Vector3 A = P[0], B = P[1] - P[0], Cc = P[2] - P[0], D = P[4] - P[0];
+		const Vector3 E = P[3] - P[1] - P[2] + P[0], F = P[5] - P[1] - P[4] + P[0], G = P[6] - P[2] - P[4] + P[0];
+		const Vector3 H = P[7] - P[3] - P[5] - P[6] + P[1] + P[2] + P[4] - P[0];
+		const Vector3 corner((float)cx, (float)cy, (float)cz);
+		for (int gz = glo.z; gz <= ghi.z; gz++) {
+			for (int gy = glo.y; gy <= ghi.y; gy++) {
+				for (int gx = glo.x; gx <= ghi.x; gx++) {
+					const Vector3 g((float)gx, (float)gy, (float)gz);
+					Vector3 u;
+					if (rigid) {
+						u = g - P[0];
+					} else {
+						// Newton's method, from where it'd be if the cell only moved.
+						u = (g - corner - mean).clamp(Vector3(-0.5f, -0.5f, -0.5f), Vector3(1.5f, 1.5f, 1.5f));
+						bool found = false;
+						for (int it = 0; it < 8; it++) {
+							const Vector3 X = A + B * u.x + Cc * u.y + D * u.z + E * (u.x * u.y) + F * (u.x * u.z) + G * (u.y * u.z) + H * (u.x * u.y * u.z);
+							const Vector3 r = X - g;
+							if (r.length_squared() < 1e-6f) {
+								found = true;
+								break;
 							}
-							const float e = 1e-3f;
-							if (u.x < -e || u.y < -e || u.z < -e || u.x > 1 + e || u.y > 1 + e || u.z > 1 + e) {
-								continue;
+							const Vector3 Ju = B + E * u.y + F * u.z + H * (u.y * u.z);
+							const Vector3 Jv = Cc + E * u.x + G * u.z + H * (u.x * u.z);
+							const Vector3 Jw = D + F * u.x + G * u.y + H * (u.x * u.y);
+							const Vector3 vw = Jv.cross(Jw);
+							const float det = Ju.dot(vw);
+							if (std::abs(det) < 1e-6f) {
+								break;
 							}
-							u = u.clamp(Vector3(), Vector3(1, 1, 1));
-							float value = 0.0f;
-							for (int c = 0; c < 8; c++) {
-								value += v[c] * (((c & 1) ? u.x : 1.0f - u.x) * (((c >> 1) & 1) ? u.y : 1.0f - u.y) * ((c >> 2) ? u.z : 1.0f - u.z));
-							}
-							const size_t gi = index(gx, gy, gz);
-							if (value > best[gi]) {
-								best[gi] = value;
-								const int nc = (u.x >= 0.5f ? 1 : 0) | (u.y >= 0.5f ? 2 : 0) | (u.z >= 0.5f ? 4 : 0);
-								mats[gi] = materials[ci[nc]];
-								to_rest[gi] = Vector3((float)cx, (float)cy, (float)cz) + u;
-							}
+							const float inv = 1.0f / det;
+							u -= Vector3(r.dot(vw), Ju.dot(r.cross(Jw)), Ju.dot(Jv.cross(r))) * inv;
+							u = u.clamp(Vector3(-0.5f, -0.5f, -0.5f), Vector3(1.5f, 1.5f, 1.5f));
 						}
+						if (!found) {
+							continue;
+						}
+					}
+					const float e = 1e-3f;
+					if (u.x < -e || u.y < -e || u.z < -e || u.x > 1 + e || u.y > 1 + e || u.z > 1 + e) {
+						continue;
+					}
+					u = u.clamp(Vector3(), Vector3(1, 1, 1));
+					const float x0 = 1.0f - u.x, y0 = 1.0f - u.y, z0 = 1.0f - u.z;
+					const float value = ((v[0] * x0 + v[1] * u.x) * y0 + (v[2] * x0 + v[3] * u.x) * u.y) * z0 +
+							((v[4] * x0 + v[5] * u.x) * y0 + (v[6] * x0 + v[7] * u.x) * u.y) * u.z;
+					const size_t gi = index(gx, gy, gz);
+					if (value > best[gi]) {
+						best[gi] = value;
+						to_rest[gi] = corner + u;
 					}
 				}
 			}
 		}
+	};
+	// In slabs across the axis parts move least along, each thicker than
+	// twice that: every other slab writes points no other of them does, so
+	// they run at once (the even ones, then the odd ones).
+	int axis = 2, slabs = 1, thick = size.z;
+	for (int a = 0; a < 3; a++) {
+		const int t = 2 * (int)std::ceil(reach[a]) + 2;
+		const int count = (size[a] - 1) / t;
+		if (count > slabs) {
+			axis = a;
+			slabs = count;
+			thick = t;
+		}
+	}
+	const int cells_along = size[axis] - 1;
+	if (slabs < 4) {
+		slabs = 1;
+		thick = cells_along;
+	}
+	auto run_slab = [&](int p_slab) {
+		Vector3i lo(0, 0, 0), hi = size - Vector3i(1, 1, 1); // cells [lo, hi)
+		lo[axis] = p_slab * thick;
+		hi[axis] = p_slab + 1 == slabs ? cells_along : (p_slab + 1) * thick;
+		for (int cz = lo.z; cz < hi.z; cz++) {
+			for (int cy = lo.y; cy < hi.y; cy++) {
+				for (int cx = lo.x; cx < hi.x; cx++) {
+					scatter(cx, cy, cz);
+				}
+			}
+		}
+	};
+	if (slabs == 1) {
+		run_slab(0);
+	} else {
+		const int threads = std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 8);
+		for (int parity = 0; parity < 2; parity++) {
+			parallel_for((slabs - parity + 1) / 2, threads, [&](int i) { run_slab(i * 2 + parity); });
+		}
 	}
 	const Vector3i last = size - Vector3i(1, 1, 1);
+	std::vector<MaterialId> mats(n, MAT_STONE);
 	for (int z = 0; z < size.z; z++) {
 		for (int y = 0; y < size.y; y++) {
 			for (int x = 0; x < size.x; x++) {
 				const size_t i = index(x, y, z);
 				if (best[i] == -INFINITY) {
 					// Nothing moved here: air, from about where it'd come from.
-					const Vector3 q = Vector3((float)x, (float)y, (float)z) - m[i];
-					const Vector3i qi = Vector3i(q.round()).clamp(Vector3i(), last);
+					to_rest[i] = Vector3((float)x, (float)y, (float)z) - m[i];
 					best[i] = -C;
-					mats[i] = materials[index(qi.x, qi.y, qi.z)];
-					to_rest[i] = q;
 				}
+				// The material of the rest point nearest what's shown.
+				const Vector3i q = Vector3i(to_rest[i].round()).clamp(Vector3i(), last);
+				mats[i] = p_materials.size() == n ? p_materials[index(q.x, q.y, q.z)] : MAT_STONE;
 				r_frame.density[i] = std::clamp(best[i] + residual_at(i), -C, C);
 			}
 		}
@@ -1093,11 +1350,34 @@ float DensityShape::sample_pose(const Vector3 &p_grid, double p_pose, const Pack
 		return -DENSITY_CLAMP;
 	}
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
-	int a, b;
-	float t;
-	pose_frames(p_pose, a, b, t, p_weights);
-	const float da = sample_grid(frame(a).density, p_grid);
-	return t > 0.0f ? da + (sample_grid(frame(b).density, p_grid) - da) * t : da;
+	Blend blend;
+	pose_blend(p_pose, p_weights, blend);
+	return sample_blend(p_grid, blend);
+}
+
+float DensityShape::sample_blend(const Vector3 &p_grid, const Blend &p_blend) const {
+	if (keys.empty()) {
+		return -DENSITY_CLAMP;
+	}
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	float d = 0.0f;
+	for (int i = 0; i < p_blend.count; i++) {
+		d += sample_grid(frame(p_blend.frames[i]).density, p_grid) * p_blend.weights[i];
+	}
+	return d;
+}
+
+double DensityShape::get_blend_density(const Vector3 &p_local, const Blend &p_blend) const {
+	return sample_blend((p_local - origin) / (float)voxel_size, p_blend) * voxel_size;
+}
+
+Vector3 DensityShape::get_blend_normal(const Vector3 &p_local, const Blend &p_blend) const {
+	const Vector3 g = (p_local - origin) / (float)voxel_size;
+	const float h = 0.5f;
+	const Vector3 grad(sample_blend(g + Vector3(h, 0, 0), p_blend) - sample_blend(g - Vector3(h, 0, 0), p_blend),
+			sample_blend(g + Vector3(0, h, 0), p_blend) - sample_blend(g - Vector3(0, h, 0), p_blend),
+			sample_blend(g + Vector3(0, 0, h), p_blend) - sample_blend(g - Vector3(0, 0, h), p_blend));
+	return grad.length_squared() > 1e-12f ? -grad.normalized() : Vector3(0, 1, 0);
 }
 
 double DensityShape::get_density(const Vector3 &p_local, double p_pose, const PackedFloat32Array &p_weights) const {
@@ -1128,10 +1408,9 @@ int DensityShape::get_material_at(const Vector3 &p_local, double p_pose, const P
 			  z = std::clamp((int)std::lround(g.z), 0, size.z - 1);
 	if (has_motion()) {
 		std::lock_guard<std::recursive_mutex> lock(frame_mutex);
-		int a, b;
-		float t;
-		pose_frames(p_pose, a, b, t, p_weights);
-		const Frame &f = frame(t < 0.5f ? a : b);
+		Blend blend;
+		pose_blend(p_pose, p_weights, blend);
+		const Frame &f = frame(blend.frames[0]);
 		if (!f.materials.empty()) {
 			return f.materials[index(x, y, z)];
 		}
@@ -1144,9 +1423,8 @@ Vector3 DensityShape::rest_grid_point(const Vector3 &p_grid, double p_pose, cons
 		return p_grid;
 	}
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
-	int a, b;
-	float t;
-	pose_frames(p_pose, a, b, t, p_weights);
+	Blend blend;
+	pose_blend(p_pose, p_weights, blend);
 	const Vector3i last = size - Vector3i(1, 1, 1);
 	const Vector3i g = Vector3i(p_grid.round()).clamp(Vector3i(), last);
 	auto from = [&](int p_frame) {
@@ -1176,8 +1454,11 @@ Vector3 DensityShape::rest_grid_point(const Vector3 &p_grid, double p_pose, cons
 		// The anchor's rest point, moved as far as p_grid is from it.
 		return f.to_rest[index(anchor.x, anchor.y, anchor.z)] + (p_grid - Vector3(anchor));
 	};
-	const Vector3 ra = from(a);
-	return t > 0.0f ? ra + (from(b) - ra) * t : ra;
+	Vector3 r;
+	for (int i = 0; i < blend.count; i++) {
+		r += from(blend.frames[i]) * blend.weights[i];
+	}
+	return r;
 }
 
 Vector3 DensityShape::rest_point(const Vector3 &p_local, double p_pose, const PackedFloat32Array &p_weights) const {
