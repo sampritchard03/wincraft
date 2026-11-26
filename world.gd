@@ -58,6 +58,18 @@ var network: Network
 ## VR (vr.gd): a headset, if one is running (Meta Quest through OpenXR).
 const VR := preload("res://vr.gd")
 var vr: VR
+## The HUD (hud.gd): the bar of tool / material / brush slots, the status
+## panel, the help list (H) and the tool wheel (hold Tab), all skinned from
+## res://assets/ui/.
+const Hud := preload("res://hud.gd")
+var hud: Hud
+## The tool wheel's ring, from the top clockwise, with each tool's key (the
+## number of presses for a key with several).
+const WHEEL_TOOLS := [Tool.DRAW, Tool.INFLATE, Tool.SMOOTH, Tool.PINCH, Tool.FLATTEN, Tool.GRAB, Tool.SNAKE_HOOK, Tool.PAINT,
+		Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.EXTRUDE, Tool.TRANSFORM, Tool.PHYSICS_GUN,
+		Tool.GEOMETRY, Tool.BOX, Tool.BOX_CUT]
+const WHEEL_KEYS := ["1", "1 x2", "2", "2 x2", "3", "4", "5", "6", "7", "7 x2", "7 x3", "8", "8 x2", "9", "0", "0 x2", "0 x3"]
+var block_icons := {}  # material -> ImageTexture, for the HUD
 ## Sun shadows from shadow maps (sun_shadows.gd).
 const SunShadows := preload("res://sun_shadows.gd")
 var sun_shadows: SunShadows
@@ -186,7 +198,7 @@ var block := 2  # stone; material_names.size() is "Color": paint_color, below
 ## Colors: after the blocks, [ / ] reach "Color", which Draw builds with and
 ## Paint paints, like a paint program's brush: paint_color laid over what was
 ## there with paint_opacity, solid within paint_hardness of the radius and
-## fading out beyond (one stroke doesn't build up over itself). Tab opens
+## fading out beyond (one stroke doesn't build up over itself). C opens
 ## the picker; middle click on a colored surface picks its color.
 var paint_color := Color(0.85, 0.25, 0.2)
 var paint_opacity := 1.0
@@ -245,6 +257,15 @@ func respawn(spawn) -> void:
 
 func _ready() -> void:
 	var start := Time.get_ticks_msec()
+	var layer := info_label.get_parent()  # the HUD CanvasLayer (Hud moves the label into itself)
+	hud = Hud.new(self)
+	layer.add_child(hud)
+	var names: Array = []
+	for t in WHEEL_TOOLS:
+		names.append(TOOL_NAMES[t])
+	hud.radial.setup(WHEEL_TOOLS, names, WHEEL_KEYS)
+	hud.color_pressed.connect(toggle_color_panel)
+	hud.help_pressed.connect(hud.toggle_help)
 	network = Network.new()
 	network.name = "Network"
 	network.world = self
@@ -381,6 +402,12 @@ func _load_water_texture() -> Texture2D:
 	image.generate_mipmaps()
 	return ImageTexture.create_from_image(image)
 
+## A material's block texture for the HUD.
+func block_icon(p_material: int) -> Texture2D:
+	if not block_icons.has(p_material):
+		block_icons[p_material] = ImageTexture.create_from_image(_load_image("res://assets/block/%s.png" % material_names[p_material]))
+	return block_icons[p_material]
+
 ## A 16x16 RGBA image from a texture file (imported or not); magenta if missing.
 func _load_image(path: String) -> Image:
 	var image: Image = null
@@ -437,6 +464,8 @@ func _save_player() -> void:
 		DirAccess.rename_absolute(path + ".tmp", path)
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_APPLICATION_FOCUS_OUT and hud != null and hud.radial.visible:
+		_close_radial(false)  # (Tab's release won't come)
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
 		_save_player()
 		_save_objects()
@@ -452,8 +481,8 @@ func _sync_prepass_camera() -> void:
 	prepass_camera.fov = camera.fov
 
 ## Scales the low-resolution view up as far as it fits, centred, and fits
-## the HUD to the window: the info text wraps to its width, and the color
-## panel (bottom left) shrinks if it wouldn't fit.
+## the HUD to the window; the color panel (bottom left, above the HUD's
+## bar) shrinks if it wouldn't fit.
 func _fit_screen() -> void:
 	var window := get_viewport().get_visible_rect().size
 	var view := Vector2(screen.size)
@@ -461,20 +490,23 @@ func _fit_screen() -> void:
 	screen.scale = Vector2(fit, fit)
 	screen.position = (window - view * fit) * 0.5
 
-	info_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	info_label.size = Vector2(maxf(window.x - 24.0, 100.0), 0.0)
+	hud.fit(vr.ui.hud_size() if vr != null and vr.active else window)
 	if color_panel != null:
+		var area := hud.size  # (the HUD's own units: it's scaled to the window)
 		var need := color_panel.get_combined_minimum_size()
 		color_panel.size = need
-		var room := Vector2(window.x - 24.0, window.y * 0.7)
+		var room := Vector2(area.x - 24.0, area.y - 160.0)
 		var scale := minf(1.0, minf(room.x / need.x, room.y / need.y))
 		color_panel.scale = Vector2(scale, scale)
-		color_panel.position = Vector2(12.0, window.y - 12.0 - need.y * scale)
+		color_panel.position = Vector2(12.0, area.y - 80.0 - need.y * scale)
 
 ## Mouse look. The camera's rotation is rebuilt from these angles each time, so
 ## pitch always tilts around the camera's own right axis whichever way you face.
 func _input(event: InputEvent) -> void:
 	if editor != null and editor.handle_input(event):
+		get_viewport().set_input_as_handled()
+		return
+	if hud.radial.visible and _radial_input(event):
 		get_viewport().set_input_as_handled()
 		return
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -483,8 +515,8 @@ func _input(event: InputEvent) -> void:
 		camera.rotation = Vector3(pitch, yaw, 0.0)
 	elif event is InputEventMouseButton and event.pressed:
 		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
-			if color_panel.visible and color_panel.get_global_rect().has_point(event.position):
-				return  # the picker's
+			if hud.has_point(event.position):
+				return  # the HUD's (the picker, its clickable slots)
 			if editor != null and editor.has_point(event.position):
 				return  # the object editor's panels
 			if event.button_index == MOUSE_BUTTON_LEFT:
@@ -556,15 +588,18 @@ func _input(event: InputEvent) -> void:
 				_undo()
 	elif event is InputEventKey and event.pressed and not event.echo:
 		if event.physical_keycode == KEY_TAB:
-			color_panel.visible = not color_panel.visible
-			_fit_screen()
-			Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if color_panel.visible else Input.MOUSE_MODE_CAPTURED
-			get_viewport().gui_release_focus()
+			# Held: the tool wheel (_radial_input() picks on release).
+			if not dragging and not stroking and gizmo_axis < 0:
+				hud.radial.open(tool)
 			get_viewport().set_input_as_handled()  # not the GUI's focus-next
 			return
 		if get_viewport().gui_get_focus_owner() is LineEdit:
 			return  # typing into a field (the picker's, the editor's)
 		match _key_of(event):
+			KEY_C:
+				toggle_color_panel()
+			KEY_H:
+				hud.toggle_help()
 			KEY_1: _cycle_tool([Tool.DRAW, Tool.INFLATE])
 			KEY_2: _cycle_tool([Tool.SMOOTH, Tool.PINCH])
 			KEY_3: _set_tool(Tool.FLATTEN)
@@ -635,6 +670,45 @@ func _input(event: InputEvent) -> void:
 					print("Unbound key: physical %s, keycode %s, label %s, unicode %d" % [
 						OS.get_keycode_string(event.physical_keycode), OS.get_keycode_string(event.keycode),
 						OS.get_keycode_string(event.key_label), event.unicode])
+
+## The color picker (C, or the HUD's material slot): on or off, freeing
+## the mouse for it on a screen.
+func toggle_color_panel() -> void:
+	color_panel.visible = not color_panel.visible
+	_fit_screen()
+	if vr == null or not vr.active:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if color_panel.visible else Input.MOUSE_MODE_CAPTURED
+	get_viewport().gui_release_focus()
+
+## While the tool wheel is open: the mouse moves its pointer (not the
+## view), letting go of Tab or a click picks the tool, Escape or the right
+## button closes it as it was. True if the event was the wheel's.
+func _radial_input(event: InputEvent) -> bool:
+	if event is InputEventMouseMotion:
+		hud.radial.move(event.relative)
+		return true
+	if event is InputEventKey and event.physical_keycode == KEY_TAB:
+		if not event.pressed:
+			_close_radial(true)
+		return true  # (and its repeats while held)
+	if event is InputEventKey and event.pressed and event.physical_keycode == KEY_ESCAPE:
+		_close_radial(false)
+		return true
+	if event is InputEventMouseButton and event.pressed:
+		if event.button_index == MOUSE_BUTTON_LEFT:
+			_close_radial(true)
+			capture_click = true  # (that click doesn't also sculpt)
+			return true
+		if event.button_index == MOUSE_BUTTON_RIGHT:
+			_close_radial(false)
+			capture_click = true
+			return true
+	return false
+
+func _close_radial(p_pick: bool) -> void:
+	var picked := hud.radial.close()
+	if p_pick and picked >= 0 and picked != tool:
+		_set_tool(picked as Tool)
 
 ## Which key an event is. Physical keys (positions on a US keyboard) first, so
 ## hotkeys stay put on other layouts; but some setups (input methods, some
@@ -764,6 +838,23 @@ func _basis_along(p_dir: Vector3) -> Basis:
 	var x := y.cross(Vector3.UP if absf(y.y) < 0.99 else Vector3.RIGHT).normalized()
 	return Basis(x, y, x.cross(y))
 
+## The slowest time (ms) each part of _process took since the last
+## take_step_times() (vr.gd logs them on the headset).
+var step_times := {}
+
+func _time_step(p_name: String, p_since: int) -> int:
+	var now := Time.get_ticks_usec()
+	step_times[p_name] = maxf(step_times.get(p_name, 0.0), (now - p_since) / 1000.0)
+	return now
+
+func take_step_times() -> String:
+	var parts: PackedStringArray = []
+	for k in step_times:
+		if step_times[k] >= 1.0:
+			parts.append("%s %.0f" % [k, step_times[k]])
+	step_times.clear()
+	return ", ".join(parts)
+
 func _process(delta: float) -> void:
 	if Input.is_action_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
@@ -781,18 +872,26 @@ func _process(delta: float) -> void:
 		off = 0.0
 	camera_lag = off
 	camera.global_position = eye + Vector3.UP * camera_lag
+	var t := Time.get_ticks_usec()
 	if vr != null and vr.active:
 		vr.follow(player.global_position)  # the headset decides where the camera is
+	t = _time_step("vr", t)
 
 	_sculpt(delta)
+	t = _time_step("sculpt", t)
 	_update_gizmo()
 	_update_geometry()
 	_update_box()
+	t = _time_step("gizmo/geometry/box", t)
 	_record_history()
+	t = _time_step("history", t)
 	terrain.update_view(camera.global_position)  # also sends the drawn bodies to the shader
+	t = _time_step("terrain.update_view", t)
 	sun_shadows.update(camera.global_position)
+	t = _time_step("sun_shadows", t)
 
 	_sync_prepass_camera()
+	t = _time_step("prepass", t)
 
 	player_save_timer += delta
 	if player_save_timer >= player_save_interval:
@@ -854,7 +953,7 @@ func _wrap_player() -> void:
 	for i in geo_points.size():
 		geo_points[i] += offset  # (the preview body moves itself)
 
-## The color picker (Tab): an RGB picker with opacity and hardness sliders.
+## The color picker (C): an RGB picker with opacity and hardness sliders.
 func _make_color_panel() -> void:
 	color_panel = PanelContainer.new()
 	color_panel.visible = false
@@ -873,7 +972,7 @@ func _make_color_panel() -> void:
 	box.add_child(color_picker)
 	opacity_slider = _add_slider(box, "Opacity", paint_opacity, func(v: float) -> void: paint_opacity = v)
 	hardness_slider = _add_slider(box, "Hardness", paint_hardness, func(v: float) -> void: paint_hardness = v)
-	info_label.get_parent().add_child(color_panel)
+	hud.add_child(color_panel)
 
 func _add_slider(p_box: VBoxContainer, p_name: String, p_value: float, p_changed: Callable) -> HSlider:
 	var label := Label.new()
@@ -911,7 +1010,7 @@ func _spawn_frog() -> void:
 
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
-	var sculpting := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not capture_click
+	var sculpting := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not capture_click and not hud.radial.visible
 	var held := sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var pressing := held or (sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX, Tool.BOX_CUT]:
@@ -995,20 +1094,8 @@ func _sculpt(delta: float) -> void:
 				terrain.apply_brush(copies[i] * hit, brush_radius, strength, mode, material)
 	_update_symmetry_visuals(hit)
 
-	var sym :="Blocky %s (B)   F throws a ball, G drops a frog, X removes one   Selected %d (Backspace clears, P: to physics object, Ctrl+C / Ctrl+V copy, Ctrl+P export, Ctrl+O import)   %s   " % [
-		"on" if terrain.blocky_size >= 2 else "off", terrain.get_selected_count(), _tool_hint()]
-	var prefix := sym
-	sym += "Symmetry off (E: axis along view)"
-	if symmetry_on:
-		sym = prefix
-		sym += "Mirror symmetry" if symmetry == Symmetry.MIRROR else "Radial symmetry x%d (+/-)" % radial_count
-		sym += " (Z: mirror/radial, E: move axis, Q: remove)"
-	var block_name := material_names[block].capitalize() if block < material_names.size() else \
-			"Color #%s, opacity %d%%, hardness %d%% (Tab: picker)" % [paint_color.to_html(false), roundi(paint_opacity * 100.0), roundi(paint_hardness * 100.0)]
-	info_label.text = "%s (1 Draw / Inflate, 2 Smooth / Pinch, 3 Flatten, 4 Grab, 5 Snake hook, 6 Paint, 7 Select: paint / fill / geometry, 8 Extrude / Transform, 9 Physics gun, 0 Geometry / Box / Box cut)   LMB sculpt, RMB carve\nMaterial: %s ([ / ], middle click picks)   Radius %.1f (wheel)   Strength %.1f (Ctrl+wheel)   Undo %d / redo %d (Ctrl+Z / Ctrl+Shift+Z)   %d FPS\n%s" % [
-		TOOL_NAMES[tool], block_name, brush_radius, brush_strength, terrain.get_undo_count(), terrain.get_redo_count(), Engine.get_frames_per_second(), sym]
-	if not network.status.is_empty():
-		info_label.text += "\n" + network.hud_text()
+	info_label.text = _tool_hint()
+	hud.refresh()
 
 func _begin_drag(p_hit: Vector3) -> void:
 	dragging = true
@@ -1314,7 +1401,7 @@ func _open_file_dialog(p_mode: FileDialog.FileMode, p_chosen: Callable) -> void:
 	file_dialog.current_dir = ProjectSettings.globalize_path("res://")
 	file_dialog.use_native_dialog = true
 	file_dialog.file_selected.connect(p_chosen)
-	info_label.get_parent().add_child(file_dialog)
+	hud.add_child(file_dialog)
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	file_dialog.popup_centered_ratio(0.6)
 

@@ -743,6 +743,12 @@ double DensityBody3D::distance_at(const Vector3 &p_point, Vector3 &r_normal) {
 		r_normal = rotation.xform(shape->get_normal(local, pose));
 		return shape->get_density(local, pose) * scale;
 	}
+	if (capsule_radius > 0.0) {
+		Vector3 d;
+		const double inside = capsule_inside(p_point, d);
+		r_normal = d;
+		return inside;
+	}
 	double best = -1e30;
 	r_normal = Vector3(0, 1, 0);
 	for (size_t i = 0; i < world_centers.size(); i++) {
@@ -765,11 +771,26 @@ double DensityBody3D::density_at(const Vector3 &p_point) {
 		const Vector3 local = to_local(p_point);
 		return shape->get_density(local, pose) * scale;
 	}
+	if (capsule_radius > 0.0) {
+		Vector3 d;
+		return capsule_inside(p_point, d);
+	}
 	double best = -1e30;
 	for (size_t i = 0; i < world_centers.size(); i++) {
 		best = std::max(best, (double)world_radii[i] - (p_point - world_centers[i]).length());
 	}
 	return best;
+}
+
+double DensityBody3D::capsule_inside(const Vector3 &p_point, Vector3 &r_normal) const {
+	const Vector3 local = to_local(p_point);
+	const Vector3 ab = capsule_b - capsule_a;
+	const float len2 = ab.length_squared();
+	const float t = len2 > 0.0f ? std::clamp((local - capsule_a).dot(ab) / len2, 0.0f, 1.0f) : 0.0f;
+	const Vector3 d = local - (capsule_a + ab * t);
+	const double dist = d.length();
+	r_normal = dist > 1e-6 ? rotation.xform(d / (float)dist) : Vector3(0, 1, 0);
+	return (capsule_radius - dist) * scale;
 }
 
 Vector3 DensityBody3D::normal_at(const Vector3 &p_point) {
@@ -1096,6 +1117,160 @@ void DensityCharacter3D::rebuild_spheres() {
 		list.push_back(q);
 	}
 	set_spheres(list);
+	capsule_radius = r;
+	capsule_a = Vector3(0, (float)r, 0);
+	capsule_b = Vector3(0, (float)(h - r), 0);
+	build_patches();
+	forget_checks();
+}
+
+void DensityCharacter3D::build_patches() {
+	patches.clear();
+	small_patches.clear();
+	// Groups points (sample centres, or small patch centres) into cells
+	// p_cell across: each group a patch with its bounding sphere and the
+	// coarse level that can vouch for it.
+	auto group = [](const std::vector<Vector3> &p_points, const std::vector<double> &p_radii, double p_cell, std::vector<Patch> &r_patches) {
+		std::unordered_map<Vector3i, int, Vector3iHash> index;
+		for (int i = 0; i < (int)p_points.size(); i++) {
+			const Vector3 &c = p_points[i];
+			const Vector3i key((int)std::floor(c.x / p_cell), (int)std::floor(c.y / p_cell), (int)std::floor(c.z / p_cell));
+			auto found = index.find(key);
+			if (found == index.end()) {
+				found = index.emplace(key, (int)r_patches.size()).first;
+				r_patches.push_back(Patch());
+			}
+			r_patches[found->second].members.push_back(i);
+		}
+		for (Patch &p : r_patches) {
+			Vector3 sum;
+			for (int i : p.members) {
+				sum += p_points[i];
+			}
+			p.centre = sum / (float)p.members.size();
+			for (int i : p.members) {
+				p.reach = std::max(p.reach, (double)(p_points[i] - p.centre).length() + p_radii[i]);
+			}
+			// The coarse level whose distances (at most ~0.6 * CLAMP lattice
+			// steps, less a corner's offset) reach past the patch.
+			p.level = 1;
+			while (p.level < 7 && (0.6 * DENSITY_CLAMP - 1.75) * (1 << p.level) < p.reach + CLEAR_GAP + 1.0) {
+				p.level++;
+			}
+		}
+	};
+	if (samples.size() <= 16) {
+		// A normal-sized player: a few spheres, all checked.
+		Patch all;
+		all.level = -1;
+		all.members.push_back(0);
+		patches.push_back(all);
+		Patch every;
+		every.level = -1;
+		for (int i = 0; i < (int)samples.size(); i++) {
+			every.members.push_back(i);
+		}
+		small_patches.push_back(every);
+		return;
+	}
+	std::vector<Vector3> points;
+	std::vector<double> radii;
+	for (const Vector4 &q : samples) {
+		points.push_back(Vector3(q.x, q.y, q.z));
+		radii.push_back(q.w);
+	}
+	group(points, radii, SMALL_PATCH, small_patches);
+	std::vector<Vector3> centres;
+	std::vector<double> reaches;
+	for (const Patch &p : small_patches) {
+		centres.push_back(p.centre);
+		reaches.push_back(p.reach);
+	}
+	group(centres, reaches, std::max(SMALL_PATCH * 2.0, radius * 0.4), patches);
+}
+
+void DensityCharacter3D::forget_checks() {
+	patch_margin.assign(patches.size() + small_patches.size(), -1.0f);
+	patch_feet.assign(patch_margin.size(), Vector3());
+	sample_margin.assign(samples.size(), -1.0f);
+	sample_feet.assign(samples.size(), Vector3());
+}
+
+double DensityCharacter3D::worst_gap(SculptTerrain *p_terrain, const Vector3 &p_feet, Vector3 &r_normal) const {
+	double worst = 1e30;
+	int deepest = -1;
+	r_normal = Vector3(0, 1, 0);
+	// A ground check is good while the feet stay within its margin of where
+	// they were for it (the ground can't have come nearer than that; an edit
+	// forgets them all): a big player re-reads only what it moved near.
+	if (remembered_serial != p_terrain->get_edit_serial()) {
+		remembered_serial = p_terrain->get_edit_serial();
+		std::fill(patch_margin.begin(), patch_margin.end(), -1.0f);
+		std::fill(sample_margin.begin(), sample_margin.end(), -1.0f);
+	}
+	// Whether nothing (ground or a near body) is within reach of a patch
+	// (index p_slot of patch_margin / patch_feet).
+	auto clear = [&](const Patch &p, int p_slot) {
+		if (p.level < 0) {
+			return false;
+		}
+		const Vector3 c = p_feet + p.centre;
+		for (const DensityBody3D *b : near_bodies) {
+			const double reach = b->bound + p.reach + 1.0;
+			if (b->com.distance_squared_to(c) <= reach * reach) {
+				return false;
+			}
+		}
+		if (patch_margin[p_slot] > 0.0f && patch_feet[p_slot].distance_squared_to(p_feet) < patch_margin[p_slot] * patch_margin[p_slot]) {
+			return true;
+		}
+		const double room = p_terrain->clear_distance(c, p.level) - p.reach - CLEAR_GAP;
+		patch_margin[p_slot] = (float)room;
+		patch_feet[p_slot] = p_feet;
+		return room > 0.0;
+	};
+	for (int bi = 0; bi < (int)patches.size(); bi++) {
+		const Patch &big = patches[bi];
+		if (clear(big, bi)) {
+			worst = std::min(worst, CLEAR_GAP);
+			continue;
+		}
+		for (int s : big.members) {
+			const Patch &p = small_patches[s];
+			if (clear(p, (int)patches.size() + s)) {
+				worst = std::min(worst, CLEAR_GAP);
+				continue;
+			}
+			for (int k : p.members) {
+				// The ground's distance only (one density read): the way out
+				// (two normals, a dozen more reads) is only needed for the
+				// deepest sample, below. Near a body, the whole check.
+				const Vector3 c = axis_point(p_feet, k);
+				double g;
+				if (near_bodies.empty()) {
+					if (sample_margin[k] > 0.0f && sample_feet[k].distance_squared_to(p_feet) < sample_margin[k] * sample_margin[k]) {
+						worst = std::min(worst, CLEAR_GAP);
+						continue;
+					}
+					g = -p_terrain->get_density(c) - samples[k].w;
+					// Densities can overstate the distance (up to ~1.7x): half of it.
+					sample_margin[k] = (float)(0.5 * (g + samples[k].w) - samples[k].w * 0.5 - CLEAR_GAP);
+					sample_feet[k] = p_feet;
+				} else {
+					Vector3 n;
+					g = gap(p_terrain, c, samples[k].w, true, n);
+				}
+				if (g < worst) {
+					worst = g;
+					deepest = k;
+				}
+			}
+		}
+	}
+	if (deepest >= 0) {
+		worst = gap(p_terrain, axis_point(p_feet, deepest), samples[deepest].w, true, r_normal);
+	}
+	return worst;
 }
 
 double DensityCharacter3D::gap(SculptTerrain *p_terrain, const Vector3 &p_center, double p_radius, bool p_bodies, Vector3 &r_normal) const {
@@ -1178,23 +1353,14 @@ bool DensityCharacter3D::move_and_slide() {
 			on_wall = true;
 		}
 	};
-	const int count = axis_count();
 	// Pushes the capsule at r_feet out of what it's in, along the deepest
 	// sphere's way out, a few times. p_slide: also classify the contacts and
 	// take away velocity into them. Returns whether it hit a wall.
 	auto depenetrate = [&](Vector3 &r_feet, bool p_slide) {
 		bool wall = false;
 		for (int iteration = 0; iteration < 4; iteration++) {
-			double worst = 0.0;
 			Vector3 out;
-			for (int k = 0; k < count; k++) {
-				Vector3 n;
-				const double g = gap(terrain, axis_point(r_feet, k), samples[k].w, true, n);
-				if (g < worst) {
-					worst = g;
-					out = n;
-				}
-			}
+			const double worst = std::min(worst_gap(terrain, r_feet, out), 0.0);
 			if (worst >= -1e-3) {
 				break;
 			}
@@ -1249,14 +1415,9 @@ bool DensityCharacter3D::move_and_slide() {
 			// sphere is over the ledge, not on its corner).
 			const Vector3 lift(0, (float)step_height, 0);
 			Vector3 n;
-			bool room = true;
-			for (int k = 0; k < count && room; k++) {
-				room = gap(terrain, axis_point(start + lift, k), samples[k].w, true, n) > -0.05;
-			}
+			bool room = worst_gap(terrain, start + lift, n) > -0.05;
 			Vector3 ahead = start + lift + across.normalized() * (float)std::max((double)across.length(), std::min(radius, MAX_SAMPLE_RADIUS));
-			for (int k = 0; k < count && room; k++) {
-				room = gap(terrain, axis_point(ahead, k), samples[k].w, true, n) > -0.05;
-			}
+			room = room && worst_gap(terrain, ahead, n) > -0.05;
 			if (room) {
 				const double g = settle(ahead, step_height * 2.0, n);
 				// The rise counts from the floor last stood on, so a ledge can't be

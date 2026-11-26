@@ -973,7 +973,7 @@ Dictionary SculptTerrain::get_stats() const {
 
 // --- Sculpting -----------------------------------------------------------------
 
-int8_t SculptTerrain::cached_point(int x, int y, int z) {
+int8_t SculptTerrain::cached_point(int x, int y, int z, int p_level) {
 	// Unedited ground is computed from noise wherever it's read, which is
 	// slow for physics reading the same points over and over: keep the
 	// latest ones in a table (one slot per hash; a newer point takes it
@@ -981,14 +981,20 @@ int8_t SculptTerrain::cached_point(int x, int y, int z) {
 	if (point_cache.empty()) {
 		point_cache.resize(POINT_CACHE_SIZE);
 	}
-	const uint32_t h = ((uint32_t)x * 73856093u) ^ ((uint32_t)y * 19349663u) ^ ((uint32_t)z * 83492791u);
+	const uint32_t h = ((uint32_t)x * 73856093u) ^ ((uint32_t)y * 19349663u) ^ ((uint32_t)z * 83492791u) ^ ((uint32_t)p_level * 2654435761u);
 	CachedPoint &e = point_cache[(h ^ (h >> 15)) & (POINT_CACHE_SIZE - 1)];
-	if (e.generation != cache_generation || e.x != x || e.y != y || e.z != z) {
+	if (e.generation != cache_generation || e.x != x || e.y != y || e.z != z || e.level != (uint8_t)p_level) {
 		e.x = x;
 		e.y = y;
 		e.z = z;
+		e.level = (uint8_t)p_level;
 		e.generation = cache_generation;
-		e.value = world.point(x, y, z);
+		if (p_level == 0) {
+			e.value = world.point(x, y, z);
+		} else {
+			MaterialId material;
+			e.value = world.lod_texel(x, y, z, p_level, material);
+		}
 	}
 	return e.value;
 }
@@ -1007,6 +1013,31 @@ float SculptTerrain::cached_sample(const Vector3 &p) {
 
 double SculptTerrain::get_density(const Vector3 &p_pos) {
 	return cached_sample(p_pos);
+}
+
+double SculptTerrain::clear_distance(const Vector3 &p_pos, int p_level) {
+	if (!opened) {
+		return 0.0;
+	}
+	// The lattice cell holding the position at this level. Each corner's
+	// value is a distance in 1/16ths of the level's spacing (as the clipmap
+	// stores it); the true distance is 1-Lipschitz, so p is at least a
+	// corner's distance less how far p is from it. Stored densities can
+	// overstate distances near a surface (by up to ~1.7x, as the raymarcher
+	// allows for), hence the 0.6. A solid corner: can't tell.
+	const int s = 1 << p_level;
+	const int x0 = (int)std::floor(p_pos.x / s) * s, y0 = (int)std::floor(p_pos.y / s) * s, z0 = (int)std::floor(p_pos.z / s) * s;
+	double best = 1e30;
+	for (int k = 0; k < 8; k++) {
+		const int cx = x0 + ((k & 1) ? s : 0), cy = y0 + ((k >> 1) & 1 ? s : 0), cz = z0 + ((k >> 2) & 1 ? s : 0);
+		const int8_t v = cached_point(cx, cy, cz, p_level);
+		if (v >= 0) {
+			return 0.0;
+		}
+		const double distance = -v * DENSITY_STEP * s * 0.6 - (Vector3((float)cx, (float)cy, (float)cz) - p_pos).length();
+		best = std::min(best, distance);
+	}
+	return std::max(best, 0.0);
 }
 
 Vector3 SculptTerrain::get_normal(const Vector3 &p_pos, double p_spread) {

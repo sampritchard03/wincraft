@@ -222,6 +222,12 @@ public:
 	Variant raycast(const Vector3 &p_from, const Vector3 &p_dir, double p_max_distance);
 	// Interpolated density at a position (> 0 = solid), in voxels.
 	double get_density(const Vector3 &p_pos);
+	// How far p_pos is from the nearest ground at least, read from level
+	// p_level's coarse data (points 2^p_level apart, which hold distances up
+	// to ~8 * 2^p_level voxels, where the full detail stops at ~8): for
+	// telling quickly that a big thing is clear of the ground. Conservative:
+	// never more than the real distance; 0 when it can't tell.
+	double clear_distance(const Vector3 &p_pos, int p_level);
 	// Outward surface normal at a position, from densities p_spread away
 	// (wider: the general lie of the ground rather than its bumps).
 	Vector3 get_normal(const Vector3 &p_pos, double p_spread = 0.5);
@@ -345,9 +351,9 @@ private:
 	// material, prepass_material and extra_materials (the valid ones).
 	std::vector<Ref<ShaderMaterial>> clip_materials() const;
 	int clip_size = 256;
-	int clip_levels = 4;
+	int clip_levels = 3;
 	// 109, 218, 436, 872, 1744, 3488, 6976, 13952
-	double view_distance = 872.0;
+	double view_distance = 436.0;
 	int thread_count = 0; // 0 = one per CPU core
 	double simulation_radius = 160.0;
 	int blocky_size = 0;
@@ -401,11 +407,12 @@ private:
 		int32_t x = 0, y = 0, z = 0;
 		uint32_t generation = 0; // valid if cache_generation
 		int8_t value = 0;
+		uint8_t level = 0; // clipmap level the value is at (see clear_distance())
 	};
 	std::vector<CachedPoint> point_cache;
 	uint32_t cache_generation = 1;
 	static constexpr size_t POINT_CACHE_SIZE = 1u << 20;
-	int8_t cached_point(int x, int y, int z);
+	int8_t cached_point(int x, int y, int z, int p_level = 0);
 	float cached_sample(const Vector3 &p_position);
 	// Wakes sleeping bodies near what an edit (or undo) changed.
 	void mark_edited(const Vector3i &p_min, const Vector3i &p_max);
