@@ -7,8 +7,13 @@
 #include <godot_cpp/variant/vector3i.hpp>
 
 #include <cmath>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -160,6 +165,7 @@ public:
 	// somewhere, or p_dir can't be made.
 	bool adopt_dir(const String &p_dir);
 	void close();
+	~VoxelWorld();
 
 	// The world's extent: x and z wrap every world_size; y runs from
 	// y_min() to y_max() - 1.
@@ -256,11 +262,15 @@ public:
 		return chunk != nullptr && chunk->edited;
 	}
 
-	// Writes every changed region. Returns false if any write failed.
-	bool save();
+	// Writes every changed region. p_wait: and waits until every write
+	// (also earlier queued ones) is on disk, returning false if any failed;
+	// otherwise the writes go on in the background (true; a failure shows
+	// up in last_error and its chunks are saved again next time).
+	bool save(bool p_wait = true);
 	// Loads the unloaded chunks within p_radius (Chebyshev, the short way
-	// round) of p_center, nearest first, for at most about p_budget_ms.
-	// Returns how many it loaded.
+	// round) of p_center, nearest first: edited ones (from the save) here
+	// for at most about p_budget_ms, generated ones on a background thread,
+	// a batch at a time, taken in on a later call. Returns how many it took in.
 	int load_near(const Vector3 &p_center, float p_radius, double p_budget_ms);
 	// Lets go of the points of chunks farther than p_radius (saving edits
 	// first).
@@ -340,6 +350,10 @@ private:
 		std::vector<RegionEntry> entries;
 	};
 	mutable std::unordered_map<Vector3i, RegionIndex, Vector3iHash> region_index; // read region headers
+	// Held for region_index, region_files and the region files themselves
+	// while load_near()'s background batch may read them (see read_full()).
+	mutable std::mutex region_lock;
+	// The caller holds region_lock (or no batch can be running: open()).
 	const RegionIndex *cached_region_index(const Vector3i &p_region) const;
 	// Terrain: a chunk column's ground heights (see column_info()).
 	struct ColumnInfo {
@@ -356,6 +370,9 @@ private:
 	// Fills a chunk's points: from the save if edited, else generated.
 	void load_chunk(const Vector3i &p_chunk, Chunk &r_chunk) const;
 	bool load_full(const Vector3i &p_chunk, Chunk &r_chunk) const;
+	// Any thread: an edited chunk's saved points (taking region_lock), and
+	// nothing else: no repair, no last_error. False if unreadable.
+	bool read_full(const Vector3i &p_unwrapped_chunk, std::vector<int8_t> &r_full, std::vector<MaterialId> &r_materials) const;
 	// Undoes an old bug's damage to a loaded chunk, if it shows (see .cpp).
 	void repair_doubled(Chunk &r_chunk) const;
 	mutable int repaired_chunks = 0;
@@ -374,6 +391,23 @@ private:
 	std::vector<Vector3i> edited_list;
 	mutable std::mutex loaded_lock;
 	void note_loaded(const Vector3i &p_chunk) const;
+	// load_near()'s chunks being generated in the background: the worker
+	// only fills made (from the settings and its own copies of the columns'
+	// info); they're taken in on the main thread once it has finished.
+	struct LoadBatch {
+		std::vector<Vector3i> chunks;
+		std::vector<uint8_t> edited; // per chunk, when the batch started: read from the save
+		std::vector<uint8_t> read_ok; // per edited chunk: read_full() worked
+		std::vector<Vector3i> columns; // the distinct (wrapped) columns, terrain worlds
+		std::vector<int> column_of; // per chunk: its index in columns
+		std::vector<ColumnInfo> infos; // per column, worked out by the worker
+		std::vector<Chunk> made;
+		std::thread thread;
+		std::atomic<bool> finished{ false };
+	};
+	std::unique_ptr<LoadBatch> load_batch;
+	static constexpr int LOAD_BATCH = 16;
+	void wait_load_batch(); // joins it, throwing it away
 	Vector3i chunk_counts; // chunks per axis
 	mutable String last_error;
 	std::unordered_set<Vector3i, Vector3iHash> region_files; // regions with a file on disk
@@ -408,7 +442,43 @@ private:
 	bool read_region_index(const String &p_path, std::vector<RegionEntry> &r_entries, int *r_version = nullptr) const;
 	// For chunks saved without materials: what the generator gives there.
 	void generate_materials(const Vector3i &p_chunk, MaterialId *r_full) const;
-	bool write_region(const Vector3i &p_region);
+	// Region writes, on a background thread (a region's chunks compressed
+	// and written took up to ~200 ms on the main thread). queue_region_write()
+	// copies what the region needs on the main thread and marks its chunks
+	// saved; the writer reads edited chunks that aren't in memory from the
+	// old file, compresses and replaces it under region_lock.
+	struct RegionWrite {
+		struct Entry {
+			Vector3i chunk;
+			int local = 0;
+			bool from_file = false; // not in memory: read from the old file
+			std::vector<int8_t> full;
+			std::vector<MaterialId> full_materials;
+			std::vector<int8_t> mips;
+			std::vector<MaterialId> mip_materials;
+		};
+		Vector3i region;
+		String path;
+		std::vector<Entry> entries;
+	};
+	void queue_region_write(const Vector3i &p_region);
+	void writer_loop();
+	bool write_region_now(RegionWrite &r_write); // writer thread; false if it failed
+	// Takes in finished writes (main thread): failures make their regions'
+	// chunks dirty again. Returns false if any failed.
+	bool poll_writes();
+	void flush_writes(); // waits until the queue is empty (main thread)
+	void stop_writer();
+	std::mutex write_mutex;
+	std::condition_variable write_wake, write_done;
+	std::deque<RegionWrite> write_queue;
+	bool writer_busy = false, writer_stopping = false;
+	std::thread writer;
+	std::vector<std::pair<Vector3i, String>> failed_writes; // (region, error), under write_mutex
+	// Main thread: queued, not yet taken in by poll_writes() (their chunks
+	// stay in memory until then).
+	std::unordered_map<Vector3i, int, Vector3iHash> pending_writes;
+	std::vector<Vector3i> finished_writes; // under write_mutex
 	bool write_settings();
 	bool read_settings();
 };

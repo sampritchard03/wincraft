@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -64,8 +65,10 @@ public:
 		// wrapped like texels), before fix_pending() lowered it.
 		std::vector<uint8_t> raw;
 		// Texels whose distances fix_pending() still has to work out again
-		// (world texels; fix_lo > fix_hi: none).
-		Vector3i fix_lo = Vector3i(1, 1, 1), fix_hi;
+		// (world texels, inclusive boxes). Kept apart unless one pass over
+		// both costs less than two (see queue_fix()), so edits far apart
+		// don't make one pass over everything between them.
+		std::vector<std::pair<Vector3i, Vector3i>> fix_boxes;
 		std::vector<uint8_t> layer_dirty; // per storage layer: changed since uploaded
 		// Where the GPU copy is placed. After a move it stays at the old origin
 		// until every changed layer is uploaded (see SculptTerrain); meanwhile
@@ -77,6 +80,10 @@ public:
 		std::vector<uint8_t> has_surface; // per brick (wrapped)
 		std::vector<uint8_t> bricks; // per brick distance (wrapped)
 		bool bricks_dirty = false; // changed since uploaded
+		std::vector<uint8_t> brick_layers_dirty; // which storage layers of bricks (when bricks_dirty)
+		// has_surface changed: bricks need update_brick_distances(), done
+		// once a frame by update_stale_distances() however many changes.
+		bool distances_stale = false;
 		// Edits made while a move was running, to re-apply when it finishes.
 		std::vector<std::pair<Vector3i, Vector3i>> pending_edits;
 
@@ -116,6 +123,14 @@ public:
 	// worker thread and writes back those that finished. p_all: all of it
 	// now. Returns whether anything changed.
 	bool fix_pending(const VoxelWorld &p_world, bool p_all);
+	// The slowest finish_job() since the last take, per part ("raw",
+	// "patch", "queue", "pending"), the slowest start_job() ("start") and
+	// per level ("L0".."); then zeroed.
+	std::vector<std::pair<std::string, double>> take_finish_times();
+	// Works out the brick distances of levels whose bricks gained or lost
+	// surface since the last call (whole level each: so at most once a frame;
+	// the levels side by side on worker threads). Call before uploading.
+	void update_stale_distances();
 	// How far a pass reaches: CLAMP texels, rounded up, and one
 	// more for the crossings next to them.
 	static constexpr int FIX_REACH = 9;
@@ -128,9 +143,18 @@ public:
 private:
 	// World texels [lo, hi] a move brings into view. Brick-aligned (levels
 	// move in steps of RECENTER texels).
+	// An edited chunk's stored data (copied on the main thread when a move
+	// starts), for the worker to write over the generated texels.
+	struct Patch {
+		Vector3i chunk, t0, t1; // the chunk; its texels inside the slab
+		int side = 0; // points per axis of data
+		std::vector<int8_t> data;
+		std::vector<MaterialId> materials;
+	};
 	struct Slab {
 		Vector3i lo, hi;
 		std::vector<uint8_t> surface; // has_surface per brick of the slab, x fastest
+		std::vector<Patch> patches; // the edited chunks in it (used up by the worker)
 	};
 	// A move of one level, generating on a worker thread.
 	struct Job {
@@ -142,6 +166,11 @@ private:
 		// slabs straight into the level's storage slots they replace, which
 		// nothing else touches while it runs (see refresh()).
 		std::vector<uint8_t> texels;
+		// Levels 1 and up: the worker also copies the slabs' densities into
+		// the raw values (the level's, or for a reset this new copy), so the
+		// main thread doesn't (strided over the whole level: up to ~100 ms).
+		std::vector<uint8_t> raw;
+		bool raw_done = false;
 		// Texels shift() moved the world by while this ran (main thread only:
 		// the worker's coordinates are applied with this once it's done).
 		Vector3i shift;
@@ -152,6 +181,8 @@ private:
 	int size = 128;
 	std::vector<Level> levels;
 	std::vector<std::unique_ptr<Job>> jobs; // per level, or null
+	double finish_part_ms[5] = {}; // see take_finish_times(); [4]: start_job()
+	double finish_level_ms[16] = {};
 	// fix_pending()'s passes, one per level at a time, on a worker thread:
 	// the raw values needed are copied out first, and the result written
 	// back on the main thread a frame or so later.
@@ -159,7 +190,6 @@ private:
 		Vector3i min, max; // the box asked for (world texels)
 		Vector3i a, n; // read: first texel, size
 		Vector3i wa, wb; // written: first and last texel
-		Vector3i origin; // the level's then (moved since: thrown away, asked again)
 		std::vector<uint8_t> raw; // the raw values read (+ 128)
 		int scale = 1, saturated = 0; // the level's; what "at least CLAMP voxels" reads as
 		Vector3i chunk0, chunk_n; // the chunks the read box covers...
@@ -167,20 +197,32 @@ private:
 		std::vector<int8_t> result; // per written texel
 		std::thread thread;
 		std::atomic<bool> finished{ false };
+		// Main thread only (the worker reads the boxes above while it runs):
+		// shift() records world shifts here instead of waiting for the
+		// worker, and fix_pending() applies them once it has finished.
+		Vector3i shift; // texels to add to the boxes
+		bool dropped = false; // the level was rebuilt: throw the result away
 	};
 	std::vector<std::unique_ptr<FixJob>> fix_jobs; // per level, or null
 
 	void start_job(int p_level, const Vector3i &p_target, const VoxelWorld &p_world, bool p_wait, int p_threads);
 	void finish_job(int p_level, VoxelWorld &r_world);
-	// Worker side: generated (unedited) texels of a slab into r_texels, and
-	// which of its bricks hold surface. Reads nothing the main thread changes.
+	// Copies the densities of a slab's texels into p_raw (texels + 128).
+	void copy_raw(const Slab &p_slab, const uint8_t *p_texels, uint8_t *r_raw) const;
+	// Worker side: generated texels of a slab into r_texels, the slab's
+	// patches over them, and which of its bricks hold surface. Reads nothing
+	// the main thread changes.
 	void generate_slab(const VoxelWorld &p_world, int p_level, Slab &r_slab, uint8_t *r_texels, int p_threads) const;
+	// Main thread: copies the data of the edited chunks in a slab into its
+	// patches (edits made while the worker runs are redone by finish_job()).
+	void take_patches(Slab &r_slab, int p_level, const VoxelWorld &p_world) const;
+	// Any thread: an edited chunk's data (points every C / side) into texels
+	// [p_t0, p_t1] of r_texels, and r_raw if not null.
+	void write_chunk(int p_level, const Vector3i &p_chunk, const int8_t *p_data, const MaterialId *p_materials, int p_side, const Vector3i &p_t0, const Vector3i &p_t1, uint8_t *r_texels, uint8_t *r_raw) const;
 	// Main thread: re-reads world texels [p_min, p_max] (clipped to the level)
 	// through VoxelWorld::lod_texel, which knows about edits. Returns whether
 	// any brick's has_surface changed.
 	bool write_texels(Level &r_level, int p_level, VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max);
-	// Overwrites the texels of edited chunks within world texels [p_min, p_max].
-	void patch_edited(Level &r_level, int p_level, VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max);
 	// Calls p_function(t0, t1) with the texel box of each repeat of the
 	// (wrapping) world's voxel box [p_min, p_max] inside texels [p_lo, p_hi].
 	template <typename F>

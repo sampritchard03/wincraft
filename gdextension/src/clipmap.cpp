@@ -3,6 +3,7 @@
 #include "parallel.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 using namespace godot;
@@ -52,28 +53,20 @@ void Clipmap::shift(VoxelWorld &r_world, const Vector3i &p_offset) {
 			}
 		}
 		if (l < (int)fix_jobs.size() && fix_jobs[l]) {
+			// Never wait for the worker here: fix_pending() applies this
+			// once it has finished (or throws the result away).
 			FixJob &fix = *fix_jobs[l];
-			if (fix.thread.joinable()) {
-				fix.thread.join();
-			}
 			if (keeps) {
-				const Vector3i texels = p_offset / level.scale;
-				fix.a += texels;
-				fix.wa += texels;
-				fix.wb += texels;
-				fix.min += texels;
-				fix.max += texels;
-				fix.origin += texels;
+				fix.shift += p_offset / level.scale;
 			} else {
-				fix_jobs[l].reset();
+				fix.dropped = true;
 			}
 		}
 		if (!keeps) {
 			level.valid = false;
 			level.published = false;
 			level.pending_edits.clear();
-			level.fix_lo = Vector3i(1, 1, 1);
-			level.fix_hi = Vector3i();
+			level.fix_boxes.clear();
 			continue;
 		}
 		const Vector3i texels = p_offset / level.scale;
@@ -83,8 +76,10 @@ void Clipmap::shift(VoxelWorld &r_world, const Vector3i &p_offset) {
 			lo += p_offset;
 			hi += p_offset;
 		}
-		level.fix_lo += texels;
-		level.fix_hi += texels;
+		for (auto &[lo, hi] : level.fix_boxes) {
+			lo += texels;
+			hi += texels;
+		}
 	}
 }
 
@@ -171,26 +166,7 @@ bool Clipmap::write_texels(Level &r_level, int p_level, VoxelWorld &r_world, con
 				const MaterialId *materials;
 				int side;
 				if (r_world.edited_data(c, p_level, data, materials, side)) {
-					// Stored points are every 2^m apart; texels every s >= 2^m.
-					const int m = C / side == 1 ? 0 : (int)std::lround(std::log2((double)(C / side)));
-					const int stride = s >> m;
-					for (int z = t0.z; z <= t1.z; z++) {
-						for (int y = t0.y; y <= t1.y; y++) {
-							const size_t first = ((size_t)((z * s - c.z * C) >> m) * side + ((y * s - c.y * C) >> m)) * side + ((t0.x * s - c.x * C) >> m);
-							const int8_t *in = &data[first];
-							const MaterialId *in_material = &materials[first];
-							for (int x = t0.x; x <= t1.x; x++, in += stride, in_material += stride) {
-								const int8_t q = p_level == 0 ? *in : VoxelWorld::encode_texel(*in * DENSITY_STEP, p_level);
-								const size_t at = texel_index(Vector3i(x, y, z));
-								uint8_t *texel = &r_level.texels[at * TEXEL_BYTES];
-								texel[0] = (uint8_t)(q + 128);
-								if (!r_level.raw.empty()) {
-									r_level.raw[at] = texel[0];
-								}
-								render_bytes(*in_material, texel + 1);
-							}
-						}
-					}
+					write_chunk(p_level, c, data, materials, side, t0, t1, r_level.texels.data(), r_level.raw.empty() ? nullptr : r_level.raw.data());
 				} else {
 					for (int z = t0.z; z <= t1.z; z++) {
 						for (int y = t0.y; y <= t1.y; y++) {
@@ -214,23 +190,58 @@ bool Clipmap::write_texels(Level &r_level, int p_level, VoxelWorld &r_world, con
 	return update_has_surface(r_level, p_min, p_max);
 }
 
-void Clipmap::patch_edited(Level &r_level, int p_level, VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max) {
-	const int s = r_level.scale;
-	r_world.prepare(p_min * s, p_max * s, p_level);
+void Clipmap::write_chunk(int p_level, const Vector3i &p_chunk, const int8_t *p_data, const MaterialId *p_materials, int p_side, const Vector3i &p_t0, const Vector3i &p_t1, uint8_t *r_texels, uint8_t *r_raw) const {
+	const int s = 1 << p_level, C = VoxelWorld::CHUNK;
+	const Vector3i &c = p_chunk;
+	// Stored points are every 2^m apart; texels every s >= 2^m.
+	const int m = C / p_side == 1 ? 0 : (int)std::lround(std::log2((double)(C / p_side)));
+	const int stride = s >> m;
+	// Wrapped storage: the row's start once, x stepped (a % per texel was
+	// most of the time for a chunk).
+	const int wx0 = wrap(p_t0.x, size);
+	for (int z = p_t0.z; z <= p_t1.z; z++) {
+		for (int y = p_t0.y; y <= p_t1.y; y++) {
+			const size_t first = ((size_t)((z * s - c.z * C) >> m) * p_side + ((y * s - c.y * C) >> m)) * p_side + ((p_t0.x * s - c.x * C) >> m);
+			const int8_t *in = &p_data[first];
+			const MaterialId *in_material = &p_materials[first];
+			const size_t row = ((size_t)wrap(z, size) * size + wrap(y, size)) * size;
+			int wx = wx0;
+			for (int x = p_t0.x; x <= p_t1.x; x++, in += stride, in_material += stride, wx = wx + 1 == size ? 0 : wx + 1) {
+				const int8_t q = p_level == 0 ? *in : VoxelWorld::encode_texel(*in * DENSITY_STEP, p_level);
+				const size_t at = row + wx;
+				uint8_t *texel = &r_texels[at * TEXEL_BYTES];
+				texel[0] = (uint8_t)(q + 128);
+				if (r_raw != nullptr) {
+					r_raw[at] = texel[0];
+				}
+				render_bytes(*in_material, texel + 1);
+			}
+		}
+	}
+}
+
+void Clipmap::take_patches(Slab &r_slab, int p_level, const VoxelWorld &p_world) const {
+	const int s = 1 << p_level, C = VoxelWorld::CHUNK;
 	std::vector<Vector3i> edited;
-	r_world.edited_chunks_in(p_min * s, p_max * s + Vector3i(s - 1, s - 1, s - 1), edited);
-	const int C = VoxelWorld::CHUNK;
+	p_world.edited_chunks_in(r_slab.lo * s, r_slab.hi * s + Vector3i(s - 1, s - 1, s - 1), edited);
 	for (const Vector3i &c : edited) {
-		Vector3i t0, t1;
+		Patch patch;
 		bool empty = false;
 		for (int a = 0; a < 3; a++) {
-			t0[a] = std::max(-floor_div(-c[a] * C, s), p_min[a]); // first texel at or after the chunk
-			t1[a] = std::min(floor_div(c[a] * C + C - 1, s), p_max[a]);
-			empty |= t0[a] > t1[a];
+			patch.t0[a] = std::max(-floor_div(-c[a] * C, s), r_slab.lo[a]); // first texel at or after the chunk
+			patch.t1[a] = std::min(floor_div(c[a] * C + C - 1, s), r_slab.hi[a]);
+			empty |= patch.t0[a] > patch.t1[a];
 		}
-		if (!empty) {
-			write_texels(r_level, p_level, r_world, t0, t1);
+		const int8_t *data;
+		const MaterialId *materials;
+		if (empty || !p_world.edited_data(c, p_level, data, materials, patch.side)) {
+			continue;
 		}
+		const size_t count = (size_t)patch.side * patch.side * patch.side;
+		patch.chunk = c;
+		patch.data.assign(data, data + count);
+		patch.materials.assign(materials, materials + count);
+		r_slab.patches.push_back(std::move(patch));
 	}
 }
 
@@ -289,9 +300,7 @@ void Clipmap::refresh(VoxelWorld &r_world, const Vector3i &p_min, const Vector3i
 				queue_fix(level, t0, t1);
 			}
 		});
-		if (bricks_changed) {
-			update_brick_distances(level);
-		}
+		level.distances_stale |= bricks_changed;
 	}
 }
 
@@ -303,6 +312,9 @@ void Clipmap::update_brick_distances(Level &r_level) {
 	const int nb = size / BRICK;
 	const Vector3i first(floor_div(r_level.origin.x, BRICK), floor_div(r_level.origin.y, BRICK), floor_div(r_level.origin.z, BRICK));
 	auto local_index = [nb](int x, int y, int z) { return ((size_t)z * nb + y) * nb + x; };
+	if (r_level.brick_layers_dirty.size() != (size_t)nb) {
+		r_level.brick_layers_dirty.assign(nb, 1);
+	}
 	std::vector<uint8_t> distance((size_t)nb * nb * nb, MAX_BRICK_DISTANCE);
 	std::vector<int> queue;
 	for (int z = 0; z < nb; z++) {
@@ -341,10 +353,14 @@ void Clipmap::update_brick_distances(Level &r_level) {
 	for (int z = 0; z < nb; z++) {
 		for (int y = 0; y < nb; y++) {
 			for (int x = 0; x < nb; x++) {
-				uint8_t &stored = r_level.bricks[brick_index(first + Vector3i(x, y, z))];
+				const size_t at = brick_index(first + Vector3i(x, y, z));
+				uint8_t &stored = r_level.bricks[at];
 				const uint8_t d = distance[local_index(x, y, z)];
-				r_level.bricks_dirty |= stored != d;
-				stored = d;
+				if (stored != d) {
+					stored = d;
+					r_level.bricks_dirty = true;
+					r_level.brick_layers_dirty[at / ((size_t)nb * nb)] = 1;
+				}
 			}
 		}
 	}
@@ -353,15 +369,36 @@ void Clipmap::update_brick_distances(Level &r_level) {
 // --- Distances near edits ------------------------------------------------------
 
 void Clipmap::queue_fix(Level &r_level, const Vector3i &p_min, const Vector3i &p_max) {
-	if (r_level.fix_lo.x > r_level.fix_hi.x) {
-		r_level.fix_lo = p_min;
-		r_level.fix_hi = p_max;
-		return;
+	// What a pass over a box costs: about the texels it reads (the box and
+	// 2 * FIX_REACH all round).
+	auto cost = [](const Vector3i &p_lo, const Vector3i &p_hi) {
+		const Vector3i n = p_hi - p_lo + Vector3i(1, 1, 1) + Vector3i(4, 4, 4) * FIX_REACH;
+		return (int64_t)n.x * n.y * n.z;
+	};
+	std::vector<std::pair<Vector3i, Vector3i>> &boxes = r_level.fix_boxes;
+	Vector3i lo = p_min, hi = p_max;
+	// Fold in every box that is cheaper done together with this one; the
+	// grown box may now pay to take others, so go round until none does.
+	bool merged = true;
+	while (merged) {
+		merged = false;
+		for (size_t i = 0; i < boxes.size(); i++) {
+			Vector3i ulo, uhi;
+			for (int a = 0; a < 3; a++) {
+				ulo[a] = std::min(lo[a], boxes[i].first[a]);
+				uhi[a] = std::max(hi[a], boxes[i].second[a]);
+			}
+			if (cost(ulo, uhi) <= cost(lo, hi) + cost(boxes[i].first, boxes[i].second)) {
+				lo = ulo;
+				hi = uhi;
+				boxes[i] = boxes.back();
+				boxes.pop_back();
+				merged = true;
+				break;
+			}
+		}
 	}
-	for (int a = 0; a < 3; a++) {
-		r_level.fix_lo[a] = std::min(r_level.fix_lo[a], p_min[a]);
-		r_level.fix_hi[a] = std::max(r_level.fix_hi[a], p_max[a]);
-	}
+	boxes.emplace_back(lo, hi);
 }
 
 bool Clipmap::fix_pending(const VoxelWorld &p_world, bool p_all) {
@@ -376,50 +413,83 @@ bool Clipmap::fix_pending(const VoxelWorld &p_world, bool p_all) {
 			if (job->thread.joinable()) {
 				job->thread.join();
 			}
-			if (jobs[l] && !p_all) {
-				continue; // applied once the move is done (or thrown away if it moved)
+			if (job->dropped) {
+				job.reset();
+			} else {
+				// World shifts made while the worker ran (see shift()).
+				const Vector3i t = job->shift;
+				job->a += t;
+				job->wa += t;
+				job->wb += t;
+				job->min += t;
+				job->max += t;
+				job->shift = Vector3i();
 			}
-			if (level.valid && !jobs[l] && level.origin == job->origin) {
-				if (apply_fix(level, *job)) {
-					update_brick_distances(level);
-				}
+		}
+		if (job) {
+			if (jobs[l] && !p_all) {
+				continue; // applied once the move is done
+			}
+			// Texels are stored by world position: what is still in the
+			// level is still right after a move (apply_fix() clips to it).
+			if (level.valid && !jobs[l]) {
+				level.distances_stale |= apply_fix(level, *job);
 				changed = true;
 			} else if (level.valid) {
-				queue_fix(level, job->min, job->max); // the level moved: again
+				queue_fix(level, job->min, job->max); // a move is running: again after it
 			}
 			job.reset();
 		}
-		if (level.fix_lo.x > level.fix_hi.x) {
+		if (level.fix_boxes.empty()) {
 			continue;
 		}
 		if (!level.valid || level.raw.empty()) {
-			level.fix_lo = Vector3i(1, 1, 1);
-			level.fix_hi = Vector3i();
+			level.fix_boxes.clear();
 			continue;
 		}
 		if (jobs[l]) {
 			continue; // once the move is done (it queues its own)
 		}
-		job = start_fix(level, l, p_world, level.fix_lo, level.fix_hi);
-		level.fix_lo = Vector3i(1, 1, 1);
-		level.fix_hi = Vector3i();
+		if (p_all) {
+			bool bricks_changed = false;
+			while (!level.fix_boxes.empty()) {
+				const auto [lo, hi] = level.fix_boxes.back();
+				level.fix_boxes.pop_back();
+				std::unique_ptr<FixJob> now = start_fix(level, l, p_world, lo, hi);
+				if (now) {
+					compute_fix(*now);
+					bricks_changed |= apply_fix(level, *now);
+					changed = true;
+				}
+			}
+			level.distances_stale |= bricks_changed;
+			continue;
+		}
+		// One box a pass, the one nearest the middle of the level (where the
+		// camera is) first; the rest wait for the next passes.
+		const Vector3i middle2 = level.origin * 2 + Vector3i(size, size, size);
+		size_t best = 0;
+		int64_t best_d = INT64_MAX;
+		for (size_t i = 0; i < level.fix_boxes.size(); i++) {
+			const Vector3i c2 = level.fix_boxes[i].first + level.fix_boxes[i].second - middle2;
+			const int64_t d = (int64_t)c2.x * c2.x + (int64_t)c2.y * c2.y + (int64_t)c2.z * c2.z;
+			if (d < best_d) {
+				best_d = d;
+				best = i;
+			}
+		}
+		const auto [lo, hi] = level.fix_boxes[best];
+		level.fix_boxes[best] = level.fix_boxes.back();
+		level.fix_boxes.pop_back();
+		job = start_fix(level, l, p_world, lo, hi);
 		if (!job) {
 			continue;
 		}
-		if (p_all) {
-			compute_fix(*job);
-			if (apply_fix(level, *job)) {
-				update_brick_distances(level);
-			}
-			job.reset();
-			changed = true;
-		} else {
-			FixJob *raw = job.get();
-			raw->thread = std::thread([raw]() {
-				compute_fix(*raw);
-				raw->finished = true;
-			});
-		}
+		FixJob *raw = job.get();
+		raw->thread = std::thread([raw]() {
+			compute_fix(*raw);
+			raw->finished = true;
+		});
 	}
 	return changed;
 }
@@ -433,7 +503,6 @@ std::unique_ptr<Clipmap::FixJob> Clipmap::start_fix(Level &r_level, int p_level,
 	FixJob &j = *job;
 	j.min = p_min;
 	j.max = p_max;
-	j.origin = r_level.origin;
 	Vector3i b;
 	for (int k = 0; k < 3; k++) {
 		j.a[k] = std::max(p_min[k] - R, r_level.origin[k]);
@@ -646,26 +715,74 @@ void Clipmap::compute_fix(FixJob &r_job) {
 	}
 }
 
+void Clipmap::update_stale_distances() {
+	std::vector<Level *> stale;
+	for (Level &level : levels) {
+		if (level.valid && level.distances_stale) {
+			stale.push_back(&level);
+			level.distances_stale = false;
+		}
+	}
+	// Each level's own data only: side by side.
+	WorkerPool::get().run((int)stale.size(), [&](int i) {
+		update_brick_distances(*stale[i]);
+	});
+}
+
 bool Clipmap::apply_fix(Level &r_level, const FixJob &p_job) {
+	// Only the part still in the level: it may have moved since the copy was
+	// taken. Texels are stored by world position, so those still in it are
+	// the same texels and the pass's result for them still holds (the new
+	// ones around them get their own pass, queued by the move).
+	const Vector3i last = r_level.origin + Vector3i(size - 1, size - 1, size - 1);
+	Vector3i c0, c1;
+	for (int a = 0; a < 3; a++) {
+		c0[a] = std::max(p_job.wa[a], r_level.origin[a]);
+		c1[a] = std::min(p_job.wb[a], last[a]);
+		if (c0[a] > c1[a]) {
+			return false;
+		}
+	}
 	// Texels edited again since the copy was taken hold their new raw values
 	// until the next pass (queued for them): not this pass's older ones.
-	const bool requeued = r_level.fix_lo.x <= r_level.fix_hi.x;
-	int z0 = INT32_MAX, z1 = INT32_MIN;
-	size_t o = 0;
-	std::vector<int> wx(p_job.wb.x - p_job.wa.x + 1);
-	for (int x = p_job.wa.x; x <= p_job.wb.x; x++) {
-		wx[x - p_job.wa.x] = wrap(x, size);
+	std::vector<std::pair<Vector3i, Vector3i>> requeued;
+	for (const auto &box : r_level.fix_boxes) {
+		bool overlaps = true;
+		for (int a = 0; a < 3; a++) {
+			overlaps = overlaps && box.first[a] <= c1[a] && box.second[a] >= c0[a];
+		}
+		if (overlaps) {
+			requeued.push_back(box);
+		}
 	}
-	for (int z = p_job.wa.z; z <= p_job.wb.z; z++) {
-		for (int y = p_job.wa.y; y <= p_job.wb.y; y++) {
+	std::vector<std::pair<int, int>> skip;
+	int z0 = INT32_MAX, z1 = INT32_MIN;
+	const Vector3i wn = p_job.wb - p_job.wa + Vector3i(1, 1, 1);
+	std::vector<int> wx(c1.x - c0.x + 1);
+	for (int x = c0.x; x <= c1.x; x++) {
+		wx[x - c0.x] = wrap(x, size);
+	}
+	for (int z = c0.z; z <= c1.z; z++) {
+		for (int y = c0.y; y <= c1.y; y++) {
 			uint8_t *row = &r_level.texels[((size_t)wrap(z, size) * size + wrap(y, size)) * size * TEXEL_BYTES];
-			const bool row_requeued = requeued && y >= r_level.fix_lo.y && z >= r_level.fix_lo.z && y <= r_level.fix_hi.y && z <= r_level.fix_hi.z;
-			for (int x = p_job.wa.x; x <= p_job.wb.x; x++, o++) {
-				if (row_requeued && x >= r_level.fix_lo.x && x <= r_level.fix_hi.x) {
+			const int8_t *result = p_job.result.data() + ((size_t)(z - p_job.wa.z) * wn.y + (y - p_job.wa.y)) * wn.x;
+			// The x spans of this row that are queued again.
+			skip.clear();
+			for (const auto &[lo, hi] : requeued) {
+				if (y >= lo.y && z >= lo.z && y <= hi.y && z <= hi.z) {
+					skip.emplace_back(lo.x, hi.x);
+				}
+			}
+			for (int x = c0.x; x <= c1.x; x++) {
+				bool skipped = false;
+				for (const auto &[x0, x1] : skip) {
+					skipped = skipped || (x >= x0 && x <= x1);
+				}
+				if (skipped) {
 					continue;
 				}
-				uint8_t &stored = row[wx[x - p_job.wa.x] * TEXEL_BYTES];
-				const uint8_t q = (uint8_t)(p_job.result[o] + 128);
+				uint8_t &stored = row[wx[x - c0.x] * TEXEL_BYTES];
+				const uint8_t q = (uint8_t)(result[x - p_job.wa.x] + 128);
 				if (stored != q) {
 					stored = q;
 					z0 = std::min(z0, z);
@@ -678,7 +795,7 @@ bool Clipmap::apply_fix(Level &r_level, const FixJob &p_job) {
 		return false;
 	}
 	mark_layers(r_level, z0, z1);
-	return update_has_surface(r_level, p_job.wa, p_job.wb);
+	return update_has_surface(r_level, c0, c1);
 }
 
 // --- Moving ----------------------------------------------------------------------
@@ -700,6 +817,12 @@ void Clipmap::generate_slab(const VoxelWorld &p_world, int p_level, Slab &r_slab
 			}
 		}
 	});
+	// Edited chunks over the generated texels (before the surface is found).
+	for (const Patch &patch : r_slab.patches) {
+		write_chunk(p_level, patch.chunk, patch.data.data(), patch.materials.data(), patch.side, patch.t0, patch.t1, r_texels, nullptr);
+	}
+	r_slab.patches.clear();
+	r_slab.patches.shrink_to_fit();
 	// Which of the slab's bricks hold surface.
 	const Vector3i nb = n / BRICK;
 	const Vector3i b0(floor_div(r_slab.lo.x, BRICK), floor_div(r_slab.lo.y, BRICK), floor_div(r_slab.lo.z, BRICK));
@@ -724,6 +847,7 @@ void Clipmap::generate_slab(const VoxelWorld &p_world, int p_level, Slab &r_slab
 }
 
 void Clipmap::start_job(int p_level, const Vector3i &p_target, const VoxelWorld &p_world, bool p_wait, int p_threads) {
+	const auto started = std::chrono::steady_clock::now();
 	Level &level = levels[p_level];
 	std::unique_ptr<Job> job = std::make_unique<Job>();
 	job->origin = p_target;
@@ -756,25 +880,87 @@ void Clipmap::start_job(int p_level, const Vector3i &p_target, const VoxelWorld 
 			}
 		}
 	}
+	for (Slab &slab : job->slabs) {
+		take_patches(slab, p_level, p_world);
+	}
 	uint8_t *target = job->reset ? job->texels.data() : level.texels.data();
+	// Where the worker puts the raw values (none for level 0; if the level
+	// has none yet, finish_job() makes them).
+	uint8_t *raw_target = nullptr;
+	if (p_level > 0) {
+		const size_t count = (size_t)size * size * size;
+		if (job->reset) {
+			job->raw.assign(count, 128);
+			raw_target = job->raw.data();
+		} else if (level.raw.size() == count) {
+			raw_target = level.raw.data();
+		}
+		job->raw_done = raw_target != nullptr;
+	}
 	if (p_wait) {
 		for (Slab &slab : job->slabs) {
 			generate_slab(p_world, p_level, slab, target, p_threads);
+			if (raw_target != nullptr) {
+				copy_raw(slab, target, raw_target);
+			}
 		}
 		job->finished = true;
 	} else {
 		Job *raw = job.get();
-		raw->thread = std::thread([this, raw, target, &p_world, p_level]() {
+		raw->thread = std::thread([this, raw, target, raw_target, &p_world, p_level]() {
 			for (Slab &slab : raw->slabs) {
 				generate_slab(p_world, p_level, slab, target, 1);
+				if (raw_target != nullptr) {
+					copy_raw(slab, target, raw_target);
+				}
 			}
 			raw->finished = true;
 		});
 	}
 	jobs[p_level] = std::move(job);
+	if (!p_wait) {
+		finish_part_ms[4] = std::max(finish_part_ms[4], std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+	}
+}
+
+void Clipmap::copy_raw(const Slab &p_slab, const uint8_t *p_texels, uint8_t *r_raw) const {
+	// Row by row (a % per texel, three in texel_index(), added up).
+	const int wx0 = wrap(p_slab.lo.x, size);
+	for (int z = p_slab.lo.z; z <= p_slab.hi.z; z++) {
+		for (int y = p_slab.lo.y; y <= p_slab.hi.y; y++) {
+			const size_t row = ((size_t)wrap(z, size) * size + wrap(y, size)) * size;
+			int wx = wx0;
+			for (int x = p_slab.lo.x; x <= p_slab.hi.x; x++) {
+				const size_t at = row + wx;
+				r_raw[at] = p_texels[at * TEXEL_BYTES];
+				if (++wx == size) {
+					wx = 0;
+				}
+			}
+		}
+	}
+}
+
+std::vector<std::pair<std::string, double>> Clipmap::take_finish_times() {
+	std::vector<std::pair<std::string, double>> out;
+	static const char *const parts[5] = { "raw", "patch", "queue", "pending", "start" };
+	for (int i = 0; i < 5; i++) {
+		out.emplace_back(parts[i], finish_part_ms[i]);
+		finish_part_ms[i] = 0.0;
+	}
+	for (int l = 0; l < (int)levels.size() && l < 16; l++) {
+		out.emplace_back("L" + std::to_string(l), finish_level_ms[l]);
+		finish_level_ms[l] = 0.0;
+	}
+	return out;
 }
 
 void Clipmap::finish_job(int p_level, VoxelWorld &r_world) {
+	const auto started = std::chrono::steady_clock::now();
+	double part_ms[4] = {};
+	auto since = [](std::chrono::steady_clock::time_point p_from) {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p_from).count();
+	};
 	std::unique_ptr<Job> job = std::move(jobs[p_level]);
 	if (job->thread.joinable()) {
 		job->thread.join();
@@ -793,28 +979,28 @@ void Clipmap::finish_job(int p_level, VoxelWorld &r_world) {
 		level.has_surface.assign((size_t)nb * nb * nb, 0);
 		level.bricks.assign(level.has_surface.size(), MAX_BRICK_DISTANCE);
 		level.bricks_dirty = true;
+		level.brick_layers_dirty.assign(nb, 1);
 	}
 	level.origin = job->origin;
 	const bool coarse = p_level > 0;
 	if (coarse && level.raw.size() != (size_t)size * size * size) {
 		level.raw.assign((size_t)size * size * size, 128);
 	}
+	auto t = std::chrono::steady_clock::now();
 	if (coarse && job->reset) {
-		for (size_t i = 0; i < level.raw.size(); i++) {
-			level.raw[i] = level.texels[i * TEXEL_BYTES];
+		if (job->raw_done) {
+			level.raw.swap(job->raw);
+		} else {
+			for (size_t i = 0; i < level.raw.size(); i++) {
+				level.raw[i] = level.texels[i * TEXEL_BYTES];
+			}
 		}
 	}
 	const Vector3i level_last = level.origin + Vector3i(size - 1, size - 1, size - 1);
 	for (const Slab &slab : job->slabs) {
-		if (coarse && !job->reset) {
-			for (int z = slab.lo.z; z <= slab.hi.z; z++) {
-				for (int y = slab.lo.y; y <= slab.hi.y; y++) {
-					for (int x = slab.lo.x; x <= slab.hi.x; x++) {
-						const size_t at = texel_index(Vector3i(x, y, z));
-						level.raw[at] = level.texels[at * TEXEL_BYTES];
-					}
-				}
-			}
+		t = std::chrono::steady_clock::now();
+		if (coarse && !job->reset && !job->raw_done) {
+			copy_raw(slab, level.texels.data(), level.raw.data());
 		}
 		const Vector3i b0(floor_div(slab.lo.x, BRICK), floor_div(slab.lo.y, BRICK), floor_div(slab.lo.z, BRICK));
 		const Vector3i n = (slab.hi - slab.lo + Vector3i(1, 1, 1)) / BRICK;
@@ -825,9 +1011,12 @@ void Clipmap::finish_job(int p_level, VoxelWorld &r_world) {
 				}
 			}
 		}
-		// The worker generated these from noise only.
-		patch_edited(level, p_level, r_world, slab.lo, slab.hi);
+		part_ms[0] += since(t);
+		t = std::chrono::steady_clock::now();
+		// (The worker wrote the edited chunks too: see take_patches().)
 		mark_layers(level, slab.lo.z, slab.hi.z);
+		part_ms[1] += since(t);
+		t = std::chrono::steady_clock::now();
 		if (coarse) {
 			// Distances near edited chunks in the slab or just outside it
 			// (the new texels don't know about those).
@@ -847,7 +1036,9 @@ void Clipmap::finish_job(int p_level, VoxelWorld &r_world) {
 				}
 			}
 		}
+		part_ms[2] += since(t);
 	}
+	t = std::chrono::steady_clock::now();
 	// Edits made while it ran, now over the whole new box.
 	const int s = level.scale;
 	const Vector3i last = level.origin + Vector3i(size - 1, size - 1, size - 1);
@@ -860,8 +1051,15 @@ void Clipmap::finish_job(int p_level, VoxelWorld &r_world) {
 		});
 	}
 	level.pending_edits.clear();
-	update_brick_distances(level);
+	level.distances_stale = true;
 	level.valid = true;
+	part_ms[3] += since(t);
+	for (int i = 0; i < 4; i++) {
+		finish_part_ms[i] = std::max(finish_part_ms[i], part_ms[i]);
+	}
+	if (p_level < 16) {
+		finish_level_ms[p_level] = std::max(finish_level_ms[p_level], since(started));
+	}
 }
 
 int Clipmap::follow(VoxelWorld &r_world, const Vector3 &p_center, int p_threads, bool p_wait_first, bool p_wait) {

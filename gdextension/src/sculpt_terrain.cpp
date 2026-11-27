@@ -413,86 +413,156 @@ void SculptTerrain::update_view(const Vector3 &p_camera_position, bool p_wait) {
 	if (!opened) {
 		return;
 	}
+	auto t = std::chrono::steady_clock::now();
+	auto lap = [&](ViewPart p_part) {
+		const auto now = std::chrono::steady_clock::now();
+		view_times[p_part] = std::max(view_times[p_part], std::chrono::duration<double, std::milli>(now - t).count());
+		t = now;
+	};
 	// Level 0 is built at once the first time, so there is something to see.
 	const int moved = clipmap.follow(world, p_camera_position, worker_count(), true, p_wait);
+	lap(VIEW_FOLLOW);
 	clipmap.fix_pending(world, p_wait);
-	// Upload changed layers, nearest level first, at most LAYERS_PER_FRAME
-	// (each is clip_size^2 * 2 bytes); a level that moved switches to its new
-	// origin once all of its changed layers are up.
+	lap(VIEW_FIX);
+	// Brick distances, once for everything that changed them this frame
+	// (edits, moves, fixes), before they go up.
+	clipmap.update_stale_distances();
+	lap(VIEW_DISTANCES);
+	// Upload changed layers, nearest level first, for about UPLOAD_BUDGET_MS
+	// a frame (each layer is clip_size^2 * 4 bytes), so a move's layers go up
+	// a few each frame instead of a big lump on one; a level that moved
+	// switches to its new origin once all of its changed layers are up.
 	bool changed = moved != 0;
-	int budget = p_wait ? 1 << 30 : LAYERS_PER_FRAME;
+	const auto deadline = p_wait ? std::chrono::steady_clock::time_point::max()
+								 : std::chrono::steady_clock::now() + std::chrono::microseconds((int64_t)(UPLOAD_BUDGET_MS * 1000.0));
+	bool uploaded = false;
+	std::fill(std::begin(upload_ms), std::end(upload_ms), 0.0);
 	for (int l = 0; l < clipmap.get_level_count(); l++) {
-		changed |= upload_level(l, budget);
+		changed |= upload_level(l, deadline, uploaded);
 	}
-	if (changed) {
-		bind_material();
+	{
+		const auto before = std::chrono::steady_clock::now();
+		if (changed) {
+			bind_material();
+		}
+		upload_ms[UPLOAD_BIND] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
+	}
+	for (int i = 0; i < UPLOAD_PART_COUNT; i++) {
+		upload_ms_max[i] = std::max(upload_ms_max[i], upload_ms[i]);
 	}
 	for (const Ref<ShaderMaterial> &m : clip_materials()) {
 		m->set_shader_parameter("view_position", p_camera_position);
 	}
+	lap(VIEW_UPLOAD);
 	// Keep the area around the camera in memory (a few milliseconds' worth
 	// of loading a frame), and now and then let go of what's far away.
 	world.load_near(p_camera_position, (float)simulation_radius, LOAD_BUDGET_MS);
+	lap(VIEW_LOAD);
 	if (++frames_since_unload >= 60) {
 		frames_since_unload = 0;
 		world.unload_far(p_camera_position, (float)simulation_radius + 64.0f);
 	}
+	lap(VIEW_UNLOAD);
 	bind_bodies(p_camera_position);
+	lap(VIEW_BODIES);
 	update_selection_mask();
+	lap(VIEW_SELECTION);
 	// Autosave.
-	if (autosave_interval > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - last_save).count() >= autosave_interval) {
-		save_world();
+	if (autosave_interval > 0.0 && opened && !save_path.is_empty() && std::chrono::duration<double>(std::chrono::steady_clock::now() - last_save).count() >= autosave_interval) {
+		// In the background (an explicit save_world() waits for it).
+		if (!world.save(false)) {
+			report_world_error("saving failed");
+		}
+		last_save = std::chrono::steady_clock::now();
 	}
+	lap(VIEW_SAVE);
 }
 
-bool SculptTerrain::upload_level(int p_level, int &r_budget) {
+bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_point p_deadline, bool &r_uploaded) {
 	Clipmap::Level &level = clipmap.level(p_level);
 	if (!level.valid) {
 		return false;
 	}
 	const int n = clipmap.get_size();
 	const int64_t layer_texels = (int64_t)n * n;
-	// A GPU texel: this slice's density, the next slice's (storage wraps, as
-	// the shader reads it), then the material, so the shader gets both
-	// densities it interpolates between in one read instead of two.
-	auto layer_image = [&](int p_layer) {
-		PackedByteArray bytes;
-		bytes.resize(layer_texels * 4);
-		uint8_t *w = bytes.ptrw();
-		const uint8_t *here = &level.texels[(size_t)p_layer * layer_texels * Clipmap::TEXEL_BYTES];
-		const uint8_t *above = &level.texels[(size_t)((p_layer + 1) % n) * layer_texels * Clipmap::TEXEL_BYTES];
-		for (int64_t i = 0; i < layer_texels; i++, w += 4, here += Clipmap::TEXEL_BYTES, above += Clipmap::TEXEL_BYTES) {
-			w[0] = here[0];
-			w[1] = above[0];
-			w[2] = here[1];
-			w[3] = here[2];
-		}
-		upload_bytes += layer_texels * 4;
-		return Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, bytes);
-	};
 	Ref<Texture2DArray> &texture = clip_textures[p_level];
 	bool changed = false;
-	// Brick distances are tiny: all of the level's go up whenever they change.
+	// Brick distances are tiny, but a layer is a call of its own: only the
+	// changed ones go up.
+	auto t = std::chrono::steady_clock::now();
+	auto lap = [&](double &r_ms) {
+		const auto now = std::chrono::steady_clock::now();
+		r_ms += std::chrono::duration<double, std::milli>(now - t).count();
+		t = now;
+	};
 	if (level.bricks_dirty) {
 		const int nb = clipmap.get_brick_count();
 		const int64_t brick_layer_bytes = (int64_t)nb * nb;
 		PackedByteArray bytes;
 		bytes.resize(brick_layer_bytes);
 		for (int z = 0; z < nb; z++) {
+			if (z < (int)level.brick_layers_dirty.size() && !level.brick_layers_dirty[z]) {
+				continue;
+			}
 			std::memcpy(bytes.ptrw(), &level.bricks[(size_t)z * brick_layer_bytes], brick_layer_bytes);
 			brick_texture->update_layer(Image::create_from_data(nb, nb, false, Image::FORMAT_R8, bytes), p_level * nb + z);
+			upload_bytes += brick_layer_bytes;
 		}
-		upload_bytes += brick_layer_bytes * nb;
+		std::fill(level.brick_layers_dirty.begin(), level.brick_layers_dirty.end(), 0);
 		level.bricks_dirty = false;
 	}
-	// Level 0's first contents go up at once so there is something to see.
+	lap(upload_ms[UPLOAD_BRICKS]);
+	// Changed layers go up a batch at a time: packed side by side on worker
+	// threads, then handed to the GPU here, until the frame's time is used
+	// up (always at least one batch a frame, so a move gets done). Level 0's
+	// first contents go up at once so there is something to see.
 	const bool unlimited = p_level == 0 && !level.published;
-	for (int z = 0; z < n && (r_budget > 0 || unlimited); z++) {
-		if (level.layer_dirty[z]) {
-			texture->update_layer(layer_image(z), z);
-			level.layer_dirty[z] = 0;
-			r_budget--;
+	PackedByteArray buffers[UPLOAD_BATCH];
+	int batch[UPLOAD_BATCH];
+	int z = 0;
+	while (z < n) {
+		if (!unlimited && r_uploaded && std::chrono::steady_clock::now() >= p_deadline) {
+			break;
 		}
+		int count = 0;
+		for (; z < n && count < UPLOAD_BATCH; z++) {
+			if (level.layer_dirty[z]) {
+				batch[count++] = z;
+			}
+		}
+		if (count == 0) {
+			break;
+		}
+		uint8_t *out[UPLOAD_BATCH];
+		for (int i = 0; i < count; i++) {
+			buffers[i].resize(layer_texels * 4);
+			out[i] = buffers[i].ptrw();
+		}
+		// A GPU texel: this slice's density, the next slice's (storage wraps,
+		// as the shader reads it), then the material, so the shader gets both
+		// densities it interpolates between in one read instead of two.
+		lap(upload_ms[UPLOAD_OTHER]);
+		WorkerPool::get().run(count, [&](int i) {
+			uint8_t *w = out[i];
+			const int layer = batch[i];
+			const uint8_t *here = &level.texels[(size_t)layer * layer_texels * Clipmap::TEXEL_BYTES];
+			const uint8_t *above = &level.texels[(size_t)((layer + 1) % n) * layer_texels * Clipmap::TEXEL_BYTES];
+			for (int64_t t = 0; t < layer_texels; t++, w += 4, here += Clipmap::TEXEL_BYTES, above += Clipmap::TEXEL_BYTES) {
+				w[0] = here[0];
+				w[1] = above[0];
+				w[2] = here[1];
+				w[3] = here[2];
+			}
+		});
+		lap(upload_ms[UPLOAD_PACK]);
+		for (int i = 0; i < count; i++) {
+			texture->update_layer(Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, buffers[i]), batch[i]);
+			level.layer_dirty[batch[i]] = 0;
+		}
+		lap(upload_ms[UPLOAD_GPU]);
+		upload_bytes += layer_texels * 4 * count;
+		layers_uploaded += count;
+		r_uploaded = true;
 	}
 	const bool all_up = std::find(level.layer_dirty.begin(), level.layer_dirty.end(), 1) == level.layer_dirty.end();
 	if (all_up && (!level.published || level.published_origin != level.origin)) {
@@ -553,6 +623,26 @@ void SculptTerrain::bind_material() {
 		material->set_shader_parameter("has_sea", world.get_settings().world_type == WORLD_TERRAIN);
 		material->set_shader_parameter("sea_level", world.get_settings().sea_level);
 	}
+}
+
+Dictionary SculptTerrain::take_view_times() {
+	static const char *const names[VIEW_PART_COUNT] = { "follow", "fix", "distances", "upload", "load", "unload", "bodies", "selection", "save" };
+	Dictionary times;
+	for (int i = 0; i < VIEW_PART_COUNT; i++) {
+		times[names[i]] = view_times[i];
+		view_times[i] = 0.0;
+	}
+	for (const auto &[name, ms] : clipmap.take_finish_times()) {
+		times[String("finish.") + name.c_str()] = ms;
+	}
+	static const char *const upload_names[UPLOAD_PART_COUNT] = { "upload.bricks", "upload.pack", "upload.gpu", "upload.bind", "upload.other" };
+	for (int i = 0; i < UPLOAD_PART_COUNT; i++) {
+		times[upload_names[i]] = upload_ms_max[i];
+		upload_ms_max[i] = 0.0;
+	}
+	times["layers"] = layers_uploaded;
+	layers_uploaded = 0;
+	return times;
 }
 
 int64_t SculptTerrain::take_upload_bytes() {
@@ -2446,6 +2536,7 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_flatten_plane", "point", "normal"), &SculptTerrain::set_flatten_plane);
 	ClassDB::bind_method(D_METHOD("clear_flatten_plane"), &SculptTerrain::clear_flatten_plane);
 	ClassDB::bind_method(D_METHOD("take_upload_bytes"), &SculptTerrain::take_upload_bytes);
+	ClassDB::bind_method(D_METHOD("take_view_times"), &SculptTerrain::take_view_times);
 	ClassDB::bind_method(D_METHOD("get_clip_origin", "level"), &SculptTerrain::get_clip_origin);
 	ClassDB::bind_method(D_METHOD("get_clip_texel", "level", "texel"), &SculptTerrain::get_clip_texel);
 	ClassDB::bind_method(D_METHOD("get_clip_brick", "level", "texel"), &SculptTerrain::get_clip_brick);

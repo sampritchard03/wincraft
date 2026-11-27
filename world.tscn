@@ -11,8 +11,8 @@ shader = ExtResource("2_terrain")
 shader_parameter/clip_brick_count = 16.0
 shader_parameter/clip_count = 0
 shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-shader_parameter/clip_size = 128.0
-shader_parameter/clip_reach = 45.0
+shader_parameter/clip_size = 156.0
+shader_parameter/clip_reach = 109.0
 shader_parameter/view_position = Vector3(0, 0, 0)
 shader_parameter/view_distance_limit = 872.0
 shader_parameter/use_prepass = false
@@ -33,8 +33,8 @@ shader = ExtResource("3_prepass")
 shader_parameter/clip_brick_count = 16.0
 shader_parameter/clip_count = 0
 shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-shader_parameter/clip_size = 128.0
-shader_parameter/clip_reach = 45.0
+shader_parameter/clip_size = 256.0
+shader_parameter/clip_reach = 109.0
 shader_parameter/view_position = Vector3(0, 0, 0)
 shader_parameter/view_distance_limit = 872.0
 
@@ -69,15 +69,15 @@ prepass_material = SubResource("PrepassMaterial")
 
 [node name="Screen" type="SubViewportContainer" parent="." unique_id=1476213551]
 texture_filter = 1
-offset_right = 272.0
-offset_bottom = 153.0
+offset_right = 256.0
+offset_bottom = 144.0
 scale = Vector2(3.6, 3.6)
 mouse_filter = 2
 
 [node name="Viewport" type="SubViewport" parent="Screen" unique_id=265028557]
 own_world_3d = true
 handle_input_locally = false
-size = Vector2i(272, 153)
+size = Vector2i(256, 144)
 render_target_update_mode = 4
 
 [node name="Camera" type="Camera3D" parent="Screen/Viewport" unique_id=1461816443]

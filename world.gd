@@ -1084,6 +1084,42 @@ func _basis_along(p_dir: Vector3) -> Basis:
 ## take_step_times() (vr.gd logs them on the headset).
 var step_times := {}
 
+## Prints, once a second, the slowest frame and what took the time in it
+## (to find hitches; turn off when done).
+const PRINT_FRAME_TIMES := true
+var _frame_report_time := 0.0
+var _frame_worst := 0.0
+var _frame_worst_physics := 0.0
+var _frame_worst_gpu := 0.0
+var _frame_count := 0
+var _measuring_gpu := false
+
+func _report_frame_times(delta: float) -> void:
+	var vp_rid := camera.get_viewport().get_viewport_rid()
+	if not _measuring_gpu:
+		_measuring_gpu = true
+		RenderingServer.viewport_set_measure_render_time(vp_rid, true)
+	_frame_count += 1
+	_frame_worst = maxf(_frame_worst, delta * 1000.0)
+	_frame_worst_physics = maxf(_frame_worst_physics, Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0)
+	_frame_worst_gpu = maxf(_frame_worst_gpu, RenderingServer.viewport_get_measured_render_time_gpu(vp_rid))
+	_frame_report_time += delta
+	if _frame_report_time < 1.0:
+		return
+	var native: Dictionary = terrain.take_view_times()
+	var parts: PackedStringArray = []
+	for k in native:
+		if k != "layers" and native[k] >= 0.5:
+			parts.append("%s %.1f" % [k, native[k]])
+	print("frames %d, worst %.1f ms | physics %.1f | gpu %.1f | process: %s | update_view: %s | layers %d" % [
+		_frame_count, _frame_worst, _frame_worst_physics, _frame_worst_gpu,
+		take_step_times(), ", ".join(parts), native["layers"]])
+	_frame_report_time = 0.0
+	_frame_worst = 0.0
+	_frame_worst_physics = 0.0
+	_frame_worst_gpu = 0.0
+	_frame_count = 0
+
 func _time_step(p_name: String, p_since: int) -> int:
 	var now := Time.get_ticks_usec()
 	step_times[p_name] = maxf(step_times.get(p_name, 0.0), (now - p_since) / 1000.0)
@@ -1140,6 +1176,8 @@ func _process(delta: float) -> void:
 
 	_sync_prepass_camera()
 	t = _time_step("prepass", t)
+	if PRINT_FRAME_TIMES:
+		_report_frame_times(delta)
 
 	player_save_timer += delta
 	if player_save_timer >= player_save_interval:
