@@ -150,6 +150,9 @@ public:
 	// key (p_key), they change that key's motion: the rest shape stays.
 	void begin_grab();
 	bool warp(const std::vector<Vector3> &p_centers, const std::vector<Vector3> &p_deltas, double p_radius, bool p_grab, int p_key = -1, double p_pose = 0.0, const PackedFloat32Array &p_weights = PackedFloat32Array());
+	// Rotate / scale, as SculptTerrain.twist() (body space; between begin_grab()
+	// and end_grab(), each call from the shape as it began).
+	bool twist(const std::vector<Vector3> &p_centers, const std::vector<Basis> &p_bases, double p_radius, int p_key = -1, double p_pose = 0.0, const PackedFloat32Array &p_weights = PackedFloat32Array());
 	void end_grab();
 	// How much solid it has (the rest shape), in cubic voxels of its space.
 	double get_volume() const;

@@ -56,6 +56,10 @@ var player: DensityCharacter3D
 ## Balls thrown with F (bouncy_balls.gd), saved with the world.
 const BouncyBalls := preload("res://bouncy_balls.gd")
 var balls: BouncyBalls
+## Frogs and chiggins (creatures.gd): saved with the world, and every one
+## of a kind shares its shape and animations.
+const Creatures := preload("res://creatures.gd")
+var creatures: Creatures
 ## The object editor (M on a body: sculpt it, animate its pose keys; object_editor.gd).
 const ObjectEditor := preload("res://object_editor.gd")
 var editor: ObjectEditor
@@ -72,10 +76,10 @@ const Hud := preload("res://hud.gd")
 var hud: Hud
 ## The tool wheel's ring, from the top clockwise, with each tool's key (the
 ## number of presses for a key with several).
-const WHEEL_TOOLS := [Tool.DRAW, Tool.INFLATE, Tool.SMOOTH, Tool.PINCH, Tool.FLATTEN, Tool.GRAB, Tool.SNAKE_HOOK, Tool.PAINT,
+const WHEEL_TOOLS := [Tool.DRAW, Tool.INFLATE, Tool.SMOOTH, Tool.PINCH, Tool.FLATTEN, Tool.GRAB, Tool.ROTATE, Tool.SCALE, Tool.SNAKE_HOOK, Tool.PAINT,
 		Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.EXTRUDE, Tool.TRANSFORM, Tool.PHYSICS_GUN,
-		Tool.GEOMETRY, Tool.BOX, Tool.BOX_CUT]
-const WHEEL_KEYS := ["1", "1 x2", "2", "2 x2", "3", "4", "5", "6", "7", "7 x2", "7 x3", "8", "8 x2", "9", "0", "0 x2", "0 x3"]
+		Tool.GEOMETRY, Tool.BOX]
+const WHEEL_KEYS := ["1", "1 x2", "2", "2 x2", "3", "4", "4 x2", "4 x3", "5", "6", "7", "7 x2", "7 x3", "8", "8 x2", "9", "0", "0 x2"]
 var block_icons := {}  # material -> ImageTexture, for the HUD
 ## Sun shadows from shadow maps (sun_shadows.gd).
 const SunShadows := preload("res://sun_shadows.gd")
@@ -109,6 +113,7 @@ var camera_lag := 0.0
 var flatten_point := Vector3.ZERO
 var flatten_normal := Vector3.ZERO
 var flatten_locked := false
+const FLATTEN_NEW_FACE := 50.0  # degrees: a face turned this far from the one flattened is another one
 ## Snake hook: where the last tendril ended (Shift + click pulls a straight
 ## one from there to where you click), or null.
 var snake_last = null
@@ -165,31 +170,30 @@ var geo_distance := 40.0
 var geo_drag := -1
 var geo_drag_distance := 0.0
 
-## Box (0, twice) and Box cut (0, three times): click where an edge starts,
-## where it ends, then how wide, then how high (or deep: below the ground);
-## the box is built of the current material, or cut out. Right click steps
-## back. box_stage: how many of those clicks so far.
-var box_stage := 0
+## Box (0, twice): press on the ground where one corner goes and drag to
+## the opposite one; letting go builds it (upright, square to the world, of
+## the current material), or cuts it out with Shift held. The far corner
+## follows the ground under the crosshair until the wheel moves it nearer or
+## farther along it. Right click (or Backspace) while dragging gives up.
+var box_dragging := false
 var box_a := Vector3.ZERO
-var box_b := Vector3.ZERO
-var box_up := Vector3.UP
-var box_width := 0.0
-var box_height := 0.0
+var box_distance := -1.0  # the far corner's distance along the crosshair (-1: on the ground)
 var box_preview: DensityBody3D = null
+var box_preview_cut := false
 var box_shown := PackedVector3Array()  # the corners the preview was made from
 
 enum Tool { DRAW, SMOOTH, FLATTEN, GRAB, SNAKE_HOOK, PAINT, SELECT_PAINT, SELECT_FILL, PHYSICS_GUN, SELECT_GEOMETRY, EXTRUDE, TRANSFORM, GEOMETRY,
-		INFLATE, PINCH, BOX, BOX_CUT }
+		INFLATE, PINCH, BOX, ROTATE, SCALE }
 const TOOL_NAMES := ["Draw", "Smooth", "Flatten", "Grab", "Snake hook", "Paint", "Select paint", "Select fill", "Physics gun",
-		"Select geometry", "Extrude", "Transform", "Geometry", "Inflate", "Pinch", "Box", "Box cut"]
+		"Select geometry", "Extrude", "Transform", "Geometry", "Inflate", "Pinch", "Box", "Rotate", "Scale"]
 ## Tools that never sculpt with the mouse buttons.
 const NON_SCULPT_TOOLS := [Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.PHYSICS_GUN, Tool.SELECT_GEOMETRY, Tool.EXTRUDE, Tool.TRANSFORM, Tool.GEOMETRY,
-		Tool.BOX, Tool.BOX_CUT]
+		Tool.BOX]
 ## Brushes whose right button does the opposite (deflate, spread) rather than carve.
 const INVERTIBLE_TOOLS := [Tool.INFLATE, Tool.PINCH]
 ## The brush each tool applies while held (-1: grab and snake hook drag instead).
 const TOOL_MODES := [SculptTerrain.BRUSH_ADD, SculptTerrain.BRUSH_SMOOTH, SculptTerrain.BRUSH_FLATTEN, -1, -1, SculptTerrain.BRUSH_PAINT, -1, -1, -1, -1, -1, -1, -1,
-		SculptTerrain.BRUSH_INFLATE, SculptTerrain.BRUSH_PINCH, -1, -1]
+		SculptTerrain.BRUSH_INFLATE, SculptTerrain.BRUSH_PINCH, -1, -1, -1]
 ## The player's size the speeds above are for: shift + wheel scales the
 ## player, and its width, speed, jump and step with it.
 const BASE_PLAYER_HEIGHT := 16.0
@@ -227,6 +231,17 @@ var drag_distance := 0.0
 var drag_start := Vector3.ZERO  # grab: where it began; snake hook: where the brush is now
 var drag_copies: Array[Transform3D] = []  # symmetry copies, fixed for the whole drag
 var last_grab_delta := Vector3.INF
+## Rotate / scale (4, twice / three times): held on the ground, the view
+## holds still and the mouse turns (Shift: rolls about the view) or scales
+## (right / up: bigger) what's within the brush radius of where it began.
+var twisting := false
+var twist_body: DensityBody3D = null  # rotating / scaling a body (held still meanwhile), not the ground
+var twist_center := Vector3.ZERO
+var twist_copies: Array[Transform3D] = []
+var twist_turn := Basis()
+var twist_scale := 1.0
+var twist_sent := Basis()  # what the terrain has
+var twist_view := Basis()  # the camera's when it began (the mouse turns about its axes)
 ## Snake hook moves in steps of at most this fraction of the radius (and 8
 ## voxels), at most this many per frame; the rest carries over.
 const SNAKE_STEP := 0.5
@@ -294,8 +309,14 @@ func _ready() -> void:
 	_make_player()
 	balls = BouncyBalls.new(terrain)
 	camera.get_parent().add_child(balls)
+	creatures = Creatures.new(self)
+	add_child(creatures)
 	if not terrain.save_path.is_empty():
 		balls.load_from(_objects_path())
+		var saved := ConfigFile.new()
+		if saved.load(_objects_path()) == OK:
+			creatures.load_from(saved)
+			creatures.restore_loaded(player.global_position)
 	_finish_ready(start)
 
 ## Joining a host: waits for its world settings, opens the same world
@@ -484,7 +505,7 @@ func _notification(what: int) -> void:
 
 func _save_objects() -> void:
 	if not terrain.save_path.is_empty():
-		balls.save(_objects_path())
+		balls.save(_objects_path(), creatures.to_save())
 
 func _sync_prepass_camera() -> void:
 	if not use_prepass:
@@ -521,7 +542,9 @@ func _input(event: InputEvent) -> void:
 	if hud.radial.visible and _radial_input(event):
 		get_viewport().set_input_as_handled()
 		return
-	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and twisting:
+		_twist_input(event.relative, event.shift_pressed)
+	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		yaw -= event.relative.x * mouse_sensitivity
 		pitch = clampf(pitch - event.relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
 		camera.rotation = Vector3(pitch, yaw, 0.0)
@@ -548,8 +571,8 @@ func _input(event: InputEvent) -> void:
 					gun_body = body
 					gun_distance = aimed.distance
 					gun_point = body.to_local(aimed.position)
-		elif tool in [Tool.BOX, Tool.BOX_CUT] and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
-			_box_click(event.button_index == MOUSE_BUTTON_LEFT)
+		elif tool == Tool.BOX and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
+			_box_press(event.button_index == MOUSE_BUTTON_LEFT)
 		elif tool in [Tool.GEOMETRY, Tool.SELECT_GEOMETRY] and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
 			_geometry_click(event.button_index == MOUSE_BUTTON_LEFT)
 		elif tool == Tool.SNAKE_HOOK and event.button_index == MOUSE_BUTTON_LEFT and event.shift_pressed and snake_last != null:
@@ -572,6 +595,10 @@ func _input(event: InputEvent) -> void:
 				_set_player_height(player_height * step)  # the player's size, and all that goes with it
 			elif gun_body != null:
 				gun_distance = clampf(gun_distance * step, 4.0, reach)  # pull in / push out
+			elif box_dragging:
+				if box_distance < 0.0:
+					box_distance = camera.global_position.distance_to(_box_far_corner())
+				box_distance = clampf(box_distance * step, 2.0, reach)
 			elif tool in [Tool.GEOMETRY, Tool.SELECT_GEOMETRY] and not event.ctrl_pressed:
 				if geo_drag >= 0:
 					geo_drag_distance = clampf(geo_drag_distance * step, 2.0, reach)
@@ -615,20 +642,20 @@ func _input(event: InputEvent) -> void:
 			KEY_1: _cycle_tool([Tool.DRAW, Tool.INFLATE])
 			KEY_2: _cycle_tool([Tool.SMOOTH, Tool.PINCH])
 			KEY_3: _set_tool(Tool.FLATTEN)
-			KEY_4: _set_tool(Tool.GRAB)
+			KEY_4: _cycle_tool([Tool.GRAB, Tool.ROTATE, Tool.SCALE])
 			KEY_5: _set_tool(Tool.SNAKE_HOOK)
 			KEY_6: _set_tool(Tool.PAINT)
 			KEY_7: _cycle_tool([Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY])
 			KEY_8: _cycle_tool([Tool.EXTRUDE, Tool.TRANSFORM])
 			KEY_9: _set_tool(Tool.PHYSICS_GUN)
-			KEY_0: _cycle_tool([Tool.GEOMETRY, Tool.BOX, Tool.BOX_CUT])
+			KEY_0: _cycle_tool([Tool.GEOMETRY, Tool.BOX])
 			KEY_T:
 				gizmo_mode = ((gizmo_mode + 1) % 3) as Gizmo
 			KEY_ENTER, KEY_KP_ENTER:
 				_confirm(event.shift_pressed)  # Shift: cut the shape out instead
 			KEY_BACKSPACE:
-				if tool in [Tool.BOX, Tool.BOX_CUT] and box_stage > 0:
-					box_stage = 0
+				if box_dragging:
+					box_dragging = false
 				elif tool in [Tool.GEOMETRY, Tool.SELECT_GEOMETRY] and not geo_points.is_empty():
 					geo_points.clear()
 					_rebuild_geometry()
@@ -1024,19 +1051,16 @@ func _notify(p_text: String) -> void:
 ## A frog (forg.tscn) or a chiggin (chiggin.tscn), whichever Shift+G last
 ## picked, dropped where the crosshair points.
 func _spawn_frog() -> void:
-	var frog := (CHIGGIN_SCENE if creature == 1 else forg_scene).instantiate() as Node3D
 	var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
 	var spawn: Vector3 = hit + Vector3.UP * 20.0 if hit != null else camera.global_position - camera.global_basis.z * 30.0
-	camera.get_parent().add_child(frog)
-	frog.global_position = spawn
-	frog.rotation.y = randf() * TAU
+	creatures.spawn(CHIGGIN_SCENE if creature == 1 else forg_scene, spawn, randf() * TAU)
 
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
 	var sculpting := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not capture_click and not hud.radial.visible
 	var held := sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var pressing := held or (sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT))
-	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX, Tool.BOX_CUT]:
+	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX]:
 		pressing = false  # these don't sculpt
 	if pressing and not stroking:
 		terrain.begin_stroke()
@@ -1052,8 +1076,13 @@ func _sculpt(delta: float) -> void:
 			hit = _drag(camera.global_position + look * drag_distance)
 		else:
 			_end_drag()
+	if twisting:
+		if held:
+			hit = _twist()
+		else:
+			_end_twist()
 	target_body = null
-	if not dragging:
+	if not dragging and not twisting:
 		hit = terrain.raycast(camera.global_position, look, reach)
 		# A body (ball, frog) in front of the ground is sculpted instead.
 		var nearest: float = reach if hit == null else camera.global_position.distance_to(hit)
@@ -1061,10 +1090,12 @@ func _sculpt(delta: float) -> void:
 		if not aimed.is_empty():
 			target_body = aimed.body
 			hit = aimed.position
-		if target_body != null and pressing and held_body == null and (TOOL_MODES[tool] >= 0 or tool in [Tool.GRAB, Tool.SNAKE_HOOK]):
+		if target_body != null and pressing and held_body == null and (TOOL_MODES[tool] >= 0 or tool in [Tool.GRAB, Tool.SNAKE_HOOK, Tool.ROTATE, Tool.SCALE]):
 			_hold_body(target_body)
 		if hit != null and held and (tool == Tool.GRAB or tool == Tool.SNAKE_HOOK):
 			_begin_drag(hit)
+		elif hit != null and held and tool in [Tool.ROTATE, Tool.SCALE]:
+			_begin_twist(hit)
 	brush_preview.visible = hit != null
 	if hit != null:
 		brush_preview.global_position = hit
@@ -1080,7 +1111,7 @@ func _sculpt(delta: float) -> void:
 	var mode := -1
 	if tool in NON_SCULPT_TOOLS:
 		pass  # not a sculpting tool
-	elif hit != null and sculpting and not dragging:
+	elif hit != null and sculpting and not dragging and not twisting:
 		if Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
 			mode = TOOL_MODES[tool] if tool in INVERTIBLE_TOOLS else SculptTerrain.BRUSH_SUBTRACT
 		elif held and TOOL_MODES[tool] >= 0:
@@ -1107,12 +1138,16 @@ func _sculpt(delta: float) -> void:
 			else:
 				var material: int = SculptTerrain.color_to_material(paint_color) if coloring else block
 				if mode == SculptTerrain.BRUSH_FLATTEN:
-					# The stroke flattens to one plane: through where it began,
-					# facing the general lie of the ground there.
-					if not flatten_locked:
-						flatten_locked = true
-						flatten_point = hit
-						flatten_normal = terrain.get_normal(hit, brush_radius * 0.5)
+					# Flattens to the face under the brush: a plane through
+					# where it began on it, facing the general lie of the ground
+					# there. Moving onto another face (one turned well away from
+					# it, past a corner) flattens that one; Shift keeps the first.
+					if i == 0:
+						var here := terrain.get_normal(hit, brush_radius * 0.5)
+						if not flatten_locked or (not Input.is_key_pressed(KEY_SHIFT) and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
+							flatten_locked = true
+							flatten_point = hit
+							flatten_normal = here
 					terrain.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
 				terrain.apply_brush(copies[i] * hit, brush_radius, strength, mode, material)
 	_update_symmetry_visuals(hit)
@@ -1139,6 +1174,7 @@ func _begin_drag(p_hit: Vector3) -> void:
 		terrain.begin_grab()
 
 func _end_drag() -> void:
+	_end_twist()
 	if dragging and tool == Tool.SNAKE_HOOK and drag_body == null:
 		snake_last = drag_start
 	if dragging and tool == Tool.GRAB:
@@ -1189,6 +1225,66 @@ func _drag(p_target: Vector3) -> Vector3:
 			continue
 		terrain.warp(centers, deltas, brush_radius, false)
 	return drag_start
+
+func _begin_twist(p_hit: Vector3) -> void:
+	twisting = true
+	twist_center = p_hit
+	twist_copies = []
+	twist_body = target_body
+	var copies := _symmetry_copies()
+	var kept := _distinct_copies(copies, p_hit) if twist_body == null else _body_copies(twist_body, copies, p_hit)
+	for i in kept:
+		twist_copies.append(copies[i])
+	twist_turn = Basis()
+	twist_scale = 1.0
+	twist_sent = Basis()
+	twist_view = camera.global_basis.orthonormalized()
+	if twist_body != null:
+		twist_body.begin_grab()
+	else:
+		terrain.begin_grab()
+
+func _end_twist() -> void:
+	if twisting:
+		if twist_body != null:
+			if is_instance_valid(twist_body):
+				twist_body.end_grab()
+			_release_held_body()  # (split off what it cut loose; undo)
+		else:
+			terrain.end_grab()
+	twisting = false
+	twist_body = null
+
+## The mouse while rotating or scaling (the view holds still meanwhile).
+func _twist_input(p_relative: Vector2, p_roll: bool) -> void:
+	if tool == Tool.SCALE:
+		twist_scale = clampf(twist_scale * exp((p_relative.x - p_relative.y) * 0.004), 0.1, 6.0)
+		return
+	var turn := 0.008
+	if p_roll:
+		twist_turn = Basis(-twist_view.z, -p_relative.x * turn) * twist_turn
+	else:
+		twist_turn = Basis(twist_view.y, p_relative.x * turn) * twist_turn
+		twist_turn = Basis(twist_view.x, p_relative.y * turn) * twist_turn
+	twist_turn = twist_turn.orthonormalized()
+
+## Re-applies the whole turn / scale since the twist began (from the
+## terrain as it was then). Returns where the brush is.
+func _twist() -> Vector3:
+	var change := twist_turn.scaled(Vector3.ONE * twist_scale)
+	if not change.is_equal_approx(twist_sent):
+		twist_sent = change
+		var centers := PackedVector3Array()
+		var bases := []
+		for copy in twist_copies:
+			centers.append(copy * twist_center)
+			bases.append(copy.basis * change * copy.basis.inverse())
+		if twist_body != null:
+			if is_instance_valid(twist_body):
+				twist_body.twist(centers, bases, brush_radius)
+		else:
+			terrain.twist(centers, bases, brush_radius)
+	return twist_center
 
 ## Holds a body still while it's sculpted (see held_body).
 func _hold_body(p_body: DensityBody3D) -> void:
@@ -1530,14 +1626,21 @@ func _tool_hint() -> String:
 		Tool.SNAKE_HOOK:
 			return "Snake hook: Shift + click pulls a straight one from where the last ended"
 		Tool.FLATTEN:
-			return "Flatten: to the plane where the stroke began"
+			return "Flatten: to the face under the brush (onto another face: that one; Shift keeps the first)"
+		Tool.ROTATE:
+			return "Rotate: hold on the ground or an object and move the mouse (Shift: roll about the view)"
+		Tool.SCALE:
+			return "Scale: hold on the ground or an object and move the mouse (right / up: bigger, left / down: smaller)"
 		Tool.INFLATE:
 			return "Inflate: puffs the surface out (RMB: in)"
 		Tool.PINCH:
 			return "Pinch: pulls the surface into a crease (RMB: spreads it)"
-		Tool.BOX, Tool.BOX_CUT:
-			return "%s: click %s (RMB: back, Backspace: start over)" % [TOOL_NAMES[tool],
-				["where an edge starts", "where it ends", "how wide", "how high (below the ground: deep)"][box_stage]]
+		Tool.BOX:
+			if box_dragging:
+				var size := _box_size()
+				return "Box %d x %d x %d: let go to %s (wheel: far corner nearer / farther, RMB: give up)" % [size.x, size.y, size.z,
+					"cut it out" if Input.is_key_pressed(KEY_SHIFT) else "build it (Shift: cut it out)"]
+			return "Box: drag from one corner to the other (Shift when you let go: cut it out)"
 		Tool.TRANSFORM:
 			if floating == null:
 				return "Transform: select something first"
@@ -1980,96 +2083,78 @@ func _import_to_paste() -> void:
 
 # --- Box ----------------------------------------------------------------------
 
-## Where the crosshair meets the box's base plane (through its first
-## corner, square to box_up), or a point ahead if it's looking along it.
-func _box_plane_point() -> Vector3:
+## LMB: the first corner, where the crosshair meets the ground.
+func _box_press(p_left: bool) -> void:
+	if not p_left:
+		box_dragging = false  # (RMB: give up)
+		return
+	var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
+	box_a = hit if hit != null else camera.global_position - camera.global_basis.z * geo_distance
+	box_distance = -1.0
+	box_dragging = true
+
+## Where the far corner is: on the ground under the crosshair, or (once the
+## wheel has moved it) that far along it.
+func _box_far_corner() -> Vector3:
 	var from := camera.global_position
 	var look := -camera.global_basis.z
-	var hit = Plane(box_up, box_a).intersects_ray(from, look)
-	if hit == null:
-		return from + look * from.distance_to(box_a)
-	return hit
+	if box_distance < 0.0:
+		var hit = terrain.raycast(from, look, reach)
+		return hit if hit != null else from + look * from.distance_to(box_a)
+	return from + look * box_distance
 
-func _box_click(p_left: bool) -> void:
-	if not p_left:
-		box_stage = maxi(box_stage - 1, 0)
-		return
-	match box_stage:
-		0:
-			var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
-			if hit == null:
-				return
-			box_a = hit
-			# Square to the ground; on near-level ground, straight up.
-			var normal := terrain.get_normal(hit, 2.0)
-			box_up = Vector3.UP if normal.dot(Vector3.UP) > 0.82 else normal
-			box_stage = 1
-		1:
-			box_b = _box_plane_point()
-			if box_b.distance_to(box_a) > 0.5:
-				box_stage = 2
-		2:
-			box_width = _box_live_width()
-			box_stage = 3
-		3:
-			box_height = _box_live_height()
-			_apply_box()
-			box_stage = 0
+## The box's lowest and highest corners, on whole voxels, at least one thick.
+func _box_bounds() -> AABB:
+	var b := _box_far_corner()
+	var lo := box_a.min(b).round()
+	var hi := box_a.max(b).round()
+	for a in 3:
+		if hi[a] - lo[a] < 1.0:
+			hi[a] = lo[a] + 1.0
+	return AABB(lo, hi - lo)
 
-func _box_live_width() -> float:
-	var edge := (box_b - box_a).normalized()
-	var across := box_up.cross(edge).normalized()
-	return (_box_plane_point() - box_a).dot(across)
+func _box_size() -> Vector3i:
+	return Vector3i(_box_bounds().size)
 
-func _box_live_height() -> float:
-	var edge_middle := box_a.lerp(box_b, 0.5) + box_up.cross((box_b - box_a).normalized()).normalized() * box_width * 0.5
-	return _line_param(edge_middle, box_up, camera.global_position, -camera.global_basis.z)
-
-## The box's corners as the clicks (and the crosshair, for what's still to
-## click) have it: just the edge until the width is known.
 func _box_corners() -> PackedVector3Array:
-	var a := box_a
-	var b := box_b if box_stage >= 2 else _box_plane_point()
-	var corners := PackedVector3Array([a, b])
-	if box_stage >= 2:
-		var across := box_up.cross((b - a).normalized()).normalized()
-		var width := box_width if box_stage >= 3 else _box_live_width()
-		corners.append(a + across * width)
-		corners.append(b + across * width)
-		if box_stage >= 3:
-			var up := box_up * _box_live_height()
-			for i in 4:
-				corners.append(corners[i] + up)
+	var box := _box_bounds()
+	var corners := PackedVector3Array()
+	for i in 8:
+		corners.append(box.get_endpoint(i))
 	return corners
 
-func _apply_box() -> void:
-	var corners := _box_corners()
-	var shape := DensityShape.make_hull(corners, _current_material())
+func _apply_box(p_cut: bool) -> void:
+	var shape := DensityShape.make_hull(_box_corners(), _current_material())
 	terrain.begin_stroke()
-	if tool == Tool.BOX_CUT:
+	if p_cut:
 		terrain.carve_shape(shape, Transform3D.IDENTITY)
 	else:
 		terrain.stamp_shape(shape, Transform3D.IDENTITY, _current_material(), false)
 	terrain.end_stroke()
 
-## The box so far, previewed as a body (rebuilt when it changes).
+## While dragging a box: it's previewed as a body (rebuilt when it
+## changes), and built (or cut out) when the button is let go.
 func _update_box() -> void:
-	var on := tool in [Tool.BOX, Tool.BOX_CUT] and box_stage > 0
-	if not on:
+	if box_dragging and (tool != Tool.BOX or Input.mouse_mode != Input.MOUSE_MODE_CAPTURED):
+		box_dragging = false
+	if box_dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		box_dragging = false
+		_apply_box(Input.is_key_pressed(KEY_SHIFT))
+	if not box_dragging:
 		if box_preview != null:
 			box_preview.queue_free()
 			box_preview = null
 			box_shown = PackedVector3Array()
-		if tool not in [Tool.BOX, Tool.BOX_CUT]:
-			box_stage = 0
 		return
 	var corners := _box_corners()
-	var changed := corners.size() != box_shown.size()
+	var cut := Input.is_key_pressed(KEY_SHIFT)
+	var changed := corners.size() != box_shown.size() or cut != box_preview_cut
 	for i in mini(corners.size(), box_shown.size()):
 		changed = changed or corners[i].distance_to(box_shown[i]) > 0.05
 	if not changed:
 		return
 	box_shown = corners
+	box_preview_cut = cut
 	if box_preview == null:
 		box_preview = DensityBody3D.new()
 		box_preview.drawn = true
@@ -2079,5 +2164,5 @@ func _update_box() -> void:
 		camera.get_parent().add_child(box_preview)
 		box_preview.global_transform = Transform3D.IDENTITY  # the hull is in world space
 	# A cut previews in red; a box in what it'll be made of.
-	var material := SculptTerrain.color_to_material(Color(0.95, 0.25, 0.2)) if tool == Tool.BOX_CUT else _current_material()
+	var material := SculptTerrain.color_to_material(Color(0.95, 0.25, 0.2)) if cut else _current_material()
 	box_preview.shape = DensityShape.make_hull(corners, material)

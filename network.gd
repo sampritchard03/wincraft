@@ -156,6 +156,11 @@ var scan_timer := 0.0
 var shape_timer := 0.0
 var ready_for_bodies := false
 var early_bodies: Array[Callable] = []
+## Animations: each AnimationLibrary (a body's own, or one a kind of
+## creature shares) -> the hash of what it held when last sent or received.
+## A change made here goes to everyone (with one of its bodies' ids), and
+## a received one is put in the copy's library, so all of that kind get it.
+var library_hashes: Dictionary = {}
 
 ## Regions (step 4). The host keeps region_owners (region -> peer id) and
 ## each peer's speed; everyone gets the region counts for the HUD.
@@ -716,7 +721,7 @@ func _simulate_here(p_body: DensityBody3D, p_on: bool) -> void:
 	if p_body.get_script() != null:
 		p_body.set_physics_process(p_on)
 	for child in p_body.get_children():
-		if child is AnimationTree:
+		if child is AnimationMixer:  # (trees and players: a copy's pose is the owner's)
 			child.active = p_on
 
 ## Everything another computer needs to make a copy of an object.
@@ -745,6 +750,28 @@ func _set_pose(p_body: DensityBody3D, p_pose: Variant) -> void:
 		p_body.pose = p_pose
 		if not p_body.key_weights.is_empty():
 			p_body.key_weights = PackedFloat32Array()
+
+## A copy's pose a step towards the owner's (key weights eased, so an
+## animation 20 updates a second still plays smoothly).
+func _glide_pose(p_body: DensityBody3D, p_pose: Variant, p_k: float) -> void:
+	var target_pose: float = p_pose[0] if p_pose is Array else p_pose
+	var target: PackedFloat32Array = p_pose[1] if p_pose is Array else PackedFloat32Array()
+	var k := minf(p_k * 1.6, 1.0)
+	if absf(p_body.pose - target_pose) > 1e-4:
+		p_body.pose = target_pose if absf(p_body.pose - target_pose) > 2.0 else lerpf(p_body.pose, target_pose, k)
+	var weights: PackedFloat32Array = p_body.key_weights
+	var n := maxi(weights.size(), target.size())
+	var changed := false
+	var glided := PackedFloat32Array()
+	glided.resize(n)
+	for i in n:
+		var have := weights[i] if i < weights.size() else 0.0
+		var want := target[i] if i < target.size() else 0.0
+		var v := want if absf(want - have) < 1e-3 else lerpf(have, want, k)
+		glided[i] = v
+		changed = changed or v != have
+	if changed:
+		p_body.key_weights = glided
 
 ## Finds objects made here (thrown, dropped, P, imported, cut off) and gives
 ## them ids, and objects removed here (X, broken, fallen out), and tells
@@ -800,6 +827,9 @@ func _spawn_now(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
 	b.angular_velocity = p_desc.spin
 	_set_pose(b, p_desc.pose)
 	BodyAnimation.apply(b, p_desc.get("animation", {}))
+	var library := _library_of(b)
+	if library != null:
+		library_hashes[library] = _library_hash(library)
 	b.freeze = p_desc.frozen
 	_simulate_here(b, p_owner == multiplayer.get_unique_id())
 
@@ -824,6 +854,7 @@ func _send_bodies() -> void:
 	if send_shapes:
 		shape_timer = 0.0
 	var peers := multiplayer.get_peers()
+	var checked := {}  # libraries looked at this time
 	var batches := {}  # peer id -> Array
 	for peer in peers:
 		batches[peer] = []
@@ -836,15 +867,26 @@ func _send_bodies() -> void:
 			if seen[0] != b.shape or seen[1] != b.shape.get_version():
 				b.set_meta("net_shape", [b.shape, b.shape.get_version()])
 				_shape.rpc(id, b.shape.to_dict())
-		var resting: bool = b.sleeping or b.freeze
+			var library := _library_of(b)
+			if library != null and not checked.has(library):
+				checked[library] = true
+				var hash := _library_hash(library)
+				if library_hashes.get(library, -1) != hash:
+					library_hashes[library] = hash
+					_animations.rpc(id, BodyAnimation.to_dict(b))
+		var pose = _pose_of(b)
+		var sent = b.get_meta("net_pose_sent") if b.has_meta("net_pose_sent") else null
+		var posing: bool = typeof(sent) != typeof(pose) or sent != pose  # (animating: sent as often as a moving one)
+		var resting: bool = (b.sleeping or b.freeze) and not posing
 		var everyone: bool = now - float(b.get_meta("net_sent", -100.0)) >= REST_INTERVAL
 		if resting and not everyone:
 			continue
 		if everyone:
 			b.set_meta("net_sent", now)
+		b.set_meta("net_pose_sent", pose)
 		var flags := (1 if b.freeze else 0) | (2 if b.sleeping else 0) | (4 if _in_use(b) else 0)
 		var state := [id, _wrapped(b.global_position), b.global_basis.get_rotation_quaternion(),
-				b.linear_velocity, b.angular_velocity, _pose_of(b), flags]
+				b.linear_velocity, b.angular_velocity, pose, flags]
 		for peer in peers:
 			if everyone or _peer_near(peer, b.global_position):
 				batches[peer].append_array(state)
@@ -880,7 +922,7 @@ func _states(p_batch: Array) -> void:
 		b.set_meta("net_turn", p_batch[i + 2])
 		b.linear_velocity = p_batch[i + 3]  # what objects here bounce off
 		b.angular_velocity = p_batch[i + 4]  # (kept, for a hand-over)
-		_set_pose(b, p_batch[i + 5])
+		b.set_meta("net_pose", p_batch[i + 5])  # (glided to in _update_bodies())
 		var flags: int = p_batch[i + 6]
 		b.set_meta("net_frozen", flags & 1 != 0)
 		b.set_meta("net_sleeping", flags & 2 != 0)
@@ -896,6 +938,52 @@ func _shape(p_id: String, p_shape: Dictionary) -> void:
 		return
 	b.shape = DensityShape.from_dict(p_shape)
 	b.set_meta("net_shape", [b.shape, b.shape.get_version()])
+
+## A body's animations (its AnimationPlayer's library), or null.
+func _library_of(p_body: Node) -> AnimationLibrary:
+	var player := BodyAnimation.player_of(p_body)
+	if player == null or not player.has_animation_library(""):
+		return null
+	return player.get_animation_library("")
+
+func _library_hash(p_library: AnimationLibrary) -> int:
+	var all := {}
+	for anim_name in p_library.get_animation_list():
+		all[anim_name] = BodyAnimation.animation_to_dict(p_library.get_animation(anim_name))
+	return all.hash()
+
+## Someone changed a body's animations (made, keyframed, imported): this
+## copy's (and, a creature's, all of its kind's) are made the same.
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _animations(p_id: String, p_animation: Dictionary) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_animations.bind(p_id, p_animation))
+		return
+	var b = bodies.get(p_id)
+	if b == null or not is_instance_valid(b):
+		return
+	BodyAnimation.apply(b, p_animation)
+	var library := _library_of(b)
+	if library != null:
+		library_hashes[library] = _library_hash(library)  # (not sent back)
+	if not b.get_meta("net_sim", false):
+		for child in b.get_children():
+			if child is AnimationMixer:
+				child.active = false  # (apply() may have woken them: a copy's pose is the owner's)
+
+## A kind of creature's shape changed here (creatures.gd): everyone's
+## creatures of that kind take it on.
+func send_kind_shape(p_scene: String, p_shape: DensityShape) -> void:
+	if mode == Mode.OFFLINE or not ready_for_bodies or multiplayer.get_peers().is_empty():
+		return
+	_kind_shape.rpc(p_scene, p_shape.to_dict())
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _kind_shape(p_scene: String, p_shape: Dictionary) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_kind_shape.bind(p_scene, p_shape))
+		return
+	world.creatures.take_kind_shape(p_scene, DensityShape.from_dict(p_shape))
 
 func _update_bodies(p_delta: float, p_k: float) -> void:
 	scan_timer += p_delta
@@ -926,9 +1014,13 @@ func _update_bodies(p_delta: float, p_k: float) -> void:
 		if rebalance_timer >= REBALANCE_INTERVAL:
 			rebalance_timer = 0.0
 			_rebalance()
-	# Copies glide towards where their owners have them.
+	# Copies glide towards where their owners have them, and how they pose them.
 	for b in bodies.values():
-		if not is_instance_valid(b) or b.get_meta("net_sim", false) or not b.has_meta("net_target"):
+		if not is_instance_valid(b) or b.get_meta("net_sim", false):
+			continue
+		if b.has_meta("net_pose"):
+			_glide_pose(b, b.get_meta("net_pose"), p_k)
+		if not b.has_meta("net_target"):
 			continue
 		var target := _nearest_repeat(b.get_meta("net_target"))
 		var turn: Quaternion = b.get_meta("net_turn")

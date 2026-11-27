@@ -2481,6 +2481,198 @@ bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector
 	return any;
 }
 
+bool DensityShape::twist(const std::vector<Vector3> &p_centers, const std::vector<Basis> &p_bases, double p_radius, int p_key, double p_pose, const PackedFloat32Array &p_weights) {
+	const int count = (int)std::min(p_centers.size(), p_bases.size());
+	if (keys.empty() || count == 0 || p_radius <= 0.0 || grab_rest.size() != rest.size() || grab_keys.size() != keys.size()) {
+		return false;
+	}
+	const bool one_key = p_key >= 0 && p_key < (int)keys.size();
+	// Where each copy's centre edits (the brush is on the pose shown), worked
+	// out once, as a grab does.
+	if ((int)grab_center_offsets.size() != count) {
+		grab_center_offsets.assign(count, Vector3());
+		if (has_motion()) {
+			for (int i = 0; i < count; i++) {
+				const Vector3 rp = rest_point(p_centers[i], p_pose, p_weights);
+				grab_center_offsets[i] = (one_key ? key_point(rp, p_key) : rp) - p_centers[i];
+			}
+		}
+	}
+	// Each copy, as SculptTerrain.twist(): material at distance u from the
+	// centre ends up turned by slerp(identity, q, s) and scaled by
+	// 1 + (k - 1) s, s = falloff(u / r).
+	struct Copy {
+		Vector3 centre; // body space, then grid space
+		Quaternion q;
+		float k = 1.0f;
+		float reach = 0.0f; // the farthest any of it lands
+	};
+	const float R = (float)p_radius;
+	std::vector<Copy> copies(count);
+	Vector3 lo_l(1e30f, 1e30f, 1e30f), hi_l(-1e30f, -1e30f, -1e30f);
+	for (int i = 0; i < count; i++) {
+		Copy &cp = copies[i];
+		cp.centre = p_centers[i] + grab_center_offsets[i];
+		const Basis &b = p_bases[i];
+		cp.k = std::clamp(std::cbrt(std::abs((float)b.determinant())), 0.05f, 20.0f);
+		Basis rot = b * (1.0f / cp.k);
+		rot.orthonormalize();
+		if (rot.determinant() < 0.0f) {
+			rot = rot * Basis().scaled(Vector3(-1, -1, -1));
+		}
+		cp.q = rot.get_rotation_quaternion().normalized();
+		cp.reach = R;
+		for (int j = 0; j <= 48; j++) {
+			const float u = R * (float)j / 48.0f;
+			cp.reach = std::max(cp.reach, u * (1.0f + (cp.k - 1.0f) * falloff(u / R)));
+		}
+		lo_l = lo_l.min(cp.centre - Vector3(1, 1, 1) * cp.reach);
+		hi_l = hi_l.max(cp.centre + Vector3(1, 1, 1) * cp.reach);
+	}
+	// Room for where it goes (as a grab: no coarser voxels).
+	const Vector3 room = Vector3(2, 2, 2) * (float)voxel_size;
+	fit(lo_l - room, hi_l + room, false);
+	const size_t n = this->count();
+	const float vs = (float)voxel_size, r = R / vs;
+	for (Copy &cp : copies) {
+		cp.centre = (cp.centre - origin) / vs;
+		cp.reach /= vs;
+	}
+	// The points rewritten: what this covers and everything it has since it
+	// began (body space: the grid may have grown).
+	Vector3 box_lo = lo_l - room, box_hi = hi_l + room;
+	if (grab_has_box) {
+		box_lo = box_lo.min(grab_box_lo);
+		box_hi = box_hi.max(grab_box_hi);
+	}
+	grab_box_lo = box_lo;
+	grab_box_hi = box_hi;
+	grab_has_box = true;
+	Vector3i lo, hi;
+	bool outside = false;
+	for (int a = 0; a < 3; a++) {
+		lo[a] = std::max((int)std::floor((box_lo[a] - origin[a]) / vs), 0);
+		hi[a] = std::min((int)std::ceil((box_hi[a] - origin[a]) / vs), size[a] - 1);
+		outside |= lo[a] > hi[a];
+	}
+	// Where the material at p came from (grid space): the most solid of
+	// every copy's roots, as SculptTerrain.twist().
+	auto source = [&](const Vector3 &q) { return sample_grid(grab_rest, q); };
+	auto twist_source = [&](const Vector3 &p) {
+		float value = -INFINITY;
+		Vector3 from = p;
+		auto take = [&](const Vector3 &q) {
+			const float v = source(q);
+			if (v > value) {
+				value = v;
+				from = q;
+			}
+		};
+		const int SCAN = 16;
+		for (const Copy &cp : copies) {
+			const Vector3 d = p - cp.centre;
+			const float rho = d.length();
+			if (rho >= cp.reach) {
+				take(p);
+				continue;
+			}
+			if (rho >= r) {
+				take(p);
+			}
+			if (rho < 1e-5f) {
+				take(cp.centre);
+				continue;
+			}
+			auto land = [&](float u) { return u * (1.0f + (cp.k - 1.0f) * falloff(u / r)) - rho; };
+			auto source_of = [&](float u) {
+				const float sv = falloff(u / r);
+				const Quaternion turn = Quaternion().slerp(cp.q, sv);
+				return cp.centre + turn.inverse().xform(d) / (1.0f + (cp.k - 1.0f) * sv);
+			};
+			float u0 = 0.0f, h0 = land(0.0f);
+			for (int k = 1; k <= SCAN; k++) {
+				const float u1 = r * (float)k / SCAN, h1 = land(u1);
+				if ((h0 > 0.0f) != (h1 > 0.0f)) {
+					float a = u0, b = u1;
+					for (int it = 0; it < 10; it++) {
+						const float m = (a + b) * 0.5f;
+						((land(m) > 0.0f) == (h0 > 0.0f) ? a : b) = m;
+					}
+					take(source_of((a + b) * 0.5f));
+				}
+				u0 = u1;
+				h0 = h1;
+			}
+		}
+		return from;
+	};
+	// Where a point lands (grid space): the forward map, for a key's motion.
+	auto twist_point = [&](const Vector3 &p) {
+		Vector3 to = p;
+		for (const Copy &cp : copies) {
+			const Vector3 d = to - cp.centre;
+			const float sv = falloff(d.length() / r);
+			if (sv <= 0.0f) {
+				continue;
+			}
+			to = cp.centre + Quaternion().slerp(cp.q, sv).xform(d) * (1.0f + (cp.k - 1.0f) * sv);
+		}
+		return to;
+	};
+	bool any = false;
+	if (one_key) {
+		// One key: its motion moves (each point from where the key had it
+		// when this began, carried by the twist), the rest shape stays.
+		Key &key = keys[p_key];
+		const Key &start = grab_keys[p_key];
+		if (key.motion.empty()) {
+			key.motion.assign(n, Vector3());
+		}
+		for (int z = 0; z < size.z; z++) {
+			for (int y = 0; y < size.y; y++) {
+				for (int x = 0; x < size.x; x++) {
+					const size_t i = index(x, y, z);
+					const Vector3 g((float)x, (float)y, (float)z);
+					const Vector3 from = start.motion.empty() ? Vector3() : start.motion[i];
+					const Vector3 to = twist_point(g + from) - g;
+					any |= (to - key.motion[i]).length_squared() > 1e-10f;
+					key.motion[i] = to;
+				}
+			}
+		}
+		if (all_zero(key.motion)) {
+			key.motion.clear();
+		}
+	} else if (!outside) {
+		// The rest shape moves, carrying every key's motion along.
+		const std::vector<float> before = rest;
+		for (int z = lo.z; z <= hi.z; z++) {
+			for (int y = lo.y; y <= hi.y; y++) {
+				for (int x = lo.x; x <= hi.x; x++) {
+					const Vector3 p((float)x, (float)y, (float)z);
+					const size_t i = index(x, y, z);
+					const Vector3 from = twist_source(p);
+					rest[i] = source(from);
+					const Vector3i m = Vector3i(from.round()).clamp(Vector3i(), size - Vector3i(1, 1, 1));
+					materials[i] = grab_materials[index(m.x, m.y, m.z)];
+					for (size_t k = 0; k < keys.size(); k++) {
+						if (!grab_keys[k].motion.empty() && keys[k].motion.size() == n) {
+							keys[k].motion[i] = sample_motion(grab_keys[k].motion, from);
+						}
+					}
+				}
+			}
+		}
+		repair(rest, before, lo, hi);
+		any = rest != before;
+	}
+	if (any) {
+		edited = true;
+		changed();
+	}
+	return any;
+}
+
 // --- Materials, splitting, hulls ------------------------------------------------------
 
 void DensityShape::physical_properties_now(double &r_mass, double &r_bounce, double &r_friction) const {
@@ -2758,7 +2950,13 @@ Ref<DensityShape> DensityShape::make_hull(const PackedVector3Array &p_points, in
 		lo = lo.min(p);
 		hi = hi.max(p);
 	}
-	const Vector3 pad = Vector3(2, 2, 2);
+	// Room for the whole distance band around it: stamped into the terrain,
+	// its distances replace the old ones out to the clamp (a thinner pad left
+	// the ground's old, farther distances just above a box's top, and the
+	// player, trusting them, dropped into it and was pushed back out every
+	// frame).
+	const float pad_by = std::ceil(DENSITY_CLAMP) + 1.0f;
+	const Vector3 pad = Vector3(pad_by, pad_by, pad_by);
 	lo -= pad;
 	hi += pad;
 	Ref<DensityShape> shape;

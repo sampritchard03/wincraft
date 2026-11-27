@@ -92,10 +92,10 @@ transitions = ["Start", "idle", SubResource("AnimationNodeStateMachineTransition
 shape = ExtResource("1_r13a2")
 bounce = 0.29
 gravity_scale = 0.212
-angular_damp = 1.316
+angular_damp = 0.0
 auto_material_properties = false
 auto_center_of_mass = false
-center_of_mass = Vector3(0, -5, 0)
+center_of_mass = Vector3(0, -3, 0)
 drawn = true
 script = ExtResource("2_5crkg")
 

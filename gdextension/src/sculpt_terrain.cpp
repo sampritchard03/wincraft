@@ -1928,6 +1928,153 @@ void SculptTerrain::warp(const PackedVector3Array &p_centers, const PackedVector
 	}
 }
 
+void SculptTerrain::twist(const PackedVector3Array &p_centers, const Array &p_bases, double p_radius) {
+	ERR_FAIL_COND_MSG(!opened, "SculptTerrain: call open_world() first.");
+	const int count = (int)std::min<int64_t>(p_centers.size(), p_bases.size());
+	if (count == 0 || p_radius <= 0.0) {
+		return;
+	}
+	const float r = (float)p_radius, C = DENSITY_CLAMP;
+	const int margin = (int)std::ceil(C) + 1;
+	// Each copy: material at distance u from the centre ends up turned by
+	// slerp(identity, q, s) and scaled by 1 + (k - 1) s, s = falloff(u / r).
+	struct Copy {
+		Vector3 centre;
+		Quaternion q;
+		float k = 1.0f;
+		float reach = 0.0f; // the farthest any of it lands
+	};
+	std::vector<Copy> copies(count);
+	Vector3i lo(INT32_MAX, INT32_MAX, INT32_MAX), hi(INT32_MIN, INT32_MIN, INT32_MIN);
+	for (int i = 0; i < count; i++) {
+		Copy &cp = copies[i];
+		cp.centre = p_centers[i];
+		const Basis b = p_bases[i];
+		const float det = (float)b.determinant();
+		cp.k = std::clamp(std::cbrt(std::abs(det)), 0.05f, 20.0f);
+		Basis rot = b * (1.0f / cp.k);
+		rot.orthonormalize();
+		if (rot.determinant() < 0.0f) {
+			rot = rot * Basis().scaled(Vector3(-1, -1, -1)); // (a mirror would be a negative scale: kept a rotation)
+		}
+		cp.q = rot.get_rotation_quaternion().normalized();
+		cp.reach = r;
+		for (int j = 0; j <= 48; j++) {
+			const float u = r * (float)j / 48.0f;
+			cp.reach = std::max(cp.reach, u * (1.0f + (cp.k - 1.0f) * falloff(u / r)));
+		}
+		for (int a = 0; a < 3; a++) {
+			lo[a] = std::min(lo[a], (int)std::floor(cp.centre[a] - cp.reach - 1.0f));
+			hi[a] = std::max(hi[a], (int)std::ceil(cp.centre[a] + cp.reach + 1.0f));
+		}
+	}
+	if (grab_has_box) {
+		for (int a = 0; a < 3; a++) {
+			lo[a] = std::min(lo[a], grab_lo[a]);
+			hi[a] = std::max(hi[a], grab_hi[a]);
+		}
+	}
+	const Vector3i rlo = lo - Vector3i(margin, margin, margin), rhi = hi + Vector3i(margin, margin, margin);
+	const Vector3i n = rhi - rlo + Vector3i(1, 1, 1);
+	auto index = [&](int x, int y, int z) { return ((size_t)(z - rlo.z) * n.y + (y - rlo.y)) * n.x + (x - rlo.x); };
+	std::vector<float> before((size_t)n.x * n.y * n.z);
+	std::vector<MaterialId> materials_before(before.size());
+	world.read_points(rlo, rhi, before.data(), worker_count(), materials_before.data());
+	// Everything is read from how the terrain was when it began (all
+	// sources lie within r of a centre, inside this box).
+	capture_snapshot(lo - Vector3i(1, 1, 1), hi + Vector3i(1, 1, 1));
+	auto source = [&](const Vector3 &q) -> float {
+		const float fx = std::floor(q.x), fy = std::floor(q.y), fz = std::floor(q.z);
+		const int x = (int)fx, y = (int)fy, z = (int)fz;
+		const float tx = q.x - fx, ty = q.y - fy, tz = q.z - fz;
+		float c[8];
+		for (int k = 0; k < 8; k++) {
+			c[k] = snapshot_point(x + (k & 1), y + ((k >> 1) & 1), z + ((k >> 2) & 1));
+		}
+		auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+		return lerp(lerp(lerp(c[0], c[1], tx), lerp(c[2], c[3], tx), ty), lerp(lerp(c[4], c[5], tx), lerp(c[6], c[7], tx), ty), tz);
+	};
+	std::vector<float> after = before;
+	std::vector<MaterialId> materials_after = materials_before;
+	// Each point p looks for the material that lands on it: at distance u
+	// from the centre, it lands at u * (1 + (k - 1) falloff(u / r)), so u
+	// solves that = |p - centre| (a 1D root: scanned, then halved; where
+	// scaling up folds material over itself there are several, and the most
+	// solid wins). Its direction is p's, turned back.
+	const int SCAN = 16;
+	for (int z = lo.z; z <= hi.z; z++) {
+		for (int y = lo.y; y <= hi.y; y++) {
+			for (int x = lo.x; x <= hi.x; x++) {
+				const Vector3 p((float)x, (float)y, (float)z);
+				bool moved = false;
+				float value = -INFINITY;
+				Vector3 from = p;
+				auto take = [&](const Vector3 &q) {
+					const float v = source(q);
+					if (v > value) {
+						value = v;
+						from = q;
+					}
+					moved = true;
+				};
+				for (const Copy &cp : copies) {
+					const Vector3 d = p - cp.centre;
+					const float rho = d.length();
+					if (rho >= cp.reach) {
+						take(p);
+						continue;
+					}
+					if (rho >= r) {
+						take(p); // (its own material, beyond the brush, unless more solid lands on it)
+					}
+					auto land = [&](float u) { return u * (1.0f + (cp.k - 1.0f) * falloff(u / r)) - rho; };
+					auto source_of = [&](float u) {
+						const float s = falloff(u / r);
+						const Quaternion turn = Quaternion().slerp(cp.q, s);
+						const float scale = 1.0f + (cp.k - 1.0f) * s;
+						return cp.centre + turn.inverse().xform(d) / scale;
+					};
+					if (rho < 1e-5f) {
+						take(cp.centre);
+						continue;
+					}
+					float u0 = 0.0f, h0 = land(0.0f);
+					for (int k = 1; k <= SCAN; k++) {
+						const float u1 = r * (float)k / SCAN, h1 = land(u1);
+						if ((h0 > 0.0f) != (h1 > 0.0f)) {
+							float a = u0, b = u1;
+							for (int it = 0; it < 10; it++) {
+								const float m = (a + b) * 0.5f;
+								((land(m) > 0.0f) == (h0 > 0.0f) ? a : b) = m;
+							}
+							take(source_of((a + b) * 0.5f));
+						}
+						u0 = u1;
+						h0 = h1;
+					}
+				}
+				after[index(x, y, z)] = moved ? value : snapshot_point(x, y, z);
+				materials_after[index(x, y, z)] = snapshot_material((int)std::lround(from.x), (int)std::lround(from.y), (int)std::lround(from.z));
+			}
+		}
+	}
+	std::vector<Vector3i> grown;
+	mask_to_selection(lo, hi, rlo, n, before, after, materials_before, materials_after, true, grown);
+	if (blocky_size >= 2) {
+		snap_to_blocks(lo, hi, rlo, n, before, after, materials_after);
+	}
+	std::vector<uint8_t> brushed(after.size(), 0);
+	for (size_t i = 0; i < after.size(); i++) {
+		brushed[i] = std::abs(after[i] - before[i]) > 1e-5f;
+	}
+	redistance(after, n);
+	commit_edit(lo, hi, rlo, n, before, after, brushed, false, materials_before, materials_after);
+	select_grown(grown);
+	grab_lo = lo;
+	grab_hi = hi;
+	grab_has_box = true;
+}
+
 Variant SculptTerrain::raycast(const Vector3 &p_from, const Vector3 &p_dir, double p_max_distance) {
 	if (!opened || p_dir.length_squared() < 1e-12f) {
 		return Variant();
@@ -2032,6 +2179,7 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("begin_grab"), &SculptTerrain::begin_grab);
 	ClassDB::bind_method(D_METHOD("end_grab"), &SculptTerrain::end_grab);
 	ClassDB::bind_method(D_METHOD("warp", "centers", "deltas", "radius", "grab"), &SculptTerrain::warp);
+	ClassDB::bind_method(D_METHOD("twist", "centers", "bases", "radius"), &SculptTerrain::twist);
 	ClassDB::bind_method(D_METHOD("get_density", "position"), &SculptTerrain::get_density);
 	ClassDB::bind_method(D_METHOD("get_normal", "position", "spread"), &SculptTerrain::get_normal, DEFVAL(0.5));
 	ClassDB::bind_method(D_METHOD("set_flatten_plane", "point", "normal"), &SculptTerrain::set_flatten_plane);
