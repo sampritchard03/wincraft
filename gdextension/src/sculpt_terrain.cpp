@@ -29,17 +29,6 @@ float falloff(float t) {
 	return t >= 1.0f ? 0.0f : 1.0f - t * t * (3.0f - 2.0f * t);
 }
 
-// A repeatable pseudo-random number in [0, 1) per point and stroke. Adding it
-// before rounding to 1/16-voxel steps makes small brush changes add up on
-// average instead of always rounding away.
-float dither(int x, int y, int z, uint32_t p_stroke) {
-	uint32_t h = (uint32_t)x * 0x8DA6B343u ^ (uint32_t)y * 0xD8163841u ^ (uint32_t)z * 0xCB1AB31Fu ^ p_stroke * 0x9E3779B9u;
-	h ^= h >> 15;
-	h *= 0x2C1B3C6Du;
-	h ^= h >> 12;
-	return (float)(h & 0xFFFFFF) / (float)0x1000000;
-}
-
 // Replaces a block of densities (x fastest, then y, then z) with the signed
 // distance from each point to the surface (where the density crosses 0),
 // clamped to DENSITY_CLAMP, keeping each point's side.
@@ -201,11 +190,63 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 	}
 }
 
+// Points that became solid (p_needs) with no ground next to them to take a
+// material from take that of the nearest one that has one, along a path
+// through solid points (6 neighbours): a surface pushed out several voxels
+// in one go, or a snake's tendril reaching past what it grabbed, keeps the
+// material it grew from instead of the one air happens to hold (stone).
+void spread_materials(const Vector3i &p_size, const std::vector<float> &p_after, const std::vector<uint8_t> &p_needs, std::vector<MaterialId> &r_materials) {
+	const int nx = p_size.x, ny = p_size.y, nz = p_size.z;
+	const ptrdiff_t sy = nx, sz = (ptrdiff_t)nx * ny;
+	std::vector<uint8_t> done(p_after.size(), 0);
+	std::vector<int> queue;
+	auto each_neighbour = [&](int i, auto p_function) {
+		const int x = i % nx, y = i / nx % ny, z = (int)(i / sz);
+		if (x > 0) p_function(i - 1);
+		if (x + 1 < nx) p_function(i + 1);
+		if (y > 0) p_function(i - (int)sy);
+		if (y + 1 < ny) p_function(i + (int)sy);
+		if (z > 0) p_function(i - (int)sz);
+		if (z + 1 < nz) p_function(i + (int)sz);
+	};
+	bool any = false;
+	for (size_t i = 0; i < p_needs.size() && !any; i++) {
+		any = p_needs[i];
+	}
+	if (!any) {
+		return;
+	}
+	for (int i = 0; i < (int)p_after.size(); i++) {
+		if (p_after[i] > 0.0f && !p_needs[i]) {
+			done[i] = 1;
+			bool next_to_new = false;
+			each_neighbour(i, [&](int j) { next_to_new |= p_needs[j] != 0; });
+			if (next_to_new) {
+				queue.push_back(i);
+			}
+		}
+	}
+	for (size_t head = 0; head < queue.size(); head++) {
+		const int i = queue[head];
+		each_neighbour(i, [&](int j) {
+			if (p_needs[j] && !done[j] && p_after[j] > 0.0f) {
+				done[j] = 1;
+				r_materials[j] = r_materials[i];
+				queue.push_back(j);
+			}
+		});
+	}
+}
+
 } // namespace
 
 // For DensityShape (density_shape.h), which edits small grids the same way.
 void godot::density_redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 	redistance(r_values, p_size);
+}
+
+void godot::density_spread_materials(const Vector3i &p_size, const std::vector<float> &p_after, const std::vector<uint8_t> &p_needs, std::vector<MaterialId> &r_materials) {
+	spread_materials(p_size, p_after, p_needs, r_materials);
 }
 
 // --- Settings ------------------------------------------------------------------
@@ -374,6 +415,7 @@ void SculptTerrain::update_view(const Vector3 &p_camera_position, bool p_wait) {
 	}
 	// Level 0 is built at once the first time, so there is something to see.
 	const int moved = clipmap.follow(world, p_camera_position, worker_count(), true, p_wait);
+	clipmap.fix_pending(world, p_wait);
 	// Upload changed layers, nearest level first, at most LAYERS_PER_FRAME
 	// (each is clip_size^2 * 2 bytes); a level that moved switches to its new
 	// origin once all of its changed layers are up.
@@ -1206,16 +1248,18 @@ PackedStringArray SculptTerrain::get_material_names() {
 
 void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double p_strength, int p_mode, int p_material) {
 	ERR_FAIL_COND_MSG(!opened, "SculptTerrain: call open_world() first.");
-	ERR_FAIL_COND(p_mode < BRUSH_ADD || p_mode > BRUSH_PINCH);
+	ERR_FAIL_COND(p_mode < BRUSH_ADD || p_mode > BRUSH_CLONE);
 	ERR_FAIL_COND(p_material > 0xFFFF);
 	if (p_radius <= 0.0 || (p_mode == BRUSH_PAINT && p_material < 0)) {
 		return;
 	}
+	const BrushOptions &options = brush_options();
 	const float r = (float)p_radius, s = (float)p_strength, C = DENSITY_CLAMP;
 	// Points the brush rewrites ("edit box"): adding or carving a sphere also
-	// changes the distances out to CLAMP around it.
+	// changes the distances out to CLAMP around it. Clay strips' squares
+	// turn with the stroke: their corners reach sqrt(2) radii.
 	const bool sphere_mode = p_mode == BRUSH_ADD || p_mode == BRUSH_SUBTRACT;
-	const float reach = sphere_mode ? r + C : r + 1.0f;
+	const float reach = sphere_mode ? r + C : (p_mode == BRUSH_CLAY ? r * 1.42f + 1.0f : r + 1.0f);
 	// Pinch reads from up to half a radius farther out.
 	const float pinch_k = p_mode == BRUSH_PINCH ? std::clamp(s / r, -0.3f, 0.3f) : 0.0f;
 	Vector3i lo, hi;
@@ -1232,27 +1276,52 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 	std::vector<float> before((size_t)n.x * n.y * n.z);
 	std::vector<MaterialId> materials_before(before.size());
 	world.read_points(rlo, rhi, before.data(), worker_count(), materials_before.data());
+	read_exact(rlo, rhi, n, before); // (this stroke's unrounded values)
 	std::vector<float> after = before;
 	std::vector<MaterialId> materials_after = materials_before;
+	std::vector<uint8_t> needs_material; // see spread_materials()
 	const MaterialId paint = (MaterialId)std::max(p_material, 0);
+	// Clone: what's there, from the offset (whole voxels: copied, not resampled).
+	std::vector<float> source;
+	std::vector<MaterialId> source_materials;
+	Vector3i clone_shift;
+	if (p_mode == BRUSH_CLONE) {
+		clone_shift = Vector3i((int)std::lround(options.clone_offset.x), (int)std::lround(options.clone_offset.y), (int)std::lround(options.clone_offset.z));
+		if (clone_shift == Vector3i()) {
+			return; // (copying onto itself)
+		}
+		source.resize(before.size());
+		source_materials.resize(before.size());
+		world.read_points(rlo + clone_shift, rhi + clone_shift, source.data(), worker_count(), source_materials.data());
+	}
 
 	// The brushes, in a form that keeps the density a distance field: a
 	// blend with a fixed weight between two distance fields is one too.
 	//   ADD / SUBTRACT: blend towards the terrain with a sphere (radius r at
-	//   the centre) added / carved. The weight sets the speed: the surface at
-	//   the centre moves about `s` voxels.
-	//   SMOOTH: blend towards the average of each point's neighbours.
+	//   the centre; a cube with the cube brush) added / carved. The weight
+	//   sets the speed: the surface at the centre moves about `s` voxels.
+	//   SMOOTH: blend towards the average of each point's neighbours
+	//   (negative: away from it, sharpening).
 	//   FLATTEN: blend towards a plane through the centre, facing the surface
-	//   there. The last two fade out towards the brush edge; the distance
-	//   repair below puts back what that bends.
+	//   there (or the plane set for the stroke).
+	//   LAYER: towards the surface as the stroke found it, raised.
+	//   CLAY: towards a plane a little above the surface (fill only).
+	//   CLONE: towards the ground at the offset.
+	// They fade out towards the brush edge (brush_falloff()); the distance
+	// repair below puts back what that bends.
 	const float blend = std::clamp(s / r, 0.0f, 1.0f);
 	// Flatten: towards the plane set for the stroke (set_flatten_plane()),
 	// or else one through the centre facing the surface there.
 	const Vector3 plane_point = flatten_plane_set ? flatten_point : p_center;
 	const Vector3 plane_normal = p_mode != BRUSH_FLATTEN ? Vector3() : (flatten_plane_set ? flatten_normal : get_normal(p_center, p_radius * 0.5));
 	// Pinch squeezes across the surface, not into it: along the plane
-	// facing the surface's general direction at the centre.
-	const Vector3 pinch_normal = p_mode == BRUSH_PINCH ? get_normal(p_center, p_radius * 0.5) : Vector3();
+	// facing the surface's general direction at the centre. Clay strips
+	// lay along that plane too.
+	const Vector3 surface_normal = (p_mode == BRUSH_PINCH || p_mode == BRUSH_CLAY) ? get_normal(p_center, p_radius * 0.5) : Vector3();
+	// Clay strips: the plane they fill to, a fifth of the radius out (in,
+	// negative: scraping).
+	const float clay_depth = r * 0.2f * (s < 0.0f ? -1.0f : 1.0f);
+	const float layer = options.layer_height * (s < 0.0f ? -1.0f : 1.0f);
 	auto sample_before = [&](const Vector3 &q) {
 		const Vector3 c = q.clamp(Vector3(rlo), Vector3(rhi) - Vector3(1, 1, 1) * 0.001f);
 		const int x0 = (int)std::floor(c.x), y0 = (int)std::floor(c.y), z0 = (int)std::floor(c.z);
@@ -1269,10 +1338,10 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 				const Vector3 p((float)x, (float)y, (float)z);
 				const size_t i = index(x, y, z);
 				const float v = before[i];
-				const float dist = (p - p_center).length();
+				const float dist = brush_distance(p - p_center);
 				switch (p_mode) {
 					case BRUSH_ADD:
-						after[i] = v + (std::max(v, std::min(r - dist, C)) - v) * blend;
+						after[i] = v + (std::max(v, std::min(r - dist, C)) - v) * blend * sphere_brush_weight(dist / r);
 						// What it builds (and the air just outside, which
 						// carries the surface's material) is the brush's.
 						if (p_material >= 0 && after[i] > v + 1e-4f && after[i] > -2.0f) {
@@ -1280,62 +1349,119 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 						}
 						break;
 					case BRUSH_SUBTRACT:
-						after[i] = v + (std::min(v, std::max(dist - r, -C)) - v) * blend;
+						after[i] = v + (std::min(v, std::max(dist - r, -C)) - v) * blend * sphere_brush_weight(dist / r);
 						break;
 					case BRUSH_SMOOTH: {
-						const float f = falloff(dist / r);
+						const float f = brush_falloff(dist / r);
 						const float avg = (v + before[index(x - 1, y, z)] + before[index(x + 1, y, z)] + before[index(x, y - 1, z)] +
 												  before[index(x, y + 1, z)] + before[index(x, y, z - 1)] + before[index(x, y, z + 1)]) /
 								7.0f;
-						after[i] = v + (avg - v) * std::min(s * f, 1.0f);
+						after[i] = std::clamp(v + (avg - v) * std::clamp(s * f, -0.5f, 1.0f), -C, C);
 					} break;
 					case BRUSH_FLATTEN: {
-						const float f = falloff(dist / r);
+						const float f = brush_falloff(dist / r);
 						const float target = std::clamp(-(p - plane_point).dot(plane_normal), -C, C); // positive below
-						after[i] = v + (target - v) * std::min(s * f, 1.0f);
+						after[i] = flatten_limit(v, std::clamp(v + (target - v) * std::clamp(s * f, -0.5f, 1.0f), -C, C));
 					} break;
 					case BRUSH_INFLATE:
-					// Every part of the surface moves along its own normal:
-					// the distance field just shifts (s voxels at the centre).
-					if (std::abs(v) < C) {
-						after[i] = std::clamp(v + s * falloff(dist / r), -C, C);
-					}
-					break;
-				case BRUSH_PINCH: {
-					// Each point takes the value from a little farther out across
-					// the surface: material slides in towards the middle line.
-					const float f = falloff(dist / r);
-					if (f > 0.0f) {
-						const Vector3 d = p - p_center;
-						const Vector3 along = pinch_normal * d.dot(pinch_normal);
-						const Vector3 q = p_center + along + (d - along) * (1.0f + pinch_k * f);
-						after[i] = sample_before(q);
-						const Vector3i qi((int)std::lround(q.x), (int)std::lround(q.y), (int)std::lround(q.z));
-						const Vector3i qc = qi.clamp(rlo, rhi);
-						materials_after[i] = materials_before[index(qc.x, qc.y, qc.z)];
-					}
-				} break;
-				case BRUSH_PAINT:
+						// Every part of the surface moves along its own normal:
+						// the distance field just shifts (s voxels at the centre).
+						if (std::abs(v) < C) {
+							after[i] = std::clamp(v + s * brush_falloff(dist / r), -C, C);
+						}
+						break;
+					case BRUSH_PINCH: {
+						// Each point takes the value from a little farther out across
+						// the surface: material slides in towards the middle line.
+						const float f = brush_falloff(dist / r);
+						if (f > 0.0f) {
+							const Vector3 d = p - p_center;
+							const Vector3 along = surface_normal * d.dot(surface_normal);
+							const Vector3 q = p_center + along + (d - along) * (1.0f + pinch_k * f);
+							after[i] = sample_before(q);
+							const Vector3i qi((int)std::lround(q.x), (int)std::lround(q.y), (int)std::lround(q.z));
+							const Vector3i qc = qi.clamp(rlo, rhi);
+							materials_after[i] = materials_before[index(qc.x, qc.y, qc.z)];
+						}
+					} break;
+					case BRUSH_PAINT:
 						// The surface skin (both sides) within the radius.
 						if (dist <= r && std::abs(v) < 2.5f) {
 							materials_after[i] = paint;
 						}
 						break;
+					case BRUSH_LAYER: {
+						// Up to `layer` above the surface as it was when the
+						// stroke began, however often it's gone over.
+						const float f = brush_falloff(dist / r);
+						const float start = stroke_start_density(x, y, z, v);
+						// A point stored as "at least CLAMP away" (on the side
+						// it would move from) has no distance to raise: raised
+						// anyway it became a skin of near-zero air hanging
+						// over the ground, which rays from afar (counting
+						// anything within a few voxels as a hit) drew as
+						// specks and sheets.
+						const bool unknown = layer > 0.0f ? start <= -C + 0.01f : start >= C - 0.01f;
+						if (f > 0.0f && !unknown) {
+							const float target = std::clamp(start + layer * f, -C, C);
+							const float moved = v + (target - v) * std::min(std::abs(s), 1.0f);
+							after[i] = s >= 0.0f ? std::max(v, moved) : std::min(v, moved);
+						}
+					} break;
+					case BRUSH_CLAY: {
+						// A square (along the stroke) in the surface's plane,
+						// filled up to a plane clay_depth out from the centre;
+						// only so deep, so it doesn't reach the far side.
+						const Vector3 l = strip_frame(p - p_center, surface_normal, options.stroke_direction);
+						const float f = brush_falloff(std::max(std::abs(l.x), std::abs(l.y)) / r);
+						if (f > 0.0f && std::abs(l.z) < r) {
+							const float target = std::clamp(clay_depth - l.z, -C, C);
+							const float moved = v + (target - v) * std::min(std::abs(s) * f, 1.0f);
+							after[i] = s >= 0.0f ? std::max(v, moved) : std::min(v, moved);
+							if (p_material >= 0 && after[i] > v + 1e-4f && after[i] > -2.0f) {
+								materials_after[i] = paint;
+							}
+						}
+					} break;
+					case BRUSH_CLONE: {
+						const float f = brush_falloff(dist / r);
+						if (f > 0.0f) {
+							after[i] = v + (source[i] - v) * std::min(std::abs(s) * f, 1.0f);
+							if (f > 0.3f && source[i] > -2.5f) {
+								materials_after[i] = source_materials[i];
+							}
+						}
+					} break;
 				}
 				// Ground raised where there was air takes the material of
-				// the most solid ground next to it.
-				if ((p_mode == BRUSH_SMOOTH || p_mode == BRUSH_FLATTEN || p_mode == BRUSH_INFLATE) && v <= 0.0f && after[i] > 0.0f) {
+				// the ground next to it nearest the surface (the grass on
+				// top, not the stone under it), or, with none next to it,
+				// of the nearest ground it grew from (spread_materials()).
+				if ((p_mode == BRUSH_SMOOTH || p_mode == BRUSH_FLATTEN || p_mode == BRUSH_INFLATE || p_mode == BRUSH_LAYER ||
+							(p_mode == BRUSH_CLAY && p_material < 0)) &&
+						v <= 0.0f && after[i] > 0.0f) {
 					const size_t neighbours[6] = { index(x - 1, y, z), index(x + 1, y, z), index(x, y - 1, z), index(x, y + 1, z), index(x, y, z - 1), index(x, y, z + 1) };
 					size_t from = i;
 					for (size_t j : neighbours) {
-						if (before[j] > before[from]) {
+						if (before[j] > 0.0f && (from == i || before[j] < before[from])) {
 							from = j;
 						}
 					}
-					materials_after[i] = materials_before[from];
+					if (from != i) {
+						materials_after[i] = materials_before[from];
+					} else {
+						if (needs_material.empty()) {
+							needs_material.assign(after.size(), 0);
+						}
+						needs_material[i] = 1;
+					}
 				}
 			}
 		}
+	}
+
+	if (!needs_material.empty()) {
+		spread_materials(n, after, needs_material, materials_after);
 	}
 
 	// Repair: make every point of the edit box hold its true distance to the
@@ -1352,12 +1478,69 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 	for (size_t i = 0; i < after.size(); i++) {
 		brushed[i] = std::abs(after[i] - before[i]) > 1e-5f;
 	}
-	if (p_mode != BRUSH_PAINT) {
+	// Not after smoothing, Layer or Clay strips: each blends towards a field
+	// that is (nearly) a distance already (an average of neighbours, the
+	// stroke's start raised, a plane), and the repair's own error (up to
+	// ~8%), made again every frame, would outweigh a gentle smoothing and
+	// wander the surface about, or, for the two that only ever raise it,
+	// ratchet it up past where they stop.
+	// (Blocks are always repaired: snapping set them apart from what's
+	// around them.)
+	const bool snapped = blocky_size >= 2 && p_mode != BRUSH_PAINT;
+	if (snapped || (p_mode != BRUSH_PAINT && p_mode != BRUSH_SMOOTH && p_mode != BRUSH_LAYER && p_mode != BRUSH_CLAY)) {
 		redistance(after, n);
 	}
 
 	commit_edit(lo, hi, rlo, n, before, after, brushed, true, materials_before, materials_after);
 	select_grown(grown);
+}
+
+float SculptTerrain::stroke_start_density(int x, int y, int z, float p_now) const {
+	const int C = VoxelWorld::CHUNK;
+	const Vector3i c = VoxelWorld::chunk_of(x, y, z);
+	auto it = recording.index.find(world.wrap_chunk(c));
+	if (it == recording.index.end()) {
+		return p_now;
+	}
+	return recording.chunks[it->second].density[((size_t)(z - c.z * C) * C + (y - c.y * C)) * C + (x - c.x * C)] * DENSITY_STEP;
+}
+
+void SculptTerrain::read_exact(const Vector3i &p_lo, const Vector3i &p_hi, const Vector3i &p_n, std::vector<float> &r_values) const {
+	if (stroke_exact.empty()) {
+		return;
+	}
+	const int CH = VoxelWorld::CHUNK;
+	const Vector3i c0 = VoxelWorld::chunk_of(p_lo.x, p_lo.y, p_lo.z), c1 = VoxelWorld::chunk_of(p_hi.x, p_hi.y, p_hi.z);
+	for (int cz = c0.z; cz <= c1.z; cz++) {
+		for (int cy = c0.y; cy <= c1.y; cy++) {
+			for (int cx = c0.x; cx <= c1.x; cx++) {
+				const Vector3i c(cx, cy, cz);
+				auto it = stroke_exact.find(world.wrap_chunk(c));
+				if (it == stroke_exact.end()) {
+					continue;
+				}
+				const std::vector<float> &exact = it->second;
+				Vector3i a, b;
+				for (int k = 0; k < 3; k++) {
+					a[k] = std::max(c[k] * CH, p_lo[k]);
+					b[k] = std::min(c[k] * CH + CH - 1, p_hi[k]);
+				}
+				for (int z = a.z; z <= b.z; z++) {
+					for (int y = a.y; y <= b.y; y++) {
+						for (int x = a.x; x <= b.x; x++) {
+							const float e = exact[((size_t)(z - c.z * CH) * CH + (y - c.y * CH)) * CH + (x - c.x * CH)];
+							float &v = r_values[((size_t)(z - p_lo.z) * p_n.y + (y - p_lo.y)) * p_n.x + (x - p_lo.x)];
+							// Only while it's still what's stored (nothing else, an
+							// undo or another player, has changed it since).
+							if (!std::isnan(e) && quantize_density(e) == quantize_density(v)) {
+								v = e;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 void SculptTerrain::select_grown(const std::vector<Vector3i> &p_points) {
@@ -1373,10 +1556,18 @@ void SculptTerrain::snap_to_blocks(const Vector3i &lo, const Vector3i &hi, const
 	auto index = [&](int x, int y, int z) { return ((size_t)(z - rlo.z) * n.y + (y - rlo.y)) * n.x + (x - rlo.x); };
 	const int B = blocky_size;
 	// Every block (on a grid fixed to the world) the tool changed any point
-	// of becomes one value: the average of its points (so growth on any of
-	// its sides counts the same), with the material of its most solid point.
-	// Blocks reaching past the edit box are averaged whole but only written
-	// inside it; tools change points well inside it, so that's rare.
+	// of becomes solid or air whole: solid if the average of its points is
+	// (so growth on any of its sides counts the same), with the material of
+	// its most solid point. Its points then hold their distance to the
+	// block's own faces, which lie half way between its points and the next
+	// block's: an exact box, whose density reads as a distance (the repair
+	// after this joins it to its neighbours). One value for the whole block,
+	// as this used to give, put the faces anywhere in the gap and made flat
+	// plateaus with no slope: rays stepped right through thin blocks (seen
+	// as flickering ground showing through), and collision, which pushes
+	// along the slope, threw bodies about on big blocks.
+	// Blocks reaching past the edit box are worked out whole but only
+	// written inside it; tools change points well inside it, so that's rare.
 	const Vector3i b0(floor_div(lo.x, B), floor_div(lo.y, B), floor_div(lo.z, B));
 	const Vector3i b1(floor_div(hi.x, B), floor_div(hi.y, B), floor_div(hi.z, B));
 	const Vector3i rhi = rlo + n - Vector3i(1, 1, 1);
@@ -1407,12 +1598,13 @@ void SculptTerrain::snap_to_blocks(const Vector3i &lo, const Vector3i &hi, const
 				if (!changed) {
 					continue;
 				}
-				const float value = sum / (float)(B * B * B);
+				const float sign = sum > 0.0f ? 1.0f : -1.0f;
 				for (int z = std::max(p0.z, lo.z); z <= std::min(p1.z, hi.z); z++) {
 					for (int y = std::max(p0.y, lo.y); y <= std::min(p1.y, hi.y); y++) {
 						for (int x = std::max(p0.x, lo.x); x <= std::min(p1.x, hi.x); x++) {
 							const size_t i = index(x, y, z);
-							after[i] = value;
+							const int face = std::min({ x - p0.x, p1.x - x, y - p0.y, p1.y - y, z - p0.z, p1.z - z });
+							after[i] = sign * std::min(face + 0.5f, DENSITY_CLAMP);
 							materials_after[i] = material;
 						}
 					}
@@ -1429,8 +1621,9 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 	// Quantize to 1/16-voxel steps and find what changed: only chunks with
 	// changes are written (and so become edited chunks), and the clipmap is
 	// refreshed only around them.
-	//   Points the brush changed: dithered rounding (if p_dither), so small
-	//   changes add up on average instead of always rounding away.
+	//   Points the brush changed: rounded, their exact values kept for the
+	//   rest of the stroke (if p_dither: stroke_exact), so small changes add
+	//   up instead of rounding away.
 	//   Points it didn't: left alone unless the repair found the surface
 	//   nearer than they say (by more than REPAIR_TOLERANCE: the edit
 	//   brought it closer, or an older edit left them wrong) or on their
@@ -1498,13 +1691,31 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 	std::vector<uint8_t> chunk_changed((size_t)cn.x * cn.y * cn.z, 0);
 	std::vector<int8_t> quantized((size_t)n.x * n.y * n.z);
 	Vector3i changed_lo = hi, changed_hi = lo;
+	// Brushes (p_dither) keep their exact values for the rest of the stroke
+	// (stroke_exact, read back by read_exact()) and round plainly: what a
+	// dab leaves short of a whole step the next one carries on from.
+	const int CHE = VoxelWorld::CHUNK;
+	Vector3i exact_chunk(INT32_MIN, 0, 0);
+	std::vector<float> *exact = nullptr;
 	for (int z = lo.z; z <= hi.z; z++) {
 		for (int y = lo.y; y <= hi.y; y++) {
 			for (int x = lo.x; x <= hi.x; x++) {
 				const size_t i = index(x, y, z);
 				float steps;
 				if (brushed[i]) {
-					steps = p_dither ? std::floor(after[i] * 16.0f + dither(x, y, z, brush_strokes)) : std::nearbyint(after[i] * 16.0f);
+					steps = std::nearbyint(after[i] * 16.0f);
+					if (p_dither) {
+						const Vector3i c = VoxelWorld::chunk_of(x, y, z);
+						if (c != exact_chunk || exact == nullptr) {
+							exact_chunk = c;
+							auto [it, made] = stroke_exact.try_emplace(world.wrap_chunk(c));
+							if (made) {
+								it->second.assign(VoxelWorld::CHUNK_POINTS, NAN);
+							}
+							exact = &it->second;
+						}
+						(*exact)[((size_t)(z - c.z * CHE) * CHE + (y - c.y * CHE)) * CHE + (x - c.x * CHE)] = std::clamp(after[i], -DENSITY_CLAMP, DENSITY_CLAMP);
+					}
 				} else if (reachable[i] && ((after[i] > 0.0f) != (before[i] > 0.0f) || std::abs(after[i]) < std::abs(before[i]) - REPAIR_TOLERANCE || ghost(before[i], after[i]))) {
 					steps = std::nearbyint(after[i] * 16.0f);
 				} else {
@@ -1586,6 +1797,8 @@ void SculptTerrain::record_chunk(const Vector3i &p_unwrapped_chunk, const VoxelW
 
 void SculptTerrain::begin_stroke() {
 	end_stroke();
+	stroke_exact.clear();
+	brush_options().stroke_serial++;
 }
 
 void SculptTerrain::end_stroke() {
@@ -1593,6 +1806,7 @@ void SculptTerrain::end_stroke() {
 		return;
 	}
 	stroke_coverage.clear();
+	stroke_exact.clear();
 	if (recording.chunks.empty()) {
 		return;
 	}
@@ -1831,6 +2045,7 @@ void SculptTerrain::warp(const PackedVector3Array &p_centers, const PackedVector
 
 	std::vector<float> after = before;
 	std::vector<MaterialId> materials_after = materials_before;
+	std::vector<uint8_t> needs_material; // (snake hook: see spread_materials())
 	if (p_grab) {
 		// Grab, as Blender's: material at x moves to x + delta * falloff(|x -
 		// centre| / r), centre being where the grab began. Each point p looks
@@ -1923,11 +2138,22 @@ void SculptTerrain::warp(const PackedVector3Array &p_centers, const PackedVector
 					if (displacement.length_squared() == 0.0f && capsule <= -C) {
 						continue;
 					}
-					after[index(x, y, z)] = std::max(source(p - displacement), std::min(capsule, C));
+					const float sourced = source(p - displacement);
+					after[index(x, y, z)] = std::max(sourced, std::min(capsule, C));
 					materials_after[index(x, y, z)] = source_material(p - displacement);
+					if (sourced <= 0.0f && capsule > 0.0f) {
+						// The tendril beyond what it grabbed: from what it grew out of.
+						if (needs_material.empty()) {
+							needs_material.assign(after.size(), 0);
+						}
+						needs_material[index(x, y, z)] = 1;
+					}
 				}
 			}
 		}
+	}
+	if (!needs_material.empty()) {
+		spread_materials(n, after, needs_material, materials_after);
 	}
 	std::vector<Vector3i> grown;
 	mask_to_selection(lo, hi, rlo, n, before, after, materials_before, materials_after, true, grown);
@@ -2173,6 +2399,18 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_clip_levels"), &SculptTerrain::get_clip_levels);
 	ClassDB::bind_method(D_METHOD("set_simulation_radius", "voxels"), &SculptTerrain::set_simulation_radius);
 	ClassDB::bind_method(D_METHOD("get_simulation_radius"), &SculptTerrain::get_simulation_radius);
+	ClassDB::bind_method(D_METHOD("set_brush_falloff", "falloff"), &SculptTerrain::set_brush_falloff);
+	ClassDB::bind_method(D_METHOD("get_brush_falloff"), &SculptTerrain::get_brush_falloff);
+	ClassDB::bind_method(D_METHOD("set_brush_shape", "shape"), &SculptTerrain::set_brush_shape);
+	ClassDB::bind_method(D_METHOD("get_brush_shape"), &SculptTerrain::get_brush_shape);
+	ClassDB::bind_method(D_METHOD("set_flatten_mode", "mode"), &SculptTerrain::set_flatten_mode);
+	ClassDB::bind_method(D_METHOD("get_flatten_mode"), &SculptTerrain::get_flatten_mode);
+	ClassDB::bind_method(D_METHOD("set_brush_layer_height", "voxels"), &SculptTerrain::set_brush_layer_height);
+	ClassDB::bind_method(D_METHOD("get_brush_layer_height"), &SculptTerrain::get_brush_layer_height);
+	ClassDB::bind_method(D_METHOD("set_brush_clone_offset", "offset"), &SculptTerrain::set_brush_clone_offset);
+	ClassDB::bind_method(D_METHOD("get_brush_clone_offset"), &SculptTerrain::get_brush_clone_offset);
+	ClassDB::bind_method(D_METHOD("set_brush_stroke_direction", "direction"), &SculptTerrain::set_brush_stroke_direction);
+	ClassDB::bind_method(D_METHOD("get_brush_stroke_direction"), &SculptTerrain::get_brush_stroke_direction);
 	ClassDB::bind_method(D_METHOD("set_blocky_size", "voxels"), &SculptTerrain::set_blocky_size);
 	ClassDB::bind_method(D_METHOD("get_blocky_size"), &SculptTerrain::get_blocky_size);
 	ClassDB::bind_method(D_METHOD("set_thread_count", "value"), &SculptTerrain::set_thread_count);
@@ -2275,6 +2513,12 @@ void SculptTerrain::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "view_distance", PROPERTY_HINT_RANGE, "16,4000,1,suffix:voxels"), "set_view_distance", "get_view_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "thread_count"), "set_thread_count", "get_thread_count");
 	ADD_GROUP("Sculpting", "");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "brush_falloff", PROPERTY_HINT_ENUM, "Smooth,Linear,Sharp,Round,Constant"), "set_brush_falloff", "get_brush_falloff");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "brush_shape", PROPERTY_HINT_ENUM, "Sphere,Cube"), "set_brush_shape", "get_brush_shape");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "flatten_mode", PROPERTY_HINT_ENUM, "Both,Fill only,Scrape only"), "set_flatten_mode", "get_flatten_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "brush_layer_height"), "set_brush_layer_height", "get_brush_layer_height");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "brush_clone_offset"), "set_brush_clone_offset", "get_brush_clone_offset");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "brush_stroke_direction"), "set_brush_stroke_direction", "get_brush_stroke_direction");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "blocky_size", PROPERTY_HINT_RANGE, "0,8,1,suffix:voxels"), "set_blocky_size", "get_blocky_size");
 	ADD_GROUP("Simulation", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "simulation_radius", PROPERTY_HINT_RANGE, "32,1024,1,suffix:voxels"), "set_simulation_radius", "get_simulation_radius");
@@ -2288,6 +2532,9 @@ void SculptTerrain::_bind_methods() {
 	BIND_ENUM_CONSTANT(BRUSH_PAINT);
 	BIND_ENUM_CONSTANT(BRUSH_INFLATE);
 	BIND_ENUM_CONSTANT(BRUSH_PINCH);
+	BIND_ENUM_CONSTANT(BRUSH_LAYER);
+	BIND_ENUM_CONSTANT(BRUSH_CLAY);
+	BIND_ENUM_CONSTANT(BRUSH_CLONE);
 	BIND_ENUM_CONSTANT(WORLD_ISLANDS);
 	BIND_ENUM_CONSTANT(WORLD_TERRAIN);
 }

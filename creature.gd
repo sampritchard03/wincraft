@@ -40,6 +40,10 @@ const TURN_R := "turn_r"
 @export var air_delay := 0.3
 ## Seconds to blend from one animation into the next.
 @export var blend_time := 0.25
+## Which way its model faces: degrees about its up from the way the script
+## expects (_model_forward()), for a model made facing elsewhere. Every one of
+## a kind shares it (the object editor's "Faces" sets it; saved with the world).
+@export var facing_offset := 0.0
 
 enum State { UP, DOWN, RIGHTING }
 
@@ -78,9 +82,14 @@ func _action() -> String:
 	return ""
 
 
+## Which way the script expects a model to face (its own space), before facing_offset.
+func _model_forward() -> Vector3:
+	return Vector3.RIGHT
+
+
 ## Which way it faces (world space).
 func _forward() -> Vector3:
-	return global_basis.x
+	return global_basis * Basis(Vector3.UP, deg_to_rad(facing_offset)) * _model_forward()
 
 
 ## What it does on its own (walking, hopping), each physics frame. p_on_feet:

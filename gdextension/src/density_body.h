@@ -137,6 +137,14 @@ public:
 	// Sculpting the shape, in world space (as SculptTerrain's brushes). The
 	// first edit gives the body its own copy of a shared shape.
 	bool apply_brush(const Vector3 &p_center, double p_radius, double p_strength, int p_mode, int p_material = -1);
+	// Flatten flattens to this plane (world space) until cleared, as the
+	// terrain's (SculptTerrain::set_flatten_plane()); else the surface's at the brush.
+	void set_flatten_plane(const Vector3 &p_point, const Vector3 &p_normal) {
+		flatten_point = p_point;
+		flatten_normal = p_normal.normalized();
+		flatten_plane_set = true;
+	}
+	void clear_flatten_plane() { flatten_plane_set = false; }
 	bool paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness);
 	// Grab and snake hook on the shape, in world space (as
 	// SculptTerrain.warp(), one centre): begin_grab(), then warp() each frame.
@@ -235,6 +243,8 @@ protected:
 	bool highlighted = false;
 	int edit_key = -1;
 	bool own_shape = false;
+	bool flatten_plane_set = false;
+	Vector3 flatten_point, flatten_normal;
 	int64_t shape_version = -1; // the shape's, when the probes were made
 	int probe_frame = -1; // the shape frame the probes are of
 	PackedFloat32Array key_weights;

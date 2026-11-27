@@ -1,5 +1,6 @@
 #pragma once
 
+#include "brush_options.h"
 #include "clipmap.h"
 #include "density_shape.h"
 #include "voxel_world.h"
@@ -51,6 +52,9 @@ public:
 		BRUSH_PAINT, // change the material of the surface, not its shape
 		BRUSH_INFLATE, // move the surface out along its own normals (negative strength: in)
 		BRUSH_PINCH, // pull the surface towards the brush's middle, into a crease (negative: spread it)
+		BRUSH_LAYER, // raise the surface up to brush_layer_height above where it was when the stroke began (negative: lower)
+		BRUSH_CLAY, // clay strips: fill up to a plane a little above the surface, in square strips along the stroke (negative: scrape below)
+		BRUSH_CLONE, // copy the ground from brush_clone_offset away
 	};
 	enum WorldType {
 		WORLD_ISLANDS = godot::WORLD_ISLANDS,
@@ -245,6 +249,26 @@ public:
 		flatten_plane_set = true;
 	}
 	void clear_flatten_plane() { flatten_plane_set = false; }
+	// The brush's settings (brush_options.h; bodies' brushes use them too).
+	//   falloff: BrushFalloff (smooth, linear, sharp, round, constant).
+	//   shape: 0 sphere, 1 cube.
+	//   flatten_mode: 0 both, 1 fill only (raise up to the plane), 2 scrape only.
+	//   layer_height: how far Layer raises, voxels (up to 7.5: the stored
+	//   distances stop at DENSITY_CLAMP, so a stroke can raise no further).
+	//   clone_offset: Clone copies from a point plus this.
+	//   stroke_direction: which way the stroke runs (Clay strips' strips).
+	void set_brush_falloff(int p_value) { brush_options().falloff = std::clamp(p_value, 0, (int)FALLOFF_COUNT - 1); }
+	int get_brush_falloff() const { return brush_options().falloff; }
+	void set_brush_shape(int p_value) { brush_options().shape = std::clamp(p_value, 0, 1); }
+	int get_brush_shape() const { return brush_options().shape; }
+	void set_flatten_mode(int p_value) { brush_options().flatten_mode = std::clamp(p_value, 0, 2); }
+	int get_flatten_mode() const { return brush_options().flatten_mode; }
+	void set_brush_layer_height(double p_value) { brush_options().layer_height = (float)std::clamp(p_value, 0.0, 7.5); }
+	double get_brush_layer_height() const { return brush_options().layer_height; }
+	void set_brush_clone_offset(const Vector3 &p_value) { brush_options().clone_offset = p_value; }
+	Vector3 get_brush_clone_offset() const { return brush_options().clone_offset; }
+	void set_brush_stroke_direction(const Vector3 &p_value) { brush_options().stroke_direction = p_value; }
+	Vector3 get_brush_stroke_direction() const { return brush_options().stroke_direction; }
 	// The middle of the top of the island nearest p_near (within a few
 	// cells), or null.
 	Variant find_island(const Vector3 &p_near) const;
@@ -376,6 +400,14 @@ private:
 	// A point's material when the current stroke began (the undo recording
 	// has it if the stroke changed its chunk; otherwise it's unchanged).
 	MaterialId stroke_start_material(int x, int y, int z, MaterialId p_now) const;
+	// The same for its density (Layer measures from it).
+	float stroke_start_density(int x, int y, int z, float p_now) const;
+	// The brushes' exact (unrounded) values this stroke, per chunk (wrapped;
+	// NaN: none): each dab carries on from them rather than from the stored
+	// 1/16-voxel steps, so weak dabs add up exactly instead of rounding (and
+	// random rounding piling up into noise, as low-power smoothing did).
+	std::unordered_map<Vector3i, std::vector<float>, Vector3iHash> stroke_exact;
+	void read_exact(const Vector3i &p_lo, const Vector3i &p_hi, const Vector3i &p_n, std::vector<float> &r_values) const;
 	// Physics (see set_gravity()).
 	double gravity = 360.0;
 	bool physics_enabled = true;

@@ -94,7 +94,9 @@ func _draw() -> void:
 		draw_texture_rect(UiSkin.texture(UiSkin.tool_icon(names[shown])), Rect2(middle - Vector2(icon, icon * 1.25) * 0.5, Vector2(icon, icon)), false)
 		var font_size := roundi(18 * s)
 		_centred_text(font, names[shown], middle + Vector2(0, 38 * s), font_size, Color.WHITE)
-		_centred_text(font, "key " + str(hints[shown]), middle + Vector2(0, 58 * s), roundi(13 * s), Color(0.8, 0.82, 0.88))
+		var hint: String = str(hints[shown]) if shown < hints.size() else ""
+		if hint != "":
+			_centred_text(font, "key " + hint, middle + Vector2(0, 58 * s), roundi(13 * s), Color(0.8, 0.82, 0.88))
 	var dot := 24.0 * s
 	draw_texture_rect(UiSkin.texture("radial_pointer"), Rect2(middle + pointer * s - Vector2(dot, dot) * 0.5, Vector2(dot, dot)), false)
 

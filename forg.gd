@@ -52,8 +52,8 @@ func _action() -> String:
 	return IDLE
 
 
-func _forward() -> Vector3:
-	return global_basis.z
+func _model_forward() -> Vector3:
+	return Vector3.BACK  # (+z)
 
 
 func _ready() -> void:

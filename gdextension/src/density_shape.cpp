@@ -1658,10 +1658,10 @@ void DensityShape::repair(std::vector<float> &r_after, const std::vector<float> 
 }
 
 bool DensityShape::brush_grid(std::vector<float> &r_values, std::vector<MaterialId> &r_materials, const Vector3 &c, float r, float s, int p_mode, int p_material, Vector3i &lo, Vector3i &hi) {
-	enum { ADD, SUBTRACT, SMOOTH, FLATTEN, PAINT, INFLATE, PINCH };
+	enum { ADD, SUBTRACT, SMOOTH, FLATTEN, PAINT, INFLATE, PINCH, LAYER, CLAY, CLONE };
 	const float C = DENSITY_CLAMP;
 	const bool sphere_mode = p_mode == ADD || p_mode == SUBTRACT;
-	const float reach = sphere_mode ? r + C : r + 1.0f;
+	const float reach = sphere_mode ? r + C : (p_mode == CLAY ? r * 1.42f + 1.0f : r + 1.0f);
 	for (int a = 0; a < 3; a++) {
 		lo[a] = std::max((int)std::floor(c[a] - reach), 0);
 		hi[a] = std::min((int)std::ceil(c[a] + reach), size[a] - 1);
@@ -1673,17 +1673,25 @@ bool DensityShape::brush_grid(std::vector<float> &r_values, std::vector<Material
 	const std::vector<MaterialId> materials_before = r_materials;
 	const std::vector<float> before = r_values;
 	std::vector<float> &after = r_values;
+	std::vector<uint8_t> needs_material; // see density_spread_materials()
 	auto at = [&](int x, int y, int z) {
 		return before[index(std::clamp(x, 0, size.x - 1), std::clamp(y, 0, size.y - 1), std::clamp(z, 0, size.z - 1))];
 	};
 	Vector3 plane_normal;
-	if (p_mode == FLATTEN || p_mode == PINCH) {
+	Vector3 plane_point = c;
+	if (p_mode == FLATTEN && brush_local.plane_set) {
+		plane_point = brush_local.plane_point;
+		plane_normal = brush_local.plane_normal;
+	} else if (p_mode == FLATTEN || p_mode == PINCH || p_mode == CLAY) {
 		const float h = 0.5f;
 		const Vector3 grad(sample_grid(before, c + Vector3(h, 0, 0)) - sample_grid(before, c - Vector3(h, 0, 0)),
 				sample_grid(before, c + Vector3(0, h, 0)) - sample_grid(before, c - Vector3(0, h, 0)),
 				sample_grid(before, c + Vector3(0, 0, h)) - sample_grid(before, c - Vector3(0, 0, h)));
 		plane_normal = grad.length_squared() > 1e-12f ? -grad.normalized() : Vector3(0, 1, 0);
 	}
+	const float clay_depth = r * 0.2f * (s < 0.0f ? -1.0f : 1.0f);
+	const float layer = brush_options().layer_height / (float)voxel_size * (s < 0.0f ? -1.0f : 1.0f);
+	const Vector3 last_point = Vector3(size - Vector3i(1, 1, 1));
 	bool any = false;
 	for (int z = lo.z; z <= hi.z; z++) {
 		for (int y = lo.y; y <= hi.y; y++) {
@@ -1691,32 +1699,32 @@ bool DensityShape::brush_grid(std::vector<float> &r_values, std::vector<Material
 				const Vector3 p((float)x, (float)y, (float)z);
 				const size_t i = index(x, y, z);
 				const float v = before[i];
-				const float dist = (p - c).length();
+				const float dist = brush_distance(p - c);
 				switch (p_mode) {
 					case ADD:
-						after[i] = v + (std::max(v, std::min(r - dist, C)) - v) * blend;
+						after[i] = v + (std::max(v, std::min(r - dist, C)) - v) * blend * sphere_brush_weight(dist / r);
 						if (p_material >= 0 && after[i] > v + 1e-4f && after[i] > -2.0f) {
 							r_materials[i] = (MaterialId)p_material;
 						}
 						break;
 					case SUBTRACT:
-						after[i] = v + (std::min(v, std::max(dist - r, -C)) - v) * blend;
+						after[i] = v + (std::min(v, std::max(dist - r, -C)) - v) * blend * sphere_brush_weight(dist / r);
 						break;
 					case SMOOTH: {
 						const float avg = (v + at(x - 1, y, z) + at(x + 1, y, z) + at(x, y - 1, z) + at(x, y + 1, z) + at(x, y, z - 1) + at(x, y, z + 1)) / 7.0f;
-						after[i] = v + (avg - v) * std::min(s * falloff(dist / r), 1.0f);
+						after[i] = std::clamp(v + (avg - v) * std::clamp(s * brush_falloff(dist / r), -0.5f, 1.0f), -C, C);
 					} break;
 					case FLATTEN: {
-						const float target = std::clamp(-(p - c).dot(plane_normal), -C, C);
-						after[i] = v + (target - v) * std::min(s * falloff(dist / r), 1.0f);
+						const float target = std::clamp(-(p - plane_point).dot(plane_normal), -C, C);
+						after[i] = flatten_limit(v, std::clamp(v + (target - v) * std::clamp(s * brush_falloff(dist / r), -0.5f, 1.0f), -C, C));
 					} break;
 					case INFLATE:
 						if (std::abs(v) < C) {
-							after[i] = std::clamp(v + s * falloff(dist / r), -C, C);
+							after[i] = std::clamp(v + s * brush_falloff(dist / r), -C, C);
 						}
 						break;
 					case PINCH: {
-						const float f = falloff(dist / r);
+						const float f = brush_falloff(dist / r);
 						if (f > 0.0f) {
 							const Vector3 d = p - c;
 							const Vector3 along = plane_normal * d.dot(plane_normal);
@@ -1730,26 +1738,78 @@ bool DensityShape::brush_grid(std::vector<float> &r_values, std::vector<Material
 							r_materials[i] = (MaterialId)p_material;
 						}
 						break;
+					case LAYER: {
+						// Up to `layer` above the surface as the stroke found it.
+						const float f = brush_falloff(dist / r);
+						if (f > 0.0f) {
+							const float base = brush_local.layer_from != nullptr && brush_local.layer_from->size() == before.size() ? (*brush_local.layer_from)[i] : v;
+							// (Not from "at least CLAMP away": see SculptTerrain.)
+							if (layer > 0.0f ? base <= -C + 0.01f : base >= C - 0.01f) {
+								break;
+							}
+							const float target = std::clamp(base + layer * f, -C, C);
+							const float moved = v + (target - v) * std::min(std::abs(s), 1.0f);
+							after[i] = s >= 0.0f ? std::max(v, moved) : std::min(v, moved);
+						}
+					} break;
+					case CLAY: {
+						const Vector3 l = strip_frame(p - c, plane_normal, brush_local.stroke_direction);
+						const float f = brush_falloff(std::max(std::abs(l.x), std::abs(l.y)) / r);
+						if (f > 0.0f && std::abs(l.z) < r) {
+							const float target = std::clamp(clay_depth - l.z, -C, C);
+							const float moved = v + (target - v) * std::min(std::abs(s) * f, 1.0f);
+							after[i] = s >= 0.0f ? std::max(v, moved) : std::min(v, moved);
+							if (p_material >= 0 && after[i] > v + 1e-4f && after[i] > -2.0f) {
+								r_materials[i] = (MaterialId)p_material;
+							}
+						}
+					} break;
+					case CLONE: {
+						const float f = brush_falloff(dist / r);
+						const Vector3 q = p + brush_local.clone_offset;
+						if (f > 0.0f && brush_local.clone_offset.length_squared() > 0.25f) {
+							const float from = sample_grid(before, q.clamp(Vector3(), last_point));
+							after[i] = v + (from - v) * std::min(std::abs(s) * f, 1.0f);
+							if (f > 0.3f && from > -2.5f) {
+								const Vector3i qi = Vector3i(q.round()).clamp(Vector3i(), size - Vector3i(1, 1, 1));
+								r_materials[i] = materials_before[index(qi.x, qi.y, qi.z)];
+							}
+						}
+					} break;
 				}
-				if ((p_mode == SMOOTH || p_mode == FLATTEN || p_mode == INFLATE) && v <= 0.0f && after[i] > 0.0f) {
-					// Raised from air: the most solid neighbour's material.
+				if ((p_mode == SMOOTH || p_mode == FLATTEN || p_mode == INFLATE || p_mode == LAYER || (p_mode == CLAY && p_material < 0)) && v <= 0.0f && after[i] > 0.0f) {
+					// Raised from air: the material of the solid neighbour
+					// nearest the surface (the top coat, not what's under
+					// it), or with none, of the nearest ground it grew from.
 					const Vector3i ns[6] = { { x - 1, y, z }, { x + 1, y, z }, { x, y - 1, z }, { x, y + 1, z }, { x, y, z - 1 }, { x, y, z + 1 } };
-					float most = v;
+					float least = INFINITY;
 					for (const Vector3i &q : ns) {
 						const Vector3i cq = q.clamp(Vector3i(), size - Vector3i(1, 1, 1));
-						if (before[index(cq.x, cq.y, cq.z)] > most) {
-							most = before[index(cq.x, cq.y, cq.z)];
+						const float b = before[index(cq.x, cq.y, cq.z)];
+						if (b > 0.0f && b < least) {
+							least = b;
 							r_materials[i] = materials_before[index(cq.x, cq.y, cq.z)];
 						}
+					}
+					if (least == INFINITY) {
+						if (needs_material.empty()) {
+							needs_material.assign(after.size(), 0);
+						}
+						needs_material[i] = 1;
 					}
 				}
 				any |= after[i] != v;
 			}
 		}
 	}
-	if (p_mode != PAINT) {
+	if (!needs_material.empty()) {
+		density_spread_materials(size, after, needs_material, r_materials);
+	}
+	if (p_mode != PAINT && p_mode != SMOOTH && p_mode != LAYER && p_mode != CLAY) {
 		// Repair the distances as the terrain does (commit_edit()), around
-		// the brush only.
+		// the brush only. (Not after smoothing: an average of distances is
+		// still a safe one, and the repair's own error, every frame, would
+		// outweigh a gentle smoothing: SculptTerrain::apply_brush().)
 		repair(after, before, lo, hi);
 	}
 	any |= r_materials != materials_before;
@@ -1818,10 +1878,10 @@ void DensityShape::inherit_motion(const std::vector<float> &p_before, const Vect
 }
 
 bool DensityShape::apply_brush(const Vector3 &p_center, double p_radius, double p_strength, int p_mode, int p_material, int p_key, double p_pose, const PackedFloat32Array &p_weights) {
-	if (keys.empty() || p_radius <= 0.0 || p_mode < 0 || p_mode > 6 || (p_mode == 4 && p_material < 0)) {
+	if (keys.empty() || p_radius <= 0.0 || p_mode < 0 || p_mode > 9 || (p_mode == 4 && p_material < 0)) {
 		return false;
 	}
-	enum { ADD = 0 };
+	enum { ADD = 0, LAYER = 7 };
 	const bool one_key = p_key >= 0 && p_key < (int)keys.size();
 	// Where it edits: the rest shape under the brush, or that in the key's pose.
 	Vector3 target = p_center;
@@ -1840,6 +1900,18 @@ bool DensityShape::apply_brush(const Vector3 &p_center, double p_radius, double 
 	const Vector3 c = (target - origin) / vs;
 	Vector3i lo, hi;
 	bool any = false;
+	// Layer measures from the grid as the stroke found it (taken at its
+	// first dab: a new stroke, another key, or a resized grid takes it anew).
+	brush_local.layer_from = nullptr;
+	if (p_mode == LAYER) {
+		const uint32_t serial = brush_options().stroke_serial;
+		if (layer_serial != serial || layer_key != p_key || layer_base.size() != count()) {
+			layer_serial = serial;
+			layer_key = p_key;
+			layer_base = one_key ? frame(key_frame(p_key)).density : rest;
+		}
+		brush_local.layer_from = &layer_base;
+	}
 	if (!one_key) {
 		const std::vector<float> before = rest;
 		any = brush_grid(rest, materials, c, r, s, p_mode, p_material, lo, hi);

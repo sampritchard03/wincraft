@@ -73,13 +73,41 @@ var vr: VR
 ## panel, the help list (H) and the tool wheel (hold Tab), all skinned from
 ## res://assets/ui/.
 const Hud := preload("res://hud.gd")
+const BrushPanel := preload("res://brush_panel.gd")
 var hud: Hud
 ## The tool wheel's ring, from the top clockwise, with each tool's key (the
 ## number of presses for a key with several).
-const WHEEL_TOOLS := [Tool.DRAW, Tool.INFLATE, Tool.SMOOTH, Tool.PINCH, Tool.FLATTEN, Tool.GRAB, Tool.ROTATE, Tool.SCALE, Tool.SNAKE_HOOK, Tool.PAINT,
-		Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.EXTRUDE, Tool.TRANSFORM, Tool.PHYSICS_GUN,
-		Tool.GEOMETRY, Tool.BOX]
-const WHEEL_KEYS := ["1", "1 x2", "2", "2 x2", "3", "4", "4 x2", "4 x3", "5", "6", "7", "7 x2", "7 x3", "8", "8 x2", "9", "0", "0 x2"]
+const WHEEL_TOOLS := [Tool.DRAW, Tool.INFLATE, Tool.CLAY_STRIPS, Tool.LAYER, Tool.SMOOTH, Tool.PINCH, Tool.FLATTEN, Tool.GRAB, Tool.ROTATE,
+		Tool.SCALE, Tool.SNAKE_HOOK, Tool.PAINT, Tool.CLONE, Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.SELECT_BOX,
+		Tool.EXTRUDE, Tool.TRANSFORM, Tool.PHYSICS_GUN, Tool.GEOMETRY, Tool.BOX]
+## The number keys: each picks its first tool, then the next on each press.
+## (The wheel's key hints are worked out from these, so they can't fall out
+## of step with it.)
+const KEY_TOOLS := {
+	KEY_1: [Tool.DRAW, Tool.INFLATE, Tool.CLAY_STRIPS, Tool.LAYER],
+	KEY_2: [Tool.SMOOTH, Tool.PINCH],
+	KEY_3: [Tool.FLATTEN],
+	KEY_4: [Tool.GRAB, Tool.ROTATE, Tool.SCALE],
+	KEY_5: [Tool.SNAKE_HOOK],
+	KEY_6: [Tool.PAINT, Tool.CLONE],
+	KEY_7: [Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.SELECT_BOX],
+	KEY_8: [Tool.EXTRUDE, Tool.TRANSFORM],
+	KEY_9: [Tool.PHYSICS_GUN],
+	KEY_0: [Tool.GEOMETRY, Tool.BOX],
+}
+
+
+## The wheel's key hint for each of WHEEL_TOOLS ("1", "1 x2"; "" for none).
+func _wheel_keys() -> Array:
+	var hints: Array = []
+	for t in WHEEL_TOOLS:
+		var hint := ""
+		for k in KEY_TOOLS:
+			var at: int = KEY_TOOLS[k].find(t)
+			if at >= 0:
+				hint = OS.get_keycode_string(k) + ("" if at == 0 else " x%d" % (at + 1))
+		hints.append(hint)
+	return hints
 var block_icons := {}  # material -> ImageTexture, for the HUD
 ## Sun shadows from shadow maps (sun_shadows.gd).
 const SunShadows := preload("res://sun_shadows.gd")
@@ -210,17 +238,45 @@ var box_preview_cut := false
 var box_shown := PackedVector3Array()  # the corners the preview was made from
 
 enum Tool { DRAW, SMOOTH, FLATTEN, GRAB, SNAKE_HOOK, PAINT, SELECT_PAINT, SELECT_FILL, PHYSICS_GUN, SELECT_GEOMETRY, EXTRUDE, TRANSFORM, GEOMETRY,
-		INFLATE, PINCH, BOX, ROTATE, SCALE }
+		INFLATE, PINCH, BOX, ROTATE, SCALE, LAYER, CLAY_STRIPS, CLONE, SELECT_BOX }
 const TOOL_NAMES := ["Draw", "Smooth", "Flatten", "Grab", "Snake hook", "Paint", "Select paint", "Select fill", "Physics gun",
-		"Select geometry", "Extrude", "Transform", "Geometry", "Inflate", "Pinch", "Box", "Rotate", "Scale"]
+		"Select geometry", "Extrude", "Transform", "Geometry", "Inflate", "Pinch", "Box", "Rotate", "Scale", "Layer", "Clay strips",
+		"Clone", "Select box"]
 ## Tools that never sculpt with the mouse buttons.
 const NON_SCULPT_TOOLS := [Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.PHYSICS_GUN, Tool.SELECT_GEOMETRY, Tool.EXTRUDE, Tool.TRANSFORM, Tool.GEOMETRY,
-		Tool.BOX]
-## Brushes whose right button does the opposite (deflate, spread) rather than carve.
-const INVERTIBLE_TOOLS := [Tool.INFLATE, Tool.PINCH]
+		Tool.BOX, Tool.SELECT_BOX]
+## Brushes whose right button does the opposite (deflate, spread, lower,
+## scrape) rather than carve. (Alt does the opposite with any brush.)
+const INVERTIBLE_TOOLS := [Tool.INFLATE, Tool.PINCH, Tool.LAYER, Tool.CLAY_STRIPS]
 ## The brush each tool applies while held (-1: grab and snake hook drag instead).
 const TOOL_MODES := [SculptTerrain.BRUSH_ADD, SculptTerrain.BRUSH_SMOOTH, SculptTerrain.BRUSH_FLATTEN, -1, -1, SculptTerrain.BRUSH_PAINT, -1, -1, -1, -1, -1, -1, -1,
-		SculptTerrain.BRUSH_INFLATE, SculptTerrain.BRUSH_PINCH, -1, -1, -1]
+		SculptTerrain.BRUSH_INFLATE, SculptTerrain.BRUSH_PINCH, -1, -1, -1, SculptTerrain.BRUSH_LAYER, SculptTerrain.BRUSH_CLAY,
+		SculptTerrain.BRUSH_CLONE, -1]
+## Flatten flattens to (brush settings, N): the face under the brush, one
+## facing the view, or one square to an axis (floors, walls).
+enum FlattenPlane { FACE, VIEW, AXIS_X, AXIS_Y, AXIS_Z }
+var flatten_plane := FlattenPlane.FACE
+## Lazy mouse (0: off .. 1): the brush trails the crosshair on a string this
+## many brush radii (x 3) long, for steady strokes.
+var lazy_mouse := 0.0
+var lazy_point = null  # where the trailing brush is, while stroking
+## The wheel eases the brush's radius and strength to where it's turned them.
+var smooth_wheel := true
+var radius_target := -1.0
+var strength_target := -1.0
+## Shift + click: a straight stroke from where the last one ended.
+var stroke_end = null  # the last brush stroke's end (a brush tool's)
+var grab_end = null  # the last grab's end
+var stroke_last = null  # where the brush was last frame (Clay strips' direction)
+## Clone: Ctrl + click sets where it copies from; the first stroke after
+## fixes the offset (from there to where that stroke began), kept after.
+var clone_source = null
+var clone_offset = null
+var clone_marker: MeshInstance3D
+var brush_panel: Control
+var blocky_size_on := 2  # the size B turns blocky mode on at
+var box_select_add := true  # Select box: dragged with the left button (adds) or the right (takes away)
+const SETTINGS_PATH := "user://brush_settings.cfg"
 ## The player's size the speeds above are for: shift + wheel scales the
 ## player, and its width, speed, jump and step with it.
 const BASE_PLAYER_HEIGHT := 16.0
@@ -314,10 +370,13 @@ func _ready() -> void:
 	var layer := info_label.get_parent()  # the HUD CanvasLayer (Hud moves the label into itself)
 	hud = Hud.new(self)
 	layer.add_child(hud)
+	brush_panel = BrushPanel.new(self)
+	hud.add_child(brush_panel)
+	load_brush_settings.call_deferred()
 	var names: Array = []
 	for t in WHEEL_TOOLS:
 		names.append(TOOL_NAMES[t])
-	hud.radial.setup(WHEEL_TOOLS, names, WHEEL_KEYS)
+	hud.radial.setup(WHEEL_TOOLS, names, _wheel_keys())
 	hud.color_pressed.connect(toggle_color_panel)
 	hud.help_pressed.connect(hud.toggle_help)
 	network = Network.new()
@@ -579,7 +638,7 @@ func _input(event: InputEvent) -> void:
 		pitch = clampf(pitch - event.relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
 		camera.rotation = Vector3(pitch, yaw, 0.0)
 	elif event is InputEventMouseButton and event.pressed:
-		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+		if not _captured():
 			if hud.has_point(event.position):
 				return  # the HUD's (the picker, its clickable slots)
 			if editor != null and editor.has_point(event.position):
@@ -590,6 +649,12 @@ func _input(event: InputEvent) -> void:
 				get_viewport().gui_release_focus()  # back to playing: keys are hotkeys again
 		elif event.button_index == MOUSE_BUTTON_RIGHT and event.shift_pressed and _begin_hoist():
 			pass  # (and not the tool's right button)
+		elif tool == Tool.CLONE and event.button_index == MOUSE_BUTTON_LEFT and event.ctrl_pressed:
+			_set_clone_source()
+		elif event.button_index == MOUSE_BUTTON_LEFT and event.shift_pressed and TOOL_MODES[tool] >= 0 and stroke_end != null:
+			_brush_line(stroke_end)
+		elif tool == Tool.GRAB and event.button_index == MOUSE_BUTTON_LEFT and event.shift_pressed and grab_end != null:
+			_grab_line()
 		elif tool == Tool.PHYSICS_GUN and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
 			var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
 			if not aimed.is_empty():
@@ -604,7 +669,7 @@ func _input(event: InputEvent) -> void:
 					gun_turned = false
 					gun_distance = aimed.distance
 					gun_point = body.to_local(aimed.position)
-		elif tool == Tool.BOX and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
+		elif tool in [Tool.BOX, Tool.SELECT_BOX] and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
 			_box_press(event.button_index == MOUSE_BUTTON_LEFT)
 		elif tool in [Tool.GEOMETRY, Tool.SELECT_GEOMETRY] and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
 			_geometry_click(event.button_index == MOUSE_BUTTON_LEFT)
@@ -642,9 +707,13 @@ func _input(event: InputEvent) -> void:
 				else:
 					geo_distance = clampf(geo_distance * step, 2.0, reach)
 			elif event.ctrl_pressed:
-				brush_strength = clampf(brush_strength * step, 0.5, 64.0)
+				strength_target = clampf((strength_target if strength_target > 0.0 else brush_strength) * step, 0.5, 64.0)
+				if not smooth_wheel:
+					brush_strength = strength_target
 			else:
-				brush_radius = clampf(brush_radius * step, 1.0, 48.0)
+				radius_target = clampf((radius_target if radius_target > 0.0 else brush_radius) * step, 1.0, 48.0)
+				if not smooth_wheel:
+					brush_radius = radius_target
 	elif event is InputEventKey and event.pressed and not event.echo and event.ctrl_pressed and event.physical_keycode in [KEY_P, KEY_O, KEY_C, KEY_V]:
 		match event.physical_keycode:
 			KEY_P: _export_selection()
@@ -677,16 +746,14 @@ func _input(event: InputEvent) -> void:
 				toggle_color_panel()
 			KEY_H:
 				hud.toggle_help()
-			KEY_1: _cycle_tool([Tool.DRAW, Tool.INFLATE])
-			KEY_2: _cycle_tool([Tool.SMOOTH, Tool.PINCH])
-			KEY_3: _set_tool(Tool.FLATTEN)
-			KEY_4: _cycle_tool([Tool.GRAB, Tool.ROTATE, Tool.SCALE])
-			KEY_5: _set_tool(Tool.SNAKE_HOOK)
-			KEY_6: _set_tool(Tool.PAINT)
-			KEY_7: _cycle_tool([Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY])
-			KEY_8: _cycle_tool([Tool.EXTRUDE, Tool.TRANSFORM])
-			KEY_9: _set_tool(Tool.PHYSICS_GUN)
-			KEY_0: _cycle_tool([Tool.GEOMETRY, Tool.BOX])
+			KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0:
+				var cycle: Array = KEY_TOOLS[_key_of(event)]
+				if cycle.size() == 1:
+					_set_tool(cycle[0])
+				else:
+					_cycle_tool(cycle)
+			KEY_N:
+				toggle_brush_panel()
 			KEY_T:
 				gizmo_mode = ((gizmo_mode + 1) % 3) as Gizmo
 			KEY_ENTER, KEY_KP_ENTER:
@@ -704,8 +771,10 @@ func _input(event: InputEvent) -> void:
 			KEY_P:
 				_selection_to_body()
 			KEY_B:
-				# Blocky mode: every tool's result snaps to 2-voxel blocks.
-				terrain.blocky_size = 0 if terrain.blocky_size >= 2 else 2
+				# Blocky mode: every tool's result snaps to blocks (2 voxels, or
+				# the size the brush settings, N, last had).
+				terrain.blocky_size = 0 if terrain.blocky_size >= 2 else maxi(blocky_size_on, 2)
+				save_brush_settings()
 			KEY_F:
 				# Made of the selected block, or a random colour when "Color" is.
 				var ball_material := block if block < material_names.size() else -1
@@ -749,6 +818,8 @@ func _input(event: InputEvent) -> void:
 				_set_player_height(player_height + 1)
 			KEY_L:
 				_set_player_height(player_height - 1)
+			KEY_ALT, KEY_CTRL, KEY_META:
+				pass  # (modifiers: held with the mouse)
 			_:
 				if not _is_action(event):
 					print("Unbound key: physical %s, keycode %s, label %s, unicode %d" % [
@@ -964,6 +1035,7 @@ func _process(delta: float) -> void:
 		vr.follow(player.global_position)  # the headset decides where the camera is
 	t = _time_step("vr", t)
 
+	_ease_brush(delta)
 	_sculpt(delta)
 	_update_body_selection()
 	t = _time_step("sculpt", t)
@@ -1188,9 +1260,15 @@ func _spawn_frog() -> void:
 	var spawn: Vector3 = hit + Vector3.UP * 20.0 if hit != null else camera.global_position - camera.global_basis.z * 30.0
 	creatures.spawn(CHIGGIN_SCENE if creature == 1 else forg_scene, spawn, randf() * TAU)
 
+## Whether the mouse is the game's (captured), so the buttons sculpt.
+## assume_captured: as if it were (a headless test run can't capture it).
+var assume_captured := false
+func _captured() -> bool:
+	return assume_captured or Input.mouse_mode == Input.MOUSE_MODE_CAPTURED
+
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
-	var sculpting := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not capture_click and not hud.radial.visible and not hoisting
+	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting
 	var held := sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var pressing := held or (sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX]:
@@ -1242,51 +1320,321 @@ func _sculpt(delta: float) -> void:
 	_select(hit, sculpting)
 	_extrude(hit, held)
 	var mode := -1
+	var inverted := false
 	if tool in NON_SCULPT_TOOLS:
 		pass  # not a sculpting tool
 	elif hit != null and sculpting and not dragging and not twisting:
 		if Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
 			mode = TOOL_MODES[tool] if tool in INVERTIBLE_TOOLS else SculptTerrain.BRUSH_SUBTRACT
+			inverted = tool in INVERTIBLE_TOOLS
 		elif held and TOOL_MODES[tool] >= 0:
 			mode = TOOL_MODES[tool]
-	var coloring := block == material_names.size()
-	# Inflate / pinch with the right button: deflate / spread.
-	var strength := brush_strength * delta * (-1.0 if tool in INVERTIBLE_TOOLS and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT) else 1.0)
-	if mode >= 0 and target_body != null:
-		# Bodies are sculpted on their own (their undo is the held body's),
-		# with symmetry like the terrain: each copy that lands on the body.
-		var copies := _symmetry_copies()
-		var material: int = SculptTerrain.color_to_material(paint_color) if coloring else block
-		for i in _body_copies(target_body, copies, hit):
-			var at: Vector3 = copies[i] * hit
-			if mode == SculptTerrain.BRUSH_PAINT and coloring:
-				target_body.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
+		# Alt: the opposite, with any brush (Draw carves, Carve draws, Smooth
+		# sharpens, Flatten pushes away from its plane, Layer lowers...).
+		if mode >= 0 and Input.is_key_pressed(KEY_ALT):
+			if mode == SculptTerrain.BRUSH_ADD:
+				mode = SculptTerrain.BRUSH_SUBTRACT
+			elif mode == SculptTerrain.BRUSH_SUBTRACT:
+				mode = SculptTerrain.BRUSH_ADD
 			else:
-				target_body.apply_brush(at, brush_radius, strength, mode, material)
-	elif mode >= 0:
-		var copies := _symmetry_copies()
-		for i in _distinct_copies(copies, hit):
-			if mode == SculptTerrain.BRUSH_PAINT and coloring:
-				terrain.paint_color(copies[i] * hit, brush_radius, paint_color, paint_opacity, paint_hardness)
-			else:
-				var material: int = SculptTerrain.color_to_material(paint_color) if coloring else block
-				if mode == SculptTerrain.BRUSH_FLATTEN:
-					# Flattens to the face under the brush: a plane through
-					# where it began on it, facing the general lie of the ground
-					# there. Moving onto another face (one turned well away from
-					# it, past a corner) flattens that one; Shift keeps the first.
-					if i == 0:
-						var here := terrain.get_normal(hit, brush_radius * 0.5)
-						if not flatten_locked or (not Input.is_key_pressed(KEY_SHIFT) and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
-							flatten_locked = true
-							flatten_point = hit
-							flatten_normal = here
-					terrain.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
-				terrain.apply_brush(copies[i] * hit, brush_radius, strength, mode, material)
+				inverted = not inverted
+	if mode < 0 or not stroking:
+		lazy_point = null
+		stroke_last = null
+	elif lazy_mouse > 0.0:
+		hit = _lazy(hit)
+		brush_preview.global_position = hit
+	if mode >= 0:
+		if mode == SculptTerrain.BRUSH_CLONE and clone_source != null and clone_offset == null:
+			clone_offset = clone_source - hit  # (the first stroke after Ctrl + click: kept after)
+		# Clay strips lay their strips along the stroke.
+		if stroke_last != null and hit.distance_to(stroke_last) > 0.05:
+			terrain.brush_stroke_direction = (hit - stroke_last).normalized()
+		stroke_last = hit
+		_dab(hit, target_body, brush_strength * delta * (-1.0 if inverted else 1.0), mode)
+		stroke_end = hit
+	_update_clone_marker(hit if TOOL_MODES[tool] == SculptTerrain.BRUSH_CLONE else null)
 	_update_symmetry_visuals(hit)
 
 	info_label.text = _tool_hint()
 	hud.refresh()
+
+## One dab of the brush at p_hit, with its symmetry copies: on p_body if
+## given (the copies that reach it), else the terrain. p_strength < 0: the
+## brush's opposite (deflate, sharpen, lower...).
+func _dab(p_hit: Vector3, p_body: DensityBody3D, p_strength: float, p_mode: int) -> void:
+	var coloring := block == material_names.size()
+	var material: int = SculptTerrain.color_to_material(paint_color) if coloring else block
+	var copies := _symmetry_copies()
+	if p_mode == SculptTerrain.BRUSH_FLATTEN:
+		_pick_flatten_plane(p_hit, p_body)
+	# Each copy copies from (and lays strips along) its own mirror of it.
+	var offset: Vector3 = clone_offset if clone_offset != null else Vector3.ZERO
+	var direction := terrain.brush_stroke_direction
+	var indices := _body_copies(p_body, copies, p_hit) if p_body != null else _distinct_copies(copies, p_hit)
+	for i in indices:
+		var at: Vector3 = copies[i] * p_hit
+		terrain.brush_clone_offset = copies[i].basis * offset
+		terrain.brush_stroke_direction = copies[i].basis * direction
+		var planed := p_mode == SculptTerrain.BRUSH_FLATTEN and flatten_locked
+		if p_body != null:
+			# (Flattening a body to its own face: its own surface's, each dab.)
+			if planed and flatten_plane != FlattenPlane.FACE:
+				p_body.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
+			if p_mode == SculptTerrain.BRUSH_PAINT and coloring:
+				p_body.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
+			else:
+				p_body.apply_brush(at, brush_radius, p_strength, p_mode, material)
+			p_body.clear_flatten_plane()
+		elif p_mode == SculptTerrain.BRUSH_PAINT and coloring:
+			terrain.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
+		else:
+			if planed:
+				terrain.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
+			terrain.apply_brush(at, brush_radius, p_strength, p_mode, material)
+	terrain.brush_clone_offset = offset
+	terrain.brush_stroke_direction = direction
+
+## Flatten's plane, picked where the stroke begins (flatten_plane): the face
+## under the brush (moving onto another face, turned well away past a
+## corner, flattens that one; Shift keeps the first), the view, or square to
+## an axis (facing the side the ground there faces).
+func _pick_flatten_plane(p_hit: Vector3, p_body: DensityBody3D) -> void:
+	var here := _surface_normal(p_hit, p_body)
+	match flatten_plane:
+		FlattenPlane.FACE:
+			if not flatten_locked or (not Input.is_key_pressed(KEY_SHIFT) and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
+				flatten_locked = true
+				flatten_point = p_hit
+				flatten_normal = here
+		_:
+			if not flatten_locked:
+				flatten_locked = true
+				flatten_point = p_hit
+				if flatten_plane == FlattenPlane.VIEW:
+					flatten_normal = camera.global_basis.z
+				else:
+					var axis: Vector3 = [Vector3.RIGHT, Vector3.UP, Vector3.BACK][flatten_plane - FlattenPlane.AXIS_X]
+					flatten_normal = axis if axis.dot(here) >= 0.0 else -axis
+
+## The surface's outward normal at a point (the general lie of it, over half
+## the brush): the terrain's, or a body's.
+func _surface_normal(p_point: Vector3, p_body: DensityBody3D) -> Vector3:
+	if p_body == null:
+		return terrain.get_normal(p_point, brush_radius * 0.5)
+	var h := maxf(brush_radius * 0.5, 0.5)
+	var gradient := Vector3(
+			p_body.get_density_at(p_point + Vector3(h, 0, 0)) - p_body.get_density_at(p_point - Vector3(h, 0, 0)),
+			p_body.get_density_at(p_point + Vector3(0, h, 0)) - p_body.get_density_at(p_point - Vector3(0, h, 0)),
+			p_body.get_density_at(p_point + Vector3(0, 0, h)) - p_body.get_density_at(p_point - Vector3(0, 0, h)))
+	return -gradient.normalized() if gradient.length_squared() > 1e-10 else Vector3.UP
+
+## Where a line from p_from (along p_dir, up to p_length) meets p_body, or
+## the terrain if null. null if it doesn't.
+func _surface_along(p_from: Vector3, p_dir: Vector3, p_length: float, p_body: DensityBody3D):
+	if p_body != null:
+		var aimed := DensityBody3D.raycast_bodies(p_from, p_dir, p_length)
+		return aimed.position if not aimed.is_empty() and aimed.body == p_body else null
+	return terrain.raycast(p_from, p_dir, p_length)
+
+## Lazy mouse: the brush trails the crosshair's p_hit on a string (lazy_mouse
+## x 3 brush radii), kept on the surface as seen from the camera.
+func _lazy(p_hit: Vector3) -> Vector3:
+	if lazy_point == null:
+		lazy_point = p_hit
+		return p_hit
+	var length := lazy_mouse * brush_radius * 3.0
+	var d: Vector3 = p_hit - lazy_point
+	if d.length() > length:
+		lazy_point += d.normalized() * (d.length() - length)
+	var from := camera.global_position
+	var on = _surface_along(from, (lazy_point - from).normalized(), from.distance_to(lazy_point) + brush_radius * 2.0, target_body)
+	if on != null:
+		lazy_point = on
+	return lazy_point
+
+## Shift + click with a brush: a straight stroke from p_from (where the last
+## ended) to the crosshair, laid along the surface, as one undo step.
+const LINE_DAB := 1.0 / 30.0  # each dab's strength, in seconds of holding the brush
+func _brush_line(p_from: Vector3) -> void:
+	var from := camera.global_position
+	var look := -camera.global_basis.z
+	var to = terrain.raycast(from, look, reach)
+	var body: DensityBody3D = null
+	var aimed := DensityBody3D.raycast_bodies(from, look, reach if to == null else from.distance_to(to))
+	if not aimed.is_empty():
+		body = aimed.body
+		to = aimed.position
+	if to == null:
+		return
+	capture_click = true  # (the click isn't a stroke of its own too)
+	var mode: int = TOOL_MODES[tool]
+	var inverted := Input.is_key_pressed(KEY_ALT)
+	if inverted and mode == SculptTerrain.BRUSH_ADD:
+		mode = SculptTerrain.BRUSH_SUBTRACT
+		inverted = false
+	if mode == SculptTerrain.BRUSH_CLONE and clone_source != null and clone_offset == null:
+		clone_offset = clone_source - p_from
+	if to.distance_to(p_from) > 0.01:
+		terrain.brush_stroke_direction = (to - p_from).normalized()
+	terrain.begin_stroke()
+	if body != null:
+		_hold_body(body)
+	flatten_locked = false
+	var spacing := maxf(brush_radius * 0.25, 0.5)
+	var steps := maxi(ceili(p_from.distance_to(to) / spacing), 1)
+	for k in steps + 1:
+		var q: Vector3 = p_from.lerp(to, float(k) / steps)
+		var on = _surface_along(from, (q - from).normalized(), from.distance_to(q) + brush_radius * 2.0, body)
+		_dab(on if on != null else q, body, brush_strength * LINE_DAB * (-1.0 if inverted else 1.0), mode)
+	_release_held_body()
+	terrain.end_stroke()
+	terrain.clear_flatten_plane()
+	flatten_locked = false
+	stroke_end = to
+
+## Shift + click with Grab: the ground where the last grab ended pulled
+## to the crosshair, in one go.
+func _grab_line() -> void:
+	var from := camera.global_position
+	var look := -camera.global_basis.z
+	var to = terrain.raycast(from, look, reach)
+	if to == null:
+		to = from + look * from.distance_to(grab_end)
+	capture_click = true
+	var copies := _symmetry_copies()
+	var centers := PackedVector3Array()
+	var deltas := PackedVector3Array()
+	for i in _distinct_copies(copies, grab_end):
+		centers.append(copies[i] * grab_end)
+		deltas.append(copies[i].basis * (to - grab_end))
+	terrain.begin_stroke()
+	terrain.begin_grab()
+	terrain.warp(centers, deltas, brush_radius, true)
+	terrain.end_grab()
+	terrain.end_stroke()
+	grab_end = to
+
+## Ctrl + click with Clone: copies from here (the next stroke fixes where to).
+func _set_clone_source() -> void:
+	var from := camera.global_position
+	var look := -camera.global_basis.z
+	var hit = terrain.raycast(from, look, reach)
+	var aimed := DensityBody3D.raycast_bodies(from, look, reach if hit == null else from.distance_to(hit))
+	if not aimed.is_empty():
+		hit = aimed.position
+	capture_click = true
+	if hit == null:
+		return
+	clone_source = hit
+	clone_offset = null
+	_notify("Clone: copies from here; where your next stroke begins gets what's here")
+
+## Clone's marker: where the brush copies from (or the source, before the
+## first stroke).
+func _update_clone_marker(p_hit) -> void:
+	if clone_marker == null:
+		clone_marker = MeshInstance3D.new()
+		var mesh := SphereMesh.new()
+		mesh.radius = 1.0
+		mesh.height = 2.0
+		var look := StandardMaterial3D.new()
+		look.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		look.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		look.albedo_color = Color(1.0, 0.55, 0.15, 0.35)
+		look.no_depth_test = true
+		mesh.material = look
+		clone_marker.mesh = mesh
+		brush_preview.get_parent().add_child(clone_marker)
+	clone_marker.visible = p_hit != null and clone_source != null
+	if clone_marker.visible:
+		clone_marker.global_position = p_hit + clone_offset if clone_offset != null else clone_source
+		clone_marker.scale = Vector3.ONE * maxf(brush_radius * 0.3, 0.5)
+
+## The wheel eases the radius and strength to what it's set them to.
+func _ease_brush(delta: float) -> void:
+	var k := 1.0 - exp(-delta * 14.0)
+	if radius_target > 0.0:
+		brush_radius = lerpf(brush_radius, radius_target, k) if smooth_wheel else radius_target
+		if absf(brush_radius - radius_target) < 0.01:
+			brush_radius = radius_target
+			radius_target = -1.0
+	if strength_target > 0.0:
+		brush_strength = lerpf(brush_strength, strength_target, k) if smooth_wheel else strength_target
+		if absf(brush_strength - strength_target) < 0.01:
+			brush_strength = strength_target
+			strength_target = -1.0
+
+## The brush settings panel (N): on or off, freeing the mouse for it.
+## Removes every object in the world: balls, creatures, cut-off pieces,
+## imports, near or put away far off (not the floating piece, which is still
+## part of the ground). Other players see them go too (network.gd notices).
+## There's no undo for it. Returns how many went.
+func delete_all_objects() -> int:
+	var count := balls.unloaded.size()
+	balls.unloaded.clear()
+	if editor != null and editor.active:
+		editor.close()
+	gun_body = null
+	_clear_body_selection()
+	for parent in [balls, camera.get_parent()]:
+		for b in parent.get_children():
+			if b is DensityBody3D and not b is DensityCharacter3D and b.pickable and b != floating \
+					and not b.has_meta("net_avatar") and not b.is_queued_for_deletion():
+				if b == held_body:
+					_release_held_body()
+				balls.remove(b)
+				count += 1
+	return count
+
+func toggle_brush_panel() -> void:
+	brush_panel.visible = not brush_panel.visible
+	if brush_panel.visible:
+		brush_panel.refresh()
+	if vr == null or not vr.active:
+		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if brush_panel.visible else Input.MOUSE_MODE_CAPTURED
+	get_viewport().gui_release_focus()
+
+## The brush preview's shape: a ball, or a cube for the cube brush.
+func update_brush_preview_shape() -> void:
+	if terrain.brush_shape == 1:
+		if not brush_preview.mesh is BoxMesh:
+			var box := BoxMesh.new()
+			box.size = Vector3.ONE * 2.0
+			brush_preview.set_meta("sphere_mesh", brush_preview.mesh)
+			brush_preview.mesh = box
+	elif brush_preview.has_meta("sphere_mesh"):
+		brush_preview.mesh = brush_preview.get_meta("sphere_mesh")
+		brush_preview.remove_meta("sphere_mesh")
+
+## The brush settings (N), kept between sessions.
+func save_brush_settings() -> void:
+	var config := ConfigFile.new()
+	config.set_value("brush", "falloff", terrain.brush_falloff)
+	config.set_value("brush", "shape", terrain.brush_shape)
+	config.set_value("brush", "blocky", terrain.blocky_size)
+	config.set_value("brush", "blocky_on", blocky_size_on)
+	config.set_value("brush", "flatten_mode", terrain.flatten_mode)
+	config.set_value("brush", "flatten_plane", flatten_plane)
+	config.set_value("brush", "layer_height", terrain.brush_layer_height)
+	config.set_value("brush", "lazy_mouse", lazy_mouse)
+	config.set_value("brush", "smooth_wheel", smooth_wheel)
+	config.save(SETTINGS_PATH)
+
+func load_brush_settings() -> void:
+	var config := ConfigFile.new()
+	if config.load(SETTINGS_PATH) != OK:
+		return
+	terrain.brush_falloff = config.get_value("brush", "falloff", 0)
+	terrain.brush_shape = config.get_value("brush", "shape", 0)
+	terrain.blocky_size = config.get_value("brush", "blocky", 0)
+	blocky_size_on = config.get_value("brush", "blocky_on", 2)
+	terrain.flatten_mode = config.get_value("brush", "flatten_mode", 0)
+	flatten_plane = config.get_value("brush", "flatten_plane", FlattenPlane.FACE)
+	terrain.brush_layer_height = config.get_value("brush", "layer_height", 2.0)
+	lazy_mouse = config.get_value("brush", "lazy_mouse", 0.0)
+	smooth_wheel = config.get_value("brush", "smooth_wheel", true)
+	update_brush_preview_shape()
 
 func _begin_drag(p_hit: Vector3) -> void:
 	dragging = true
@@ -1311,6 +1659,8 @@ func _end_drag() -> void:
 	if dragging and tool == Tool.SNAKE_HOOK and drag_body == null:
 		snake_last = drag_start
 	if dragging and tool == Tool.GRAB:
+		if drag_body == null:
+			grab_end = camera.global_position - camera.global_basis.z * drag_distance  # (Shift + click pulls on from here)
 		if drag_body != null:
 			if is_instance_valid(drag_body):
 				drag_body.end_grab()
@@ -1770,7 +2120,10 @@ func _tool_hint() -> String:
 		Tool.SNAKE_HOOK:
 			return "Snake hook: Shift + click pulls a straight one from where the last ended"
 		Tool.FLATTEN:
-			return "Flatten: to the face under the brush (onto another face: that one; Shift keeps the first)"
+			var to: String = ["the face under the brush (onto another face: that one; Shift keeps the first)", "a plane facing you",
+					"a wall across x", "a floor", "a wall across z"][flatten_plane]
+			var how: String = ["", ", only filling up to it", ", only scraping down to it"][terrain.flatten_mode]
+			return "Flatten: to %s%s (Alt: away from it; N: plane and mode)" % [to, how]
 		Tool.ROTATE:
 			return "Rotate: hold on the ground or an object and move the mouse (Shift: roll about the view)"
 		Tool.SCALE:
@@ -1785,6 +2138,28 @@ func _tool_hint() -> String:
 				return "Box %d x %d x %d: let go to %s (wheel: far corner nearer / farther, RMB: give up)" % [size.x, size.y, size.z,
 					"cut it out" if Input.is_key_pressed(KEY_SHIFT) else "build it (Shift: cut it out)"]
 			return "Box: drag from one corner to the other (Shift when you let go: cut it out)"
+		Tool.SELECT_BOX:
+			if box_dragging:
+				var size := _box_size()
+				return "Select box %d x %d x %d: let go to %s (wheel: far corner nearer / farther, the other button: give up)" % [size.x, size.y, size.z,
+					"select what's inside" if box_select_add else "deselect what's inside"]
+			return "Select box: drag corner to corner, LMB selects what's inside (ground, or objects), RMB deselects"
+		Tool.LAYER:
+			return "Layer: raises the ground %.1f above where it was, however often you go over it (RMB / Alt: lowers; N: height)" % terrain.brush_layer_height
+		Tool.CLAY_STRIPS:
+			return "Clay strips: builds flat strips along the stroke, layer on layer (RMB / Alt: scrapes)"
+		Tool.CLONE:
+			if clone_source == null:
+				return "Clone: Ctrl + click where to copy from, then paint it on somewhere else"
+			return "Clone: copies from %s (Ctrl + click: from somewhere else)" % ("the orange ball" if clone_offset != null else "where you Ctrl + clicked, to where you begin")
+		Tool.DRAW:
+			return "Draw (RMB / Alt: carve; Shift + click: a straight stroke from the last; N: brush settings)"
+		Tool.SMOOTH:
+			return "Smooth (Alt: sharpen; Shift + click: a straight stroke from the last)"
+		Tool.PAINT:
+			return "Paint (Shift + click: a straight stroke from the last)"
+		Tool.GRAB:
+			return "Grab: drag the ground (Shift + click: pulls where the last grab ended to here)"
 		Tool.TRANSFORM:
 			if floating == null:
 				return "Transform: select something first"
@@ -2227,9 +2602,15 @@ func _import_to_paste() -> void:
 
 # --- Box ----------------------------------------------------------------------
 
-## LMB: the first corner, where the crosshair meets the ground.
+## LMB: the first corner, where the crosshair meets the ground. (Select
+## box: RMB too, taking away from the selection.)
 func _box_press(p_left: bool) -> void:
-	if not p_left:
+	if tool == Tool.SELECT_BOX:
+		if box_dragging:
+			box_dragging = false  # (the other button: give up)
+			return
+		box_select_add = p_left
+	elif not p_left:
 		box_dragging = false  # (RMB: give up)
 		return
 	var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
@@ -2276,14 +2657,38 @@ func _apply_box(p_cut: bool) -> void:
 		terrain.stamp_shape(shape, Transform3D.IDENTITY, _current_material(), false)
 	terrain.end_stroke()
 
+## Select box, let go: the ground inside the box selected (p_add) or not
+## any more. Bodies whose middles are inside are selected instead when no
+## ground is (the two aren't selected together).
+func _apply_box_select(p_add: bool) -> void:
+	var box := _box_bounds()
+	var shape := DensityShape.make_hull(_box_corners(), 0)
+	var before := terrain.get_selected_count()
+	terrain.select_inside_shape(shape, Transform3D.IDENTITY, p_add)
+	if not p_add:
+		for b in selected_bodies.duplicate():
+			if is_instance_valid(b) and box.has_point(b.global_position):
+				_select_body(b, false)
+		return
+	if terrain.get_selected_count() > before:
+		_clear_body_selection()
+		return
+	for b in camera.get_parent().get_children():
+		if b is DensityBody3D and not b is DensityCharacter3D and b != box_preview and b.pickable and box.has_point(b.global_position):
+			_select_body(b, true)
+
 ## While dragging a box: it's previewed as a body (rebuilt when it
 ## changes), and built (or cut out) when the button is let go.
 func _update_box() -> void:
-	if box_dragging and (tool != Tool.BOX or Input.mouse_mode != Input.MOUSE_MODE_CAPTURED):
+	if box_dragging and (not tool in [Tool.BOX, Tool.SELECT_BOX] or not _captured()):
 		box_dragging = false
-	if box_dragging and not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+	var box_button := MOUSE_BUTTON_LEFT if tool != Tool.SELECT_BOX or box_select_add else MOUSE_BUTTON_RIGHT
+	if box_dragging and not Input.is_mouse_button_pressed(box_button):
 		box_dragging = false
-		_apply_box(Input.is_key_pressed(KEY_SHIFT))
+		if tool == Tool.SELECT_BOX:
+			_apply_box_select(box_select_add)
+		else:
+			_apply_box(Input.is_key_pressed(KEY_SHIFT))
 	if not box_dragging:
 		if box_preview != null:
 			box_preview.queue_free()
@@ -2291,7 +2696,8 @@ func _update_box() -> void:
 			box_shown = PackedVector3Array()
 		return
 	var corners := _box_corners()
-	var cut := Input.is_key_pressed(KEY_SHIFT)
+	# (Select box: shown as a selection would be, or red taking away.)
+	var cut := Input.is_key_pressed(KEY_SHIFT) if tool == Tool.BOX else not box_select_add
 	var changed := corners.size() != box_shown.size() or cut != box_preview_cut
 	for i in mini(corners.size(), box_shown.size()):
 		changed = changed or corners[i].distance_to(box_shown[i]) > 0.05
@@ -2309,4 +2715,6 @@ func _update_box() -> void:
 		box_preview.global_transform = Transform3D.IDENTITY  # the hull is in world space
 	# A cut previews in red; a box in what it'll be made of.
 	var material := SculptTerrain.color_to_material(Color(0.95, 0.25, 0.2)) if cut else _current_material()
+	if tool == Tool.SELECT_BOX and not cut:
+		material = SculptTerrain.color_to_material(Color(0.3, 0.7, 1.0))
 	box_preview.shape = DensityShape.make_hull(corners, material)

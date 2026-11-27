@@ -41,8 +41,8 @@ func _action() -> String:
 	return WALK if walking and not freeze else IDLE
 
 
-func _forward() -> Vector3:
-	return global_basis.x
+func _model_forward() -> Vector3:
+	return Vector3.RIGHT
 
 
 func _ready() -> void:

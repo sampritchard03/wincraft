@@ -232,7 +232,7 @@ func _clickable(p_name: String, p_signal: Signal) -> void:
 
 ## Whether a point (in the HUD's viewport) is on one of its panels.
 func has_point(p_point: Vector2) -> bool:
-	var parts: Array = [status_panel, help_panel, world.color_panel]
+	var parts: Array = [status_panel, help_panel, world.color_panel, world.brush_panel]
 	parts.append_array(corner.get_children())
 	for slot in slots.values():
 		parts.append(slot.panel)
@@ -286,8 +286,12 @@ func _icon(p_texture: Texture2D, p_size: float) -> TextureRect:
 const HELP := [
 	["Tools", ""],
 	["Tab (hold)", "Tool wheel: point at a tool, let go to pick it (holding with the physics gun: turn it with the mouse)"],
-	["1 - 0", "Draw / Inflate, Smooth / Pinch, Flatten, Grab / Rotate / Scale, Snake hook, Paint, Select (paint / fill / geometry), Extrude / Transform, Physics gun, Geometry / Box (Shift: cut)"],
-	["LMB / RMB", "Sculpt / carve (Inflate, Pinch: the opposite)"],
+	["1 - 0", "Draw / Inflate / Clay strips / Layer, Smooth / Pinch, Flatten, Grab / Rotate / Scale, Snake hook, Paint / Clone, Select (paint / fill / geometry / box), Extrude / Transform, Physics gun, Geometry / Box (Shift: cut)"],
+	["LMB / RMB", "Sculpt / carve (Inflate, Pinch, Layer, Clay strips: the opposite)"],
+	["Alt + LMB", "Any brush the other way (Draw carves, Smooth sharpens, Flatten pushes away...)"],
+	["Shift + click", "A straight stroke from where the last ended (Grab: pulls that spot to here)"],
+	["Ctrl + click", "Clone: where to copy from"],
+	["N", "Brush settings: falloff, sphere / cube, blocky, Flatten's plane and mode, Layer height, lazy mouse; and Delete all objects"],
 	["Wheel", "Brush radius (Ctrl: strength, Shift: your size)"],
 	["Enter / Backspace", "Confirm (Shift+Enter: cut out) / clear the selection or points"],
 	["T", "Transform: move / rotate / scale"],
@@ -307,7 +311,7 @@ const HELP := [
 	["F / G / X", "Throw a ball / drop a frog or chiggin / remove the one aimed at"],
 	["Shift+G", "Frog or chiggin for G"],
 	["M", "Edit the object aimed at"],
-	["B", "Blocky mode"],
+	["B", "Blocky mode (its size: N)"],
 	["Ctrl+Z / Ctrl+Y", "Undo / redo (Ctrl+Shift+Z too)"],
 	["K / L", "Grow / shrink"],
 	["V", "Walk / freecam / orbit cam (WASD, Space / Shift: up / down; orbit: Alt+wheel zooms)"],

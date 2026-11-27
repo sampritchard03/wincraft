@@ -30,6 +30,8 @@ var kind_history: Dictionary = {}
 const HISTORY := 32
 ## Scene path -> the AnimationLibrary its creatures share.
 var kind_libraries: Dictionary = {}
+## Scene path -> its facing_offset (degrees, creature.gd): every one of the kind's.
+var kind_facing: Dictionary = {}
 ## Scene path -> {"shape": dict or null, "animation": BodyAnimation.to_dict()},
 ## loaded and not yet put on a creature of that kind.
 var loaded_kinds: Dictionary = {}
@@ -111,6 +113,7 @@ func _meet(p_body: DensityBody3D) -> void:
 			kind_shapes[path] = DensityShape.from_dict(saved.shape)
 		else:
 			kind_shapes[path] = p_body.shape
+		kind_facing[path] = float(saved.get("facing", p_body.get("facing_offset") if p_body.get("facing_offset") != null else 0.0))
 		if saved.get("animation") is Dictionary:
 			BodyAnimation.apply(p_body, saved.animation)  # (into the library every one of its kind shares)
 		var player := BodyAnimation.player_of(p_body)
@@ -118,6 +121,8 @@ func _meet(p_body: DensityBody3D) -> void:
 			kind_libraries[path] = player.get_animation_library("")
 	if p_body.get_meta("net_sim", true) and p_body.shape != kind_shapes[path]:
 		p_body.shape = kind_shapes[path]
+	if p_body.get("facing_offset") != null:
+		p_body.set("facing_offset", kind_facing.get(path, 0.0))
 	p_body.set_meta(META_SEEN, p_body.shape)
 
 
@@ -166,7 +171,7 @@ func to_save() -> Dictionary:
 	list.append_array(loaded_creatures)  # (not made yet: kept)
 	var kinds := loaded_kinds.duplicate()  # (kinds not met this time: kept as they were)
 	for path in kind_shapes:
-		var kind := {"shape": (kind_shapes[path] as DensityShape).to_dict()}
+		var kind := {"shape": (kind_shapes[path] as DensityShape).to_dict(), "facing": kind_facing.get(path, 0.0)}
 		var library: AnimationLibrary = kind_libraries.get(path)
 		if library != null:
 			var animations := {}
@@ -214,6 +219,17 @@ func restore_loaded(p_player: Vector3) -> void:
 ## keeps them there), or into the scene itself. Returns what it did, or
 ## what went wrong. (Only while running from the project: an exported
 ## game's files can't be written.)
+## Every one of a kind faces p_degrees off (creature.gd, facing_offset): here,
+## and for the other players unless p_from_network.
+func set_kind_facing(p_path: String, p_degrees: float, p_from_network := false) -> void:
+	kind_facing[p_path] = p_degrees
+	for body in all():
+		if body.scene_file_path == p_path and body.get("facing_offset") != null:
+			body.set("facing_offset", p_degrees)
+	if not p_from_network:
+		world.network.send_kind_facing(p_path, p_degrees)
+
+
 func save_as_default(p_body: DensityBody3D) -> String:
 	var path := p_body.scene_file_path
 	var scene := load(path) as PackedScene if path != "" else null
@@ -258,6 +274,8 @@ func save_as_default(p_body: DensityBody3D) -> String:
 				player.add_animation_library("", library)
 		else:
 			player.add_animation_library("", library)
+	if root.get("facing_offset") != null:
+		root.set("facing_offset", kind_facing.get(path, p_body.get("facing_offset")))
 	# The scene, with them.
 	root.scene_file_path = ""
 	var packed := PackedScene.new()

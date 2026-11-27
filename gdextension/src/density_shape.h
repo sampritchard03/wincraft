@@ -25,6 +25,9 @@ namespace godot {
 
 // sculpt_terrain.cpp's distance repair, for grids too (x fastest, then y, z).
 void density_redistance(std::vector<float> &r_values, const Vector3i &p_size);
+// Points that became solid (p_needs) with no ground next to them take the
+// material of the nearest that has one, through solid points (sculpt_terrain.cpp).
+void density_spread_materials(const Vector3i &p_size, const std::vector<float> &p_after, const std::vector<uint8_t> &p_needs, std::vector<MaterialId> &r_materials);
 
 // A small density grid that moves with a DensityBody3D: the body's shape,
 // drawn by the terrain's raymarcher and sculpted with the same brushes as the
@@ -335,6 +338,21 @@ private:
 	// points that were air and changed move as the nearest solid does, in
 	// every key with motion (what's added onto a part follows it).
 	void inherit_motion(const std::vector<float> &p_before, const Vector3i &p_lo, const Vector3i &p_hi);
+public:
+	// What a brush takes beyond its arguments, in grid units (the body sets
+	// them before each apply_brush(): DensityBody3D::apply_brush()).
+	struct BrushLocal {
+		bool plane_set = false; // Flatten: to this plane (else the surface's at the centre)
+		Vector3 plane_point, plane_normal;
+		Vector3 clone_offset; // Clone: copies from a point plus this
+		Vector3 stroke_direction; // Clay strips: along this
+		const std::vector<float> *layer_from = nullptr; // Layer: the grid as the stroke found it
+	} brush_local;
+
+private:
+	std::vector<float> layer_base;
+	uint32_t layer_serial = UINT32_MAX;
+	int layer_key = -2;
 	// A brush (apply_brush()'s modes) on one grid of this size: values and
 	// materials, centre in grid units. r_lo, r_hi: the points it may have
 	// changed. Returns whether anything changed.

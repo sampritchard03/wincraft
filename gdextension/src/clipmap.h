@@ -60,6 +60,12 @@ public:
 		Vector3i origin; // first texel, in world texels (world position / scale)
 		bool valid = false;
 		std::vector<uint8_t> texels; // TEXEL_BYTES per texel: density + 128, material (wrapped)
+		// Levels 1 and up: each texel's density as read from the world (+ 128,
+		// wrapped like texels), before fix_pending() lowered it.
+		std::vector<uint8_t> raw;
+		// Texels whose distances fix_pending() still has to work out again
+		// (world texels; fix_lo > fix_hi: none).
+		Vector3i fix_lo = Vector3i(1, 1, 1), fix_hi;
 		std::vector<uint8_t> layer_dirty; // per storage layer: changed since uploaded
 		// Where the GPU copy is placed. After a move it stays at the old origin
 		// until every changed layer is uploaded (see SculptTerrain); meanwhile
@@ -105,6 +111,14 @@ public:
 	bool has_pending_jobs() const;
 	// Re-reads the texels whose points lie in [p_min, p_max] after an edit there.
 	void refresh(VoxelWorld &r_world, const Vector3i &p_min, const Vector3i &p_max);
+	// Works out the distances refresh() and moves left to do (see
+	// start_fix()), once a frame: starts a pass per level with work on a
+	// worker thread and writes back those that finished. p_all: all of it
+	// now. Returns whether anything changed.
+	bool fix_pending(const VoxelWorld &p_world, bool p_all);
+	// How far a pass reaches: CLAMP texels, rounded up, and one
+	// more for the crossings next to them.
+	static constexpr int FIX_REACH = 9;
 
 	// Density stored for world texel p_texel of a level, in voxels (for tests).
 	float texel_value(const Level &p_level, const Vector3i &p_texel) const;
@@ -138,6 +152,23 @@ private:
 	int size = 128;
 	std::vector<Level> levels;
 	std::vector<std::unique_ptr<Job>> jobs; // per level, or null
+	// fix_pending()'s passes, one per level at a time, on a worker thread:
+	// the raw values needed are copied out first, and the result written
+	// back on the main thread a frame or so later.
+	struct FixJob {
+		Vector3i min, max; // the box asked for (world texels)
+		Vector3i a, n; // read: first texel, size
+		Vector3i wa, wb; // written: first and last texel
+		Vector3i origin; // the level's then (moved since: thrown away, asked again)
+		std::vector<uint8_t> raw; // the raw values read (+ 128)
+		int scale = 1, saturated = 0; // the level's; what "at least CLAMP voxels" reads as
+		Vector3i chunk0, chunk_n; // the chunks the read box covers...
+		std::vector<uint8_t> chunk_edited; // ...and which are edited
+		std::vector<int8_t> result; // per written texel
+		std::thread thread;
+		std::atomic<bool> finished{ false };
+	};
+	std::vector<std::unique_ptr<FixJob>> fix_jobs; // per level, or null
 
 	void start_job(int p_level, const Vector3i &p_target, const VoxelWorld &p_world, bool p_wait, int p_threads);
 	void finish_job(int p_level, VoxelWorld &r_world);
@@ -154,6 +185,27 @@ private:
 	// (wrapping) world's voxel box [p_min, p_max] inside texels [p_lo, p_hi].
 	template <typename F>
 	void for_each_repeat(const VoxelWorld &p_world, const Vector3i &p_min, const Vector3i &p_max, const Vector3i &p_lo, const Vector3i &p_hi, int p_scale, F p_function) const;
+	// Coarse levels (1 and up) near edits. An edited chunk's mips hold its
+	// points' densities, which stop at DENSITY_CLAMP voxels: a fraction of
+	// these levels' texels, so rays over sculpted ground far away crept
+	// along in short steps (running out of them: holes, and slow) and no
+	// brick there could be skipped. And generated texels next to an edit
+	// don't know about it. So texels within CLAMP texels of world texels
+	// [p_min, p_max] are worked out again from the raw ones around them:
+	// each gets the distance (in this level's texels, along a 26-neighbour
+	// path, a little short of the straight line) to the nearest crossing of
+	// the surface, where that is clearly less than it says; an edited
+	// chunk's "at least CLAMP voxels" gets that distance outright (CLAMP
+	// texels if there's none so near).
+	//
+	// Main thread: copies what a pass over [p_min, p_max] reads (null if
+	// nothing of it is in the level).
+	std::unique_ptr<FixJob> start_fix(Level &r_level, int p_level, const VoxelWorld &p_world, const Vector3i &p_min, const Vector3i &p_max);
+	// Any thread: the pass itself, from the copy only.
+	static void compute_fix(FixJob &r_job);
+	// Main thread: writes the result. Returns whether a brick's has_surface changed.
+	bool apply_fix(Level &r_level, const FixJob &p_job);
+	static void queue_fix(Level &r_level, const Vector3i &p_min, const Vector3i &p_max);
 	// Returns whether any brick's flag changed.
 	bool update_has_surface(Level &r_level, const Vector3i &p_min, const Vector3i &p_max);
 	void update_brick_distances(Level &r_level);

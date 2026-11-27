@@ -80,6 +80,8 @@ var loop_check: CheckBox
 var play_button: Button
 var timeline: Timeline
 var file_dialog: FileDialog
+var facing_row: HBoxContainer
+var facing_spin: SpinBox
 var updating_ui := false  # filling the panels in: their signals are ignored
 var seen_shape: DensityShape = null
 var seen_keys := -1
@@ -427,6 +429,17 @@ func _draw_center_of_mass() -> void:
 		line_mesh.surface_add_vertex(a)
 		line_mesh.surface_set_color(color)
 		line_mesh.surface_add_vertex(b)
+	# Which way it faces (a frog or chiggin): an arrow from the centre of mass.
+	if body.has_method("_forward"):
+		var forward: Vector3 = body._forward().normalized()
+		var length := size * 6.0
+		var tip := com + forward * length
+		var side := forward.cross(body.global_basis.y.normalized()).normalized() * size
+		for to in [com, tip - forward * size * 1.5 + side, tip - forward * size * 1.5 - side]:
+			line_mesh.surface_set_color(Color(1.0, 0.85, 0.1))
+			line_mesh.surface_add_vertex(tip if to != com else to)
+			line_mesh.surface_set_color(Color(1.0, 0.85, 0.1))
+			line_mesh.surface_add_vertex(to if to != com else tip)
 	line_mesh.surface_end()
 
 
@@ -490,6 +503,15 @@ func _make_panels() -> void:
 		if is_instance_valid(body):
 			body.auto_center_of_mass = on)
 	_button(box, "Centre of mass at the crosshair", _set_com_here)
+	facing_row = HBoxContainer.new()
+	box.add_child(facing_row)
+	facing_row.add_child(_label("Faces (degrees, the yellow arrow)"))
+	facing_spin = _spin(facing_row, -180.0, 180.0, 1.0, _set_facing)
+	facing_spin.tooltip_text = "Turns which way a frog or chiggin thinks it's facing (every one of its kind): for a model made facing another way"
+	for turn in [-90, 90]:
+		_button(facing_row, "%+d" % turn, func() -> void:
+			if is_instance_valid(body) and body.get("facing_offset") != null:
+				facing_spin.value = wrapf(body.facing_offset + turn, -180.0, 180.0))
 	autokey_check = _check(box, "Auto key the weight sliders", func(on: bool) -> void: auto_key = on)
 	autokey_check.set_pressed_no_signal(true)
 	# (Here, not along the bottom: that row is full.)
@@ -511,6 +533,7 @@ func _make_panels() -> void:
 	box.add_child(plays_select)
 	var files := HBoxContainer.new()
 	box.add_child(files)
+	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); on a frog or chiggin, every one of its kind. Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
 	_button(files, "Export model", _export_model)
 	_button(files, "Export scene", _export_scene)
 	make_default_button = _button(files, "Make game default", _make_default)
@@ -642,6 +665,14 @@ func _spin(p_box: Container, p_min: float, p_max: float, p_step: float, p_change
 
 ## The centre of mass where the crosshair goes through the body (it stops
 ## being automatic).
+func _set_facing(p_degrees: float) -> void:
+	if not is_instance_valid(body) or body.get("facing_offset") == null:
+		return
+	if body.scene_file_path != "":
+		world.creatures.set_kind_facing(body.scene_file_path, p_degrees)
+	else:
+		body.facing_offset = p_degrees
+
 func _set_com_here() -> void:
 	if not is_instance_valid(body):
 		return
@@ -675,6 +706,9 @@ func _refresh_ui() -> void:
 	if sculpt_target >= keys:
 		sculpt_target = -1
 	title_label.text = "Object editor: %s   (%d shape keys)" % [body.name, keys]
+	facing_row.visible = body.get("facing_offset") != null
+	if facing_row.visible:
+		facing_spin.set_value_no_signal(body.facing_offset)
 	edit_key_select.clear()
 	edit_key_select.add_item("All keys (the shape itself)", -1)
 	edit_key_select.add_item("Current key (%s)" % shape.get_key_label(current_key), -2)
@@ -901,6 +935,41 @@ func _make_default() -> void:
 func _export_model() -> void:
 	var shape: DensityShape = body.shape.duplicate_shape()
 	_open_dialog(FileDialog.FILE_MODE_SAVE_FILE, "*.res ; Density shape", func(path: String) -> void: _save(shape, path))
+
+## Replaces the body's model with a saved shape (an export, a Ctrl+P), as one
+## undo step. Its keys stay where the animations expect them: the shape's own
+## first, then any of the old one's past those, empty (named as before), to
+## sculpt again.
+func _import_model() -> void:
+	_open_dialog(FileDialog.FILE_MODE_OPEN_FILE, "*.res, *.tres ; Density shape", import_model_from)
+
+func import_model_from(path: String) -> void:
+	var loaded := load(path) as DensityShape
+	if loaded == null or not is_instance_valid(body):
+		notice = "%s isn't a density shape" % path.get_file()
+		notice_until = Time.get_ticks_msec() + 8000
+		return
+	var before: DensityShape = body.shape
+	var after: DensityShape = loaded.duplicate_shape()
+	var own := after.get_key_count()
+	var old := before.get_key_count() if before != null else 0
+	if own > 0:
+		for k in mini(own, old):
+			if after.get_key_name(k) == "" and before.get_key_name(k) != "":
+				after.set_key_name(k, before.get_key_name(k))
+		for k in range(own, old):
+			after.set_key_name(after.add_key(0.0), before.get_key_name(k))
+	body.shape = after
+	var weights: PackedFloat32Array = body.key_weights
+	weights.resize(after.get_key_count())
+	body.key_weights = weights
+	body.pose = minf(body.pose, maxf(after.get_key_count() - 1, 0))
+	world._push_history({"body": body, "before": before, "after": after,
+			"part_shapes": [], "part_transform": body.global_transform, "parts": []})
+	current_key = mini(current_key, maxi(after.get_key_count() - 1, 0))
+	notice = "Imported %s" % path.get_file() + (" (%d of its keys empty: sculpt them again)" % (old - own) if old > own and own > 0 else "")
+	notice_until = Time.get_ticks_msec() + 8000
+	_refresh_ui()
 
 func _export_animation() -> void:
 	var anim := _anim()

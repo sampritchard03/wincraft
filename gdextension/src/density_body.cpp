@@ -943,7 +943,19 @@ bool DensityBody3D::apply_brush(const Vector3 &p_center, double p_radius, double
 	}
 	const Transform3D t = get_global_transform();
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
-	const Vector3 local = t.affine_inverse().xform(p_center);
+	const Transform3D inv = t.affine_inverse();
+	const Vector3 local = inv.xform(p_center);
+	// The brush's settings in the shape's grid (its units: voxel_size).
+	DensityShape::BrushLocal &b = shape->brush_local;
+	const float vs = (float)shape->get_voxel_size();
+	const Vector3 origin = shape->get_origin();
+	b.plane_set = flatten_plane_set;
+	if (flatten_plane_set) {
+		b.plane_point = (inv.xform(flatten_point) - origin) / vs;
+		b.plane_normal = inv.basis.xform(flatten_normal).normalized();
+	}
+	b.clone_offset = inv.basis.xform(brush_options().clone_offset) / vs;
+	b.stroke_direction = inv.basis.xform(brush_options().stroke_direction);
 	const bool any = shape->apply_brush(local, p_radius / s, p_strength / s, p_mode, p_material, edit_key, pose, key_weights);
 	if (any) {
 		inertia_dirty = true;
@@ -1152,6 +1164,8 @@ void DensityBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_edit_key", "key"), &DensityBody3D::set_edit_key);
 	ClassDB::bind_method(D_METHOD("get_edit_key"), &DensityBody3D::get_edit_key);
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material"), &DensityBody3D::apply_brush, DEFVAL(-1));
+	ClassDB::bind_method(D_METHOD("set_flatten_plane", "point", "normal"), &DensityBody3D::set_flatten_plane);
+	ClassDB::bind_method(D_METHOD("clear_flatten_plane"), &DensityBody3D::clear_flatten_plane);
 	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness"), &DensityBody3D::paint_color);
 	ClassDB::bind_method(D_METHOD("raycast", "from", "direction", "max_distance"), &DensityBody3D::raycast);
 	ClassDB::bind_method(D_METHOD("begin_grab"), &DensityBody3D::begin_grab);

@@ -25,6 +25,7 @@ auto_center_of_mass = false
 center_of_mass = Vector3(0.5, -5, 0)
 drawn = true
 script = ExtResource("2_script")
+facing_offset = -142.0
 
 [node name="AnimationPlayer" type="AnimationPlayer" parent="." unique_id=1164557582]
 libraries/ = SubResource("AnimationLibrary_chiggin")

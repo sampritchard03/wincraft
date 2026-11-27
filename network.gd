@@ -985,6 +985,19 @@ func _kind_shape(p_scene: String, p_shape: Dictionary) -> void:
 		return
 	world.creatures.take_kind_shape(p_scene, DensityShape.from_dict(p_shape))
 
+## A kind of creature's facing changed here (creatures.gd, set_kind_facing()).
+func send_kind_facing(p_scene: String, p_degrees: float) -> void:
+	if mode == Mode.OFFLINE or not ready_for_bodies or multiplayer.get_peers().is_empty():
+		return
+	_kind_facing.rpc(p_scene, p_degrees)
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _kind_facing(p_scene: String, p_degrees: float) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_kind_facing.bind(p_scene, p_degrees))
+		return
+	world.creatures.set_kind_facing(p_scene, p_degrees, true)
+
 func _update_bodies(p_delta: float, p_k: float) -> void:
 	scan_timer += p_delta
 	if scan_timer >= SCAN_INTERVAL:
