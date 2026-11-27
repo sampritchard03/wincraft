@@ -275,6 +275,9 @@ public:
 
 	// For tests and profiling.
 	int64_t take_upload_bytes();
+	// The slowest time (ms) each part of update_view() took since the last
+	// call, and how many layers went up in all (for finding hitches).
+	Dictionary take_view_times();
 	Vector3i get_clip_origin(int p_level) const;
 	// What level p_level holds at texel p_texel (0..clip_size-1 from its
 	// origin): the density in voxels, and the brick distance.
@@ -383,7 +386,7 @@ private:
 	int clip_size = 256;
 	int clip_levels = 3;
 	// 109, 218, 436, 872, 1744, 3488, 6976, 13952
-	double view_distance = 436.0;
+	double view_distance = 872.0;
 	int thread_count = 0; // 0 = one per CPU core
 	double simulation_radius = 160.0;
 	int blocky_size = 0;
@@ -392,6 +395,15 @@ private:
 	void snap_to_blocks(const Vector3i &lo, const Vector3i &hi, const Vector3i &rlo, const Vector3i &n,
 			const std::vector<float> &before, std::vector<float> &after, std::vector<MaterialId> &materials_after) const;
 	int frames_since_unload = 0;
+	// See take_view_times(): per part, the slowest since the last take.
+	enum ViewPart { VIEW_FOLLOW, VIEW_FIX, VIEW_DISTANCES, VIEW_UPLOAD, VIEW_LOAD, VIEW_UNLOAD, VIEW_BODIES, VIEW_SELECTION, VIEW_SAVE, VIEW_PART_COUNT };
+	double view_times[VIEW_PART_COUNT] = {};
+	int64_t layers_uploaded = 0;
+	// The upload's parts: this frame's (summed over levels), and the slowest
+	// frame's since take_view_times().
+	enum UploadPart { UPLOAD_BRICKS, UPLOAD_PACK, UPLOAD_GPU, UPLOAD_BIND, UPLOAD_OTHER, UPLOAD_PART_COUNT };
+	double upload_ms[UPLOAD_PART_COUNT] = {};
+	double upload_ms_max[UPLOAD_PART_COUNT] = {};
 	// Color painting (see paint_color()).
 	std::vector<Color> material_colors;
 	// Per chunk (wrapped) the current stroke has painted: how much coverage
@@ -480,16 +492,20 @@ private:
 	Ref<Texture2DArray> clip_textures[MAX_CLIP_LEVELS];
 	Ref<Texture2DArray> brick_texture; // all levels' brick distances (see Clipmap)
 	int64_t upload_bytes = 0;
-	// Texture layers (z slices) uploaded per frame at most.
-	static constexpr int LAYERS_PER_FRAME = 64;
+	// Time spent uploading texture layers (z slices) a frame, roughly: at
+	// least one batch goes up each frame, then more while under this.
+	static constexpr double UPLOAD_BUDGET_MS = 2.5;
+	// Layers packed side by side (on worker threads) before going up.
+	static constexpr int UPLOAD_BATCH = 8;
 	std::chrono::steady_clock::time_point last_save = std::chrono::steady_clock::now();
 	uint32_t brush_strokes = 0; // varies the rounding dither between strokes
 
 	int worker_count() const;
-	// Uploads up to r_budget changed layers of a level (all, if it has no
-	// texture yet) and publishes its new origin once none are left. Returns
+	// Uploads a level's changed layers until p_deadline (all, if it has no
+	// texture yet; at least one batch a frame: r_uploaded says whether one
+	// went up yet) and publishes its new origin once none are left. Returns
 	// whether the material needs updating.
-	bool upload_level(int p_level, int &r_budget);
+	bool upload_level(int p_level, std::chrono::steady_clock::time_point p_deadline, bool &r_uploaded);
 	// Sends the textures and level placement to the material.
 	void bind_material();
 	void report_world_error(const String &p_what);

@@ -883,13 +883,93 @@ int VoxelWorld::load_near(const Vector3 &p_center, float p_radius, double p_budg
 	}
 	std::sort(wanted.begin(), wanted.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
 	int loaded = 0;
-	for (const auto &entry : wanted) {
-		loaded_chunk(entry.second);
-		loaded++;
-		if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() >= p_budget_ms) {
-			break;
+	// A finished background batch: take in what still wants it (a chunk may
+	// have been loaded on demand, or edited, meanwhile).
+	if (load_batch && load_batch->finished) {
+		load_batch->thread.join();
+		LoadBatch &batch = *load_batch;
+		for (size_t i = 0; i < batch.chunks.size(); i++) {
+			Chunk *chunk = chunk_at(batch.chunks[i]);
+			// Loaded on demand meanwhile, or edited since it was generated.
+			if (chunk == nullptr || chunk->loaded || (bool)chunk->edited != (bool)batch.edited[i]) {
+				continue;
+			}
+			if (batch.edited[i]) {
+				if (!batch.read_ok[i]) {
+					loaded_chunk(batch.chunks[i]); // here, with its error and fallback
+					loaded++;
+					continue;
+				}
+				chunk->full = std::move(batch.made[i].full);
+				chunk->full_materials = std::move(batch.made[i].full_materials);
+				repair_doubled(*chunk);
+			} else {
+				chunk->uniform_density = batch.made[i].uniform_density;
+				chunk->uniform_material = batch.made[i].uniform_material;
+				chunk->full = std::move(batch.made[i].full);
+				chunk->full_materials = std::move(batch.made[i].full_materials);
+			}
+			chunk->loaded = true;
+			note_loaded(batch.chunks[i]);
+			loaded++;
 		}
+		load_batch.reset();
 	}
+	// The next unloaded chunks, nearest first, go to a new batch if none is
+	// running: generated or (edited) read from the save, all on its thread,
+	// so neither the noise nor a slow disk holds up a frame.
+	if (!load_batch && !wanted.empty()) {
+		std::unique_ptr<LoadBatch> batch = std::make_unique<LoadBatch>();
+		const bool terrain = settings.world_type == WORLD_TERRAIN;
+		for (const auto &entry : wanted) {
+			if ((int)batch->chunks.size() >= LOAD_BATCH) {
+				break;
+			}
+			const Vector3i c = entry.second;
+			const bool edited = chunk_at(c)->edited;
+			batch->chunks.push_back(c);
+			batch->edited.push_back(edited);
+			int column = -1;
+			if (terrain && !edited) {
+				const Vector3i w = wrap_chunk(c);
+				const Vector3i key(w.x, 0, w.z);
+				for (size_t k = 0; k < batch->columns.size() && column < 0; k++) {
+					if (batch->columns[k] == key) {
+						column = (int)k;
+					}
+				}
+				if (column < 0) {
+					column = (int)batch->columns.size();
+					batch->columns.push_back(key);
+				}
+			}
+			batch->column_of.push_back(column);
+		}
+		const size_t count = batch->chunks.size();
+		batch->made.resize(count);
+		batch->read_ok.assign(count, 0);
+		batch->infos.resize(batch->columns.size());
+		LoadBatch *raw = batch.get();
+		raw->thread = std::thread([this, raw, terrain]() {
+			const int threads = std::clamp((int)std::thread::hardware_concurrency() / 2, 1, 4);
+			parallel_for((int)raw->columns.size(), threads, [&](int k) {
+				column_info(raw->columns[k].x, raw->columns[k].z, raw->infos[k]);
+			});
+			parallel_for((int)raw->chunks.size(), threads, [&](int i) {
+				Chunk &made = raw->made[i];
+				if (raw->edited[i]) {
+					raw->read_ok[i] = read_full(raw->chunks[i], made.full, made.full_materials);
+				} else if (terrain) {
+					generate_terrain_chunk(raw->chunks[i], raw->infos[raw->column_of[i]], made);
+				} else {
+					generate_chunk(raw->chunks[i], made);
+				}
+			});
+			raw->finished = true;
+		});
+		load_batch = std::move(batch);
+	}
+	(void)p_budget_ms;
 	return loaded;
 }
 
@@ -925,14 +1005,16 @@ void VoxelWorld::unload_far(const Vector3 &p_center, float p_radius) {
 			loaded_set.erase(c);
 		}
 	}
+	// Written in the background; a chunk's points are let go once its
+	// region's write is done (a later call), so reading it back never finds
+	// the old file.
+	poll_writes();
 	for (const Vector3i &region : to_save) {
-		if (!write_region(region)) {
-			return; // keep everything in memory rather than lose edits
-		}
+		queue_region_write(region);
 	}
 	for (const Vector3i &c : far) {
 		Chunk &chunk = *chunk_at(c);
-		if (chunk.dirty) {
+		if (chunk.dirty || pending_writes.count(region_of(c))) {
 			continue;
 		}
 		chunk.full = std::vector<int8_t>();
@@ -1309,8 +1391,12 @@ bool VoxelWorld::adopt_dir(const String &p_dir) {
 			DirAccess::remove_absolute(target.path_join(name));
 		}
 	}
+	stop_writer(); // (writes for the old directory, if any)
 	dir = target;
-	region_files.clear();
+	{
+		std::lock_guard<std::mutex> lock(region_lock);
+		region_files.clear();
+	}
 	if (!write_settings()) {
 		dir = String();
 		return false;
@@ -1375,7 +1461,22 @@ bool VoxelWorld::open(const String &p_dir, int p_threads) {
 	return ok;
 }
 
+void VoxelWorld::wait_load_batch() {
+	if (load_batch && load_batch->thread.joinable()) {
+		load_batch->thread.join();
+	}
+	load_batch.reset();
+}
+
+VoxelWorld::~VoxelWorld() {
+	wait_load_batch();
+	stop_writer();
+}
+
 void VoxelWorld::close() {
+	wait_load_batch();
+	stop_writer();
+	pending_writes.clear();
 	chunks.clear();
 	{
 		std::lock_guard<std::mutex> lock(loaded_lock);
@@ -1467,45 +1568,63 @@ void VoxelWorld::repair_doubled(Chunk &r_chunk) const {
 	repaired_chunks++;
 }
 
-bool VoxelWorld::load_full(const Vector3i &p_unwrapped_chunk, Chunk &r_chunk) const {
+bool VoxelWorld::read_full(const Vector3i &p_unwrapped_chunk, std::vector<int8_t> &r_full, std::vector<MaterialId> &r_materials) const {
 	// Saved by the chunk's own coordinates, whichever repeat of the world it
 	// was reached in.
 	const Vector3i p_chunk = wrap_chunk(p_unwrapped_chunk);
 	const Vector3i r = region_of(p_chunk);
 	const Vector3i l = p_chunk - r * REGION;
 	const int local = (l.z * REGION + l.y) * REGION + l.x;
-	const RegionIndex *index = cached_region_index(r);
-	if (index == nullptr) {
-		last_error = "Could not read " + region_path(r);
+	PackedByteArray compressed;
+	int version = 0;
+	{
+		// The index and the read together: a save replaces the file and
+		// forgets its index under the same lock.
+		std::lock_guard<std::mutex> lock(region_lock);
+		const RegionIndex *index = cached_region_index(r);
+		if (index == nullptr) {
+			return false;
+		}
+		for (const RegionEntry &e : index->entries) {
+			if (e.local != local) {
+				continue;
+			}
+			Ref<FileAccess> file = FileAccess::open(region_path(r), FileAccess::READ);
+			if (file.is_null()) {
+				return false;
+			}
+			file->seek(e.full_offset);
+			compressed = file->get_buffer(e.full_size);
+			version = index->version;
+			break;
+		}
+	}
+	if (version == 0) {
 		return false;
 	}
-	for (const RegionEntry &e : index->entries) {
-		if (e.local != local) {
-			continue;
-		}
-		Ref<FileAccess> file = FileAccess::open(region_path(r), FileAccess::READ);
-		if (file.is_null()) {
-			break;
-		}
-		const int64_t expected = (int64_t)chunk_bytes_size(CHUNK_POINTS, index->version);
-		file->seek(e.full_offset);
-		const PackedByteArray full = file->get_buffer(e.full_size).decompress(expected, COMPRESSION);
-		if (full.size() != expected) {
-			break;
-		}
-		r_chunk.full.resize(CHUNK_POINTS);
-		r_chunk.full_materials.resize(CHUNK_POINTS);
-		std::memcpy(r_chunk.full.data(), full.ptr(), CHUNK_POINTS);
-		if (index->version >= 2) {
-			read_stored_materials(full.ptr(), CHUNK_POINTS, index->version, r_chunk.full_materials.data());
-		} else {
-			generate_materials(p_chunk, r_chunk.full_materials.data());
-		}
-		repair_doubled(r_chunk);
-		return true;
+	const int64_t expected = (int64_t)chunk_bytes_size(CHUNK_POINTS, version);
+	const PackedByteArray full = compressed.decompress(expected, COMPRESSION);
+	if (full.size() != expected) {
+		return false;
 	}
-	last_error = "Damaged chunk in " + region_path(r);
-	return false;
+	r_full.resize(CHUNK_POINTS);
+	r_materials.resize(CHUNK_POINTS);
+	std::memcpy(r_full.data(), full.ptr(), CHUNK_POINTS);
+	if (version >= 2) {
+		read_stored_materials(full.ptr(), CHUNK_POINTS, version, r_materials.data());
+	} else {
+		generate_materials(p_chunk, r_materials.data());
+	}
+	return true;
+}
+
+bool VoxelWorld::load_full(const Vector3i &p_unwrapped_chunk, Chunk &r_chunk) const {
+	if (!read_full(p_unwrapped_chunk, r_chunk.full, r_chunk.full_materials)) {
+		last_error = "Could not read chunk in " + region_path(region_of(wrap_chunk(p_unwrapped_chunk)));
+		return false;
+	}
+	repair_doubled(r_chunk);
+	return true;
 }
 
 void VoxelWorld::load_region(const Vector3i &p_region) {
@@ -1548,100 +1667,182 @@ void VoxelWorld::load_region(const Vector3i &p_region) {
 	}
 }
 
-bool VoxelWorld::write_region(const Vector3i &p_region) {
+void VoxelWorld::queue_region_write(const Vector3i &p_region) {
 	if (dir.is_empty()) {
-		return false;
+		return;
 	}
-	const String path = region_path(p_region);
-	PackedByteArray table, blobs;
-	uint32_t count = 0;
-	std::vector<Chunk *> written;
-	std::vector<int8_t> density;
-	std::vector<MaterialId> materials;
-	// Every edited chunk of the region is written whole: load those that
-	// aren't in memory (from the old file, before it's replaced).
-	for (int local = 0; local < REGION * REGION * REGION; local++) {
-		const Vector3i c = p_region * REGION + Vector3i(local % REGION, local / REGION % REGION, local / (REGION * REGION));
-		const Chunk *chunk = chunk_at(c);
-		if (chunk != nullptr && chunk->edited && !chunk->loaded && wrap_chunk(c) == c) {
-			loaded_chunk(c);
-		}
-	}
+	RegionWrite job;
+	job.region = p_region;
+	job.path = region_path(p_region);
 	for (int local = 0; local < REGION * REGION * REGION; local++) {
 		const Vector3i c = p_region * REGION + Vector3i(local % REGION, local / REGION % REGION, local / (REGION * REGION));
 		Chunk *chunk = chunk_at(c);
 		if (chunk == nullptr || !chunk->edited || wrap_chunk(c) != c) {
 			continue;
 		}
-		const int8_t *d = chunk->full.data();
-		const MaterialId *m = chunk->full_materials.data();
-		if (chunk->uniform()) {
-			density.assign(CHUNK_POINTS, chunk->uniform_density);
-			materials.assign(CHUNK_POINTS, chunk->uniform_material);
-			d = density.data();
-			m = materials.data();
+		RegionWrite::Entry e;
+		e.chunk = c;
+		e.local = local;
+		e.mips = chunk->mips;
+		e.mip_materials = chunk->mip_materials;
+		if (!chunk->loaded) {
+			e.from_file = true; // never dirty: what's in the file is current
+		} else if (chunk->uniform()) {
+			e.full.assign(CHUNK_POINTS, chunk->uniform_density);
+			e.full_materials.assign(CHUNK_POINTS, chunk->uniform_material);
+		} else {
+			e.full = chunk->full;
+			e.full_materials = chunk->full_materials;
 		}
-		const PackedByteArray full = chunk_bytes(d, m, CHUNK_POINTS).compress(COMPRESSION);
-		const PackedByteArray mips = chunk_bytes(chunk->mips.data(), chunk->mip_materials.data(), MIP_BYTES).compress(COMPRESSION);
-		table.push_back((uint8_t)(local & 0xFF));
-		table.push_back((uint8_t)(local >> 8));
+		chunk->dirty = false; // dirty again if the write fails (poll_writes())
+		job.entries.push_back(std::move(e));
+	}
+	if (job.entries.empty()) {
+		return;
+	}
+	pending_writes[p_region]++;
+	{
+		std::lock_guard<std::mutex> lock(write_mutex);
+		write_queue.push_back(std::move(job));
+		if (!writer.joinable()) {
+			writer_stopping = false;
+			writer = std::thread([this]() { writer_loop(); });
+		}
+	}
+	write_wake.notify_one();
+}
+
+void VoxelWorld::writer_loop() {
+	std::unique_lock<std::mutex> lock(write_mutex);
+	while (true) {
+		write_wake.wait(lock, [&] { return writer_stopping || !write_queue.empty(); });
+		if (write_queue.empty()) {
+			return; // stopping, and nothing left
+		}
+		RegionWrite job = std::move(write_queue.front());
+		write_queue.pop_front();
+		writer_busy = true;
+		lock.unlock();
+		const bool ok = write_region_now(job);
+		lock.lock();
+		writer_busy = false;
+		if (!ok) {
+			failed_writes.push_back({ job.region, "Could not write " + job.path });
+		}
+		finished_writes.push_back(job.region);
+		write_done.notify_all();
+	}
+}
+
+bool VoxelWorld::write_region_now(RegionWrite &r_write) {
+	PackedByteArray table, blobs;
+	uint32_t count = 0;
+	for (RegionWrite::Entry &e : r_write.entries) {
+		if (e.from_file && !read_full(e.chunk, e.full, e.full_materials)) {
+			return false; // rather than drop the chunk from the region
+		}
+		const PackedByteArray full = chunk_bytes(e.full.data(), e.full_materials.data(), CHUNK_POINTS).compress(COMPRESSION);
+		const PackedByteArray mips = chunk_bytes(e.mips.data(), e.mip_materials.data(), MIP_BYTES).compress(COMPRESSION);
+		table.push_back((uint8_t)(e.local & 0xFF));
+		table.push_back((uint8_t)(e.local >> 8));
 		table.push_back(0);
 		table.push_back(0);
 		put_u32(table, (uint32_t)full.size());
 		put_u32(table, (uint32_t)mips.size());
 		blobs.append_array(full);
 		blobs.append_array(mips);
-		written.push_back(chunk);
 		count++;
-	}
-	if (count == 0) {
-		return true;
 	}
 	PackedByteArray out;
 	put_u32(out, REGION_MAGIC);
 	put_u32(out, count);
 	out.append_array(table);
 	out.append_array(blobs);
-
 	// Write a temporary file, then rename it over the old one: a crash leaves
-	// either the old region or the new one, never half of each.
-	const String tmp = path + String(".tmp");
+	// either the old region or the new one, never half of each. Under
+	// region_lock: a background read mustn't use the old index on the new file.
+	std::lock_guard<std::mutex> lock(region_lock);
+	const String tmp = r_write.path + String(".tmp");
 	{
 		Ref<FileAccess> file = FileAccess::open(tmp, FileAccess::WRITE);
 		if (file.is_null() || !file->store_buffer(out)) {
-			last_error = "Could not write " + tmp;
 			return false;
 		}
 		file->flush();
 	}
-	if (DirAccess::rename_absolute(tmp, path) != OK) {
-		last_error = "Could not replace " + path;
+	if (DirAccess::rename_absolute(tmp, r_write.path) != OK) {
 		return false;
 	}
-	for (Chunk *chunk : written) {
-		chunk->dirty = false;
-	}
-	region_files.insert(p_region);
-	region_index.erase(p_region); // the offsets changed
+	region_files.insert(r_write.region);
+	region_index.erase(r_write.region); // the offsets changed
 	return true;
 }
 
-bool VoxelWorld::save() {
-	std::unordered_set<Vector3i, Vector3iHash> dirty_regions;
-	for (int iy = 0; iy < chunk_counts.y; iy++) {
-		for (int iz = 0; iz < chunk_counts.z; iz++) {
-			for (int ix = 0; ix < chunk_counts.x; ix++) {
-				if (chunks[chunk_index(Vector3i(ix, iy, iz))].dirty) {
-					dirty_regions.insert(region_of(Vector3i(ix, iy + y_min() / CHUNK, iz)));
-				}
+bool VoxelWorld::poll_writes() {
+	std::vector<Vector3i> finished;
+	std::vector<std::pair<Vector3i, String>> failed;
+	{
+		std::lock_guard<std::mutex> lock(write_mutex);
+		finished.swap(finished_writes);
+		failed.swap(failed_writes);
+	}
+	for (const Vector3i &r : finished) {
+		auto it = pending_writes.find(r);
+		if (it != pending_writes.end() && --it->second <= 0) {
+			pending_writes.erase(it);
+		}
+	}
+	for (const auto &[region, error] : failed) {
+		last_error = error;
+		// Its chunks get written again next time.
+		for (int local = 0; local < REGION * REGION * REGION; local++) {
+			Chunk *chunk = chunk_at(region * REGION + Vector3i(local % REGION, local / REGION % REGION, local / (REGION * REGION)));
+			if (chunk != nullptr && chunk->edited) {
+				chunk->dirty = true;
 			}
 		}
 	}
-	bool ok = true;
-	for (const Vector3i &r : dirty_regions) {
-		ok &= write_region(r);
+	return failed.empty();
+}
+
+void VoxelWorld::flush_writes() {
+	if (writer.joinable()) {
+		std::unique_lock<std::mutex> lock(write_mutex);
+		write_done.wait(lock, [&] { return write_queue.empty() && !writer_busy; });
 	}
-	return ok;
+}
+
+void VoxelWorld::stop_writer() {
+	if (!writer.joinable()) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(write_mutex);
+		writer_stopping = true;
+	}
+	write_wake.notify_all();
+	writer.join(); // after writing what's queued
+	poll_writes();
+}
+
+bool VoxelWorld::save(bool p_wait) {
+	// Only edited chunks are ever dirty: going through those, not every
+	// chunk of the world (4 million by default: a 35 ms hitch each autosave).
+	std::unordered_set<Vector3i, Vector3iHash> dirty_regions;
+	for (const Vector3i &c : edited_list) {
+		const Chunk *chunk = chunk_at(c);
+		if (chunk != nullptr && chunk->dirty) {
+			dirty_regions.insert(region_of(c));
+		}
+	}
+	for (const Vector3i &r : dirty_regions) {
+		queue_region_write(r);
+	}
+	if (!p_wait) {
+		return poll_writes();
+	}
+	flush_writes();
+	return poll_writes();
 }
 
 void VoxelWorld::set_change_tracking(bool p_on) {
@@ -1700,8 +1901,9 @@ int VoxelWorld::get_loaded_chunk_count() const {
 
 int VoxelWorld::get_dirty_chunk_count() const {
 	int count = 0;
-	for (const Chunk &chunk : chunks) {
-		count += chunk.dirty;
+	for (const Vector3i &c : edited_list) {
+		const Chunk *chunk = chunk_at(c);
+		count += chunk != nullptr && chunk->dirty;
 	}
 	return count;
 }
