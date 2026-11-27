@@ -15,7 +15,7 @@ _data = {
 &"chiggin_walk": ExtResource("4_walk")
 }
 
-[node name="Chiggin" type="DensityBody3D"]
+[node name="Chiggin" type="DensityBody3D" unique_id=1336257053]
 shape = ExtResource("1_shape")
 bounce = 0.2
 gravity_scale = 0.212
@@ -26,5 +26,5 @@ center_of_mass = Vector3(0.5, -5, 0)
 drawn = true
 script = ExtResource("2_script")
 
-[node name="AnimationPlayer" type="AnimationPlayer" parent="."]
+[node name="AnimationPlayer" type="AnimationPlayer" parent="." unique_id=1164557582]
 libraries/ = SubResource("AnimationLibrary_chiggin")
