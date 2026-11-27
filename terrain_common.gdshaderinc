@@ -121,8 +121,8 @@ LEVEL_SAMPLER(level7, clip_texture7, 7.0, 128.0)
 // (solid points count more: the surface belongs to them) for its kind of
 // material, a block or "colored", and the kind with the most weight wins.
 // The boundary then runs where the votes balance, a smooth curve between
-// the points. Colors blend: a colored result is the vote-weighted average of
-// the colored points, so painted gradients come out smooth.
+// the points. A colored result's color is not blended: the colored point
+// with the most weight gives it (nearest filtering), so paint stays crisp.
 #define MATERIAL_LEVEL(L, TEX, SCALE) \
 if (clip_count > L && reach <= clip_reach * SCALE && inside((p - clip_origin[L]) / SCALE, clip_extent[L])) { \
 	vec3 w = p / SCALE; \
@@ -157,11 +157,15 @@ if (clip_count > L && reach <= clip_reach * SCALE && inside((p - clip_origin[L])
 	if (best < 128) { \
 		return vec4(float(best), 0.0, 0.0, 0.0); \
 	} \
-	vec3 sum = vec3(0.0); \
+	vec3 nearest = vec3(0.0); \
+	float nearest_vote = -1.0; \
 	for (int k = 0; k < 8; k++) { \
-		sum += kinds[k] == 128 ? colors[k] * votes[k] : vec3(0.0); \
+		if (kinds[k] == 128 && votes[k] > nearest_vote) { \
+			nearest_vote = votes[k]; \
+			nearest = colors[k]; \
+		} \
 	} \
-	return vec4(-1.0, sum / max(best_votes, 1e-6)); \
+	return vec4(-1.0, nearest); \
 }
 vec4 material_at(vec3 p) {
 	vec3 rel = abs(p - view_position);

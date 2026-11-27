@@ -404,6 +404,18 @@ private:
 	enum UploadPart { UPLOAD_BRICKS, UPLOAD_PACK, UPLOAD_GPU, UPLOAD_BIND, UPLOAD_OTHER, UPLOAD_PART_COUNT };
 	double upload_ms[UPLOAD_PART_COUNT] = {};
 	double upload_ms_max[UPLOAD_PART_COUNT] = {};
+	// apply_brush()'s parts: summed over this frame's dabs, and the slowest
+	// frame's since take_view_times().
+	enum BrushPart { BRUSH_T_READ, BRUSH_T_BRUSH, BRUSH_T_MASK, BRUSH_T_REDISTANCE, BRUSH_T_WRITE, BRUSH_T_REFRESH, BRUSH_T_MARK, BRUSH_PART_COUNT };
+	double brush_frame_ms[BRUSH_PART_COUNT] = {};
+	double brush_max_ms[BRUSH_PART_COUNT] = {};
+	int brush_frame_dabs = 0, brush_max_dabs = 0;
+	std::chrono::steady_clock::time_point brush_t;
+	void brush_lap(BrushPart p_part) {
+		const auto now = std::chrono::steady_clock::now();
+		brush_frame_ms[p_part] += std::chrono::duration<double, std::milli>(now - brush_t).count();
+		brush_t = now;
+	}
 	// Color painting (see paint_color()).
 	std::vector<Color> material_colors;
 	// Per chunk (wrapped) the current stroke has painted: how much coverage
@@ -505,7 +517,8 @@ private:
 	// texture yet; at least one batch a frame: r_uploaded says whether one
 	// went up yet) and publishes its new origin once none are left. Returns
 	// whether the material needs updating.
-	bool upload_level(int p_level, std::chrono::steady_clock::time_point p_deadline, bool &r_uploaded);
+	// p_min_priority: only layers marked at least this (see Clipmap::Level::layer_dirty).
+	bool upload_level(int p_level, std::chrono::steady_clock::time_point p_deadline, bool &r_uploaded, uint8_t p_min_priority);
 	// Sends the textures and level placement to the material.
 	void bind_material();
 	void report_world_error(const String &p_what);

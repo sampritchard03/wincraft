@@ -123,11 +123,15 @@ vec4 grid_material(int i, vec3 q_point) {
 	if (best < 128) {
 		return vec4(float(best), 0.0, 0.0, 0.0);
 	}
-	vec3 sum = vec3(0.0);
+	vec3 nearest = vec3(0.0);
+	float nearest_vote = -1.0;
 	for (int k = 0; k < 8; k++) {
-		sum += kinds[k] == 128 ? colors[k] * votes[k] : vec3(0.0);
+		if (kinds[k] == 128 && votes[k] > nearest_vote) {
+			nearest_vote = votes[k];
+			nearest = colors[k];
+		}
 	}
-	return vec4(-1.0, sum / max(best_votes, 1e-6));
+	return vec4(-1.0, nearest);
 }
 
 // Where the ray ro + rd * t is inside grid body i's bounding sphere: false

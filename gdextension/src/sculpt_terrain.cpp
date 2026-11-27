@@ -58,10 +58,13 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 	std::vector<uint8_t> crossing((size_t)tx * ty * tz, 0);
 	auto tile = [&](int x, int y, int z) { return ((size_t)(z / T) * ty + y / T) * tx + x / T; };
 
-	// Seeds: points next to a crossing.
+	// Seeds: points next to a crossing. A slice of z per task: it writes its
+	// own points and the next slice's, so even slices go first, then odd
+	// ones (no two tasks write the same point).
 	const size_t step[3] = { 1, (size_t)nx, (size_t)nx * ny };
 	const ptrdiff_t pstep[3] = { 1, psy, psz };
-	for (int z = 0; z < nz; z++) {
+	for (int parity = 0; parity < 2; parity++) WorkerPool::get().run((nz - parity + 1) / 2, [&](int k) {
+		const int z = k * 2 + parity;
 		for (int y = 0; y < ny; y++) {
 			for (int x = 0; x < nx; x++) {
 				const size_t i = at(x, y, z);
@@ -80,10 +83,17 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 					const float t = v / (v - w); // crossing, from this point
 					dist[pi] = std::min(dist[pi], t);
 					dist[pi + pstep[a]] = std::min(dist[pi + pstep[a]], 1.0f - t);
+				}
+			}
+		}
+	});
+	// Tiles with surface: those with a seed (both ends of a crossing are).
+	for (int z = 0; z < nz; z++) {
+		for (int y = 0; y < ny; y++) {
+			const float *row = &dist[pat(0, y, z)];
+			for (int x = 0; x < nx; x++) {
+				if (row[x] < INF) {
 					crossing[tile(x, y, z)] = 1;
-					int q[3] = { x, y, z };
-					q[a]++;
-					crossing[tile(q[0], q[1], q[2])] = 1;
 				}
 			}
 		}
@@ -107,8 +117,9 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 		}
 	}
 	// Refine the seeds with value / slope, which is closer for surfaces at an
-	// angle to the grid.
-	for (int z = 1; z + 1 < nz; z++) {
+	// angle to the grid (each point on its own: slices side by side).
+	WorkerPool::get().run(std::max(nz - 2, 0), [&](int k) {
+		const int z = k + 1;
 		for (int y = 1; y + 1 < ny; y++) {
 			for (int x = 1; x + 1 < nx; x++) {
 				const ptrdiff_t pi = pat(x, y, z);
@@ -125,7 +136,7 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 				}
 			}
 		}
-	}
+	});
 	// Two passes over the 13 neighbours before / after each point, in
 	// active tiles only (inactive ones stay "infinitely far", which is fine:
 	// any path through them is longer than CLAMP).
@@ -179,7 +190,7 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 			}
 		}
 	}
-	for (int z = 0; z < nz; z++) {
+	WorkerPool::get().run(nz, [&](int z) {
 		for (int y = 0; y < ny; y++) {
 			for (int x = 0; x < nx; x++) {
 				float &v = r_values[at(x, y, z)];
@@ -187,7 +198,7 @@ void redistance(std::vector<float> &r_values, const Vector3i &p_size) {
 				v = v > 0.0f ? e : -e;
 			}
 		}
-	}
+	});
 }
 
 // Points that became solid (p_needs) with no ground next to them to take a
@@ -413,6 +424,13 @@ void SculptTerrain::update_view(const Vector3 &p_camera_position, bool p_wait) {
 	if (!opened) {
 		return;
 	}
+	// This frame's brush dabs (applied before this call) into the slowest.
+	for (int i = 0; i < BRUSH_PART_COUNT; i++) {
+		brush_max_ms[i] = std::max(brush_max_ms[i], brush_frame_ms[i]);
+		brush_frame_ms[i] = 0.0;
+	}
+	brush_max_dabs = std::max(brush_max_dabs, brush_frame_dabs);
+	brush_frame_dabs = 0;
 	auto t = std::chrono::steady_clock::now();
 	auto lap = [&](ViewPart p_part) {
 		const auto now = std::chrono::steady_clock::now();
@@ -437,8 +455,11 @@ void SculptTerrain::update_view(const Vector3 &p_camera_position, bool p_wait) {
 								 : std::chrono::steady_clock::now() + std::chrono::microseconds((int64_t)(UPLOAD_BUDGET_MS * 1000.0));
 	bool uploaded = false;
 	std::fill(std::begin(upload_ms), std::end(upload_ms), 0.0);
-	for (int l = 0; l < clipmap.get_level_count(); l++) {
-		changed |= upload_level(l, deadline, uploaded);
+	// Layers an edit or fix changed first (every level), then moves'.
+	for (uint8_t priority : { (uint8_t)2, (uint8_t)1 }) {
+		for (int l = 0; l < clipmap.get_level_count(); l++) {
+			changed |= upload_level(l, deadline, uploaded, priority);
+		}
 	}
 	{
 		const auto before = std::chrono::steady_clock::now();
@@ -478,7 +499,7 @@ void SculptTerrain::update_view(const Vector3 &p_camera_position, bool p_wait) {
 	lap(VIEW_SAVE);
 }
 
-bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_point p_deadline, bool &r_uploaded) {
+bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_point p_deadline, bool &r_uploaded, uint8_t p_min_priority) {
 	Clipmap::Level &level = clipmap.level(p_level);
 	if (!level.valid) {
 		return false;
@@ -495,21 +516,39 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 		r_ms += std::chrono::duration<double, std::milli>(now - t).count();
 		t = now;
 	};
-	if (level.bricks_dirty) {
-		const int nb = clipmap.get_brick_count();
-		const int64_t brick_layer_bytes = (int64_t)nb * nb;
+	const int nb = clipmap.get_brick_count();
+	const int64_t brick_layer_bytes = (int64_t)nb * nb;
+	auto any_layer_dirty = [&]() {
+		return std::any_of(level.layer_dirty.begin(), level.layer_dirty.end(), [](uint8_t d) { return d != 0; });
+	};
+	// Brick distances: the least of old and new while texels are still
+	// going up (see Clipmap::Level::bricks_gpu), exact otherwise.
+	auto upload_bricks = [&](bool p_conservative) {
+		if (level.bricks_gpu.size() != level.bricks.size()) {
+			level.bricks_gpu.assign(level.bricks.size(), 0); // blank GPU texels: no skipping yet
+		}
 		PackedByteArray bytes;
 		bytes.resize(brick_layer_bytes);
 		for (int z = 0; z < nb; z++) {
 			if (z < (int)level.brick_layers_dirty.size() && !level.brick_layers_dirty[z]) {
 				continue;
 			}
-			std::memcpy(bytes.ptrw(), &level.bricks[(size_t)z * brick_layer_bytes], brick_layer_bytes);
+			uint8_t *gpu = &level.bricks_gpu[(size_t)z * brick_layer_bytes];
+			const uint8_t *now = &level.bricks[(size_t)z * brick_layer_bytes];
+			for (int64_t i = 0; i < brick_layer_bytes; i++) {
+				gpu[i] = p_conservative ? std::min(gpu[i], now[i]) : now[i];
+			}
+			std::memcpy(bytes.ptrw(), gpu, brick_layer_bytes);
 			brick_texture->update_layer(Image::create_from_data(nb, nb, false, Image::FORMAT_R8, bytes), p_level * nb + z);
 			upload_bytes += brick_layer_bytes;
 		}
 		std::fill(level.brick_layers_dirty.begin(), level.brick_layers_dirty.end(), 0);
 		level.bricks_dirty = false;
+	};
+	if (level.bricks_dirty && p_min_priority == 2) {
+		const bool pending = any_layer_dirty();
+		upload_bricks(pending);
+		level.bricks_conservative |= pending;
 	}
 	lap(upload_ms[UPLOAD_BRICKS]);
 	// Changed layers go up a batch at a time: packed side by side on worker
@@ -526,7 +565,7 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 		}
 		int count = 0;
 		for (; z < n && count < UPLOAD_BATCH; z++) {
-			if (level.layer_dirty[z]) {
+			if (level.layer_dirty[z] >= p_min_priority) {
 				batch[count++] = z;
 			}
 		}
@@ -564,7 +603,14 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 		layers_uploaded += count;
 		r_uploaded = true;
 	}
-	const bool all_up = std::find(level.layer_dirty.begin(), level.layer_dirty.end(), 1) == level.layer_dirty.end();
+	const bool all_up = !any_layer_dirty();
+	if (all_up && level.bricks_conservative) {
+		// Every layer is up: the exact distances (skipping as far as they can).
+		std::fill(level.brick_layers_dirty.begin(), level.brick_layers_dirty.end(), 1);
+		upload_bricks(false);
+		level.bricks_conservative = false;
+		lap(upload_ms[UPLOAD_BRICKS]);
+	}
 	if (all_up && (!level.published || level.published_origin != level.origin)) {
 		level.published_origin = level.origin;
 		level.published = true;
@@ -640,6 +686,13 @@ Dictionary SculptTerrain::take_view_times() {
 		times[upload_names[i]] = upload_ms_max[i];
 		upload_ms_max[i] = 0.0;
 	}
+	static const char *const brush_names[BRUSH_PART_COUNT] = { "brush.read", "brush.brush", "brush.mask", "brush.redistance", "brush.write", "brush.refresh", "brush.mark" };
+	for (int i = 0; i < BRUSH_PART_COUNT; i++) {
+		times[brush_names[i]] = brush_max_ms[i];
+		brush_max_ms[i] = 0.0;
+	}
+	times["brush.dabs"] = (double)brush_max_dabs;
+	brush_max_dabs = 0;
 	times["layers"] = layers_uploaded;
 	layers_uploaded = 0;
 	return times;
@@ -1345,6 +1398,8 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 	}
 	const BrushOptions &options = brush_options();
 	const float r = (float)p_radius, s = (float)p_strength, C = DENSITY_CLAMP;
+	brush_t = std::chrono::steady_clock::now();
+	brush_frame_dabs++;
 	// Points the brush rewrites ("edit box"): adding or carving a sphere also
 	// changes the distances out to CLAMP around it. Clay strips' squares
 	// turn with the stroke: their corners reach sqrt(2) radii.
@@ -1367,6 +1422,7 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 	std::vector<MaterialId> materials_before(before.size());
 	world.read_points(rlo, rhi, before.data(), worker_count(), materials_before.data());
 	read_exact(rlo, rhi, n, before); // (this stroke's unrounded values)
+	brush_lap(BRUSH_T_READ);
 	std::vector<float> after = before;
 	std::vector<MaterialId> materials_after = materials_before;
 	std::vector<uint8_t> needs_material; // see spread_materials()
@@ -1553,6 +1609,7 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 	if (!needs_material.empty()) {
 		spread_materials(n, after, needs_material, materials_after);
 	}
+	brush_lap(BRUSH_T_BRUSH);
 
 	// Repair: make every point of the edit box hold its true distance to the
 	// surface again (signed, clamped to CLAMP), whatever the brush (or an
@@ -1577,9 +1634,11 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 	// (Blocks are always repaired: snapping set them apart from what's
 	// around them.)
 	const bool snapped = blocky_size >= 2 && p_mode != BRUSH_PAINT;
+	brush_lap(BRUSH_T_MASK);
 	if (snapped || (p_mode != BRUSH_PAINT && p_mode != BRUSH_SMOOTH && p_mode != BRUSH_LAYER && p_mode != BRUSH_CLAY)) {
 		redistance(after, n);
 	}
+	brush_lap(BRUSH_T_REDISTANCE);
 
 	commit_edit(lo, hi, rlo, n, before, after, brushed, true, materials_before, materials_after);
 	select_grown(grown);
@@ -1707,6 +1766,7 @@ void SculptTerrain::snap_to_blocks(const Vector3i &lo, const Vector3i &hi, const
 void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Vector3i &rlo, const Vector3i &n,
 		const std::vector<float> &before, const std::vector<float> &after, const std::vector<uint8_t> &brushed, bool p_dither,
 		const std::vector<MaterialId> &materials_before, const std::vector<MaterialId> &materials_after) {
+	brush_t = std::chrono::steady_clock::now(); // (timing: other tools call this too)
 	auto index = [&](int x, int y, int z) { return ((size_t)(z - rlo.z) * n.y + (y - rlo.y)) * n.x + (x - rlo.x); };
 	// Quantize to 1/16-voxel steps and find what changed: only chunks with
 	// changes are written (and so become edited chunks), and the clipmap is
@@ -1746,13 +1806,13 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 		const int R = (int)std::ceil(DENSITY_CLAMP) + 1;
 		const int sizes[3] = { n.x, n.y, n.z };
 		const size_t strides[3] = { 1, (size_t)n.x, (size_t)n.x * n.y };
-		std::vector<uint8_t> line;
 		for (int a = 0; a < 3; a++) {
 			std::vector<uint8_t> next(reachable.size(), 0);
 			const int len = sizes[a];
-			line.assign(len, 0);
 			const int b = (a + 1) % 3, c = (a + 2) % 3;
-			for (int j = 0; j < sizes[c]; j++) {
+			// Every line on its own: the planes of lines side by side.
+			WorkerPool::get().run(sizes[c], [&](int j) {
+				std::vector<uint8_t> line(len, 0);
 				for (int i = 0; i < sizes[b]; i++) {
 					const size_t base = (size_t)i * strides[b] + (size_t)j * strides[c];
 					// Distance to the nearest marked point along this line, both ways.
@@ -1771,7 +1831,7 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 						next[base + k * strides[a]] = line[k] || last - k <= R;
 					}
 				}
-			}
+			});
 			reachable.swap(next);
 		}
 	}
@@ -1785,9 +1845,43 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 	// (stroke_exact, read back by read_exact()) and round plainly: what a
 	// dab leaves short of a whole step the next one carries on from.
 	const int CHE = VoxelWorld::CHUNK;
-	Vector3i exact_chunk(INT32_MIN, 0, 0);
-	std::vector<float> *exact = nullptr;
-	for (int z = lo.z; z <= hi.z; z++) {
+	// The stroke's exact values of each chunk with brushed points, made
+	// here first so the loop below can run on worker threads.
+	std::vector<std::vector<float> *> exact_of(chunk_changed.size(), nullptr);
+	if (p_dither) {
+		for (int cz = c0.z; cz <= c1.z; cz++) {
+			for (int cy = c0.y; cy <= c1.y; cy++) {
+				for (int cx = c0.x; cx <= c1.x; cx++) {
+					const Vector3i c(cx, cy, cz);
+					bool any = false;
+					for (int z = std::max(c.z * CHE, lo.z); z <= std::min(c.z * CHE + CHE - 1, hi.z) && !any; z++) {
+						for (int y = std::max(c.y * CHE, lo.y); y <= std::min(c.y * CHE + CHE - 1, hi.y) && !any; y++) {
+							for (int x = std::max(c.x * CHE, lo.x); x <= std::min(c.x * CHE + CHE - 1, hi.x) && !any; x++) {
+								any = brushed[index(x, y, z)] != 0;
+							}
+						}
+					}
+					if (!any) {
+						continue;
+					}
+					auto [it, made] = stroke_exact.try_emplace(world.wrap_chunk(c));
+					if (made) {
+						it->second.assign(VoxelWorld::CHUNK_POINTS, NAN);
+					}
+					exact_of[chunk_slot(c)] = &it->second;
+				}
+			}
+		}
+	}
+	// A slice of z per task, each with its own changed chunks and box.
+	const int slices = hi.z - lo.z + 1;
+	std::vector<std::vector<uint8_t>> slice_changed(slices);
+	std::vector<std::pair<Vector3i, Vector3i>> slice_box(slices, { hi, lo });
+	WorkerPool::get().run(slices, [&](int k) {
+		const int z = lo.z + k;
+		std::vector<uint8_t> &changed = slice_changed[k];
+		changed.assign(chunk_changed.size(), 0);
+		Vector3i &box_lo = slice_box[k].first, &box_hi = slice_box[k].second;
 		for (int y = lo.y; y <= hi.y; y++) {
 			for (int x = lo.x; x <= hi.x; x++) {
 				const size_t i = index(x, y, z);
@@ -1796,15 +1890,8 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 					steps = std::nearbyint(after[i] * 16.0f);
 					if (p_dither) {
 						const Vector3i c = VoxelWorld::chunk_of(x, y, z);
-						if (c != exact_chunk || exact == nullptr) {
-							exact_chunk = c;
-							auto [it, made] = stroke_exact.try_emplace(world.wrap_chunk(c));
-							if (made) {
-								it->second.assign(VoxelWorld::CHUNK_POINTS, NAN);
-							}
-							exact = &it->second;
-						}
-						(*exact)[((size_t)(z - c.z * CHE) * CHE + (y - c.y * CHE)) * CHE + (x - c.x * CHE)] = std::clamp(after[i], -DENSITY_CLAMP, DENSITY_CLAMP);
+						std::vector<float> &exact = *exact_of[chunk_slot(c)];
+						exact[((size_t)(z - c.z * CHE) * CHE + (y - c.y * CHE)) * CHE + (x - c.x * CHE)] = std::clamp(after[i], -DENSITY_CLAMP, DENSITY_CLAMP);
 					}
 				} else if (reachable[i] && ((after[i] > 0.0f) != (before[i] > 0.0f) || std::abs(after[i]) < std::abs(before[i]) - REPAIR_TOLERANCE || ghost(before[i], after[i]))) {
 					steps = std::nearbyint(after[i] * 16.0f);
@@ -1814,11 +1901,21 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 				const int8_t q = (int8_t)std::clamp(steps, (float)-DENSITY_LIMIT, (float)DENSITY_LIMIT);
 				quantized[i] = q;
 				if (q != (int8_t)std::lround(before[i] * 16.0f) || materials_after[i] != materials_before[i]) {
-					chunk_changed[chunk_slot(VoxelWorld::chunk_of(x, y, z))] = 1;
-					changed_lo = Vector3i(std::min(changed_lo.x, x), std::min(changed_lo.y, y), std::min(changed_lo.z, z));
-					changed_hi = Vector3i(std::max(changed_hi.x, x), std::max(changed_hi.y, y), std::max(changed_hi.z, z));
+					changed[chunk_slot(VoxelWorld::chunk_of(x, y, z))] = 1;
+					box_lo = Vector3i(std::min(box_lo.x, x), std::min(box_lo.y, y), std::min(box_lo.z, z));
+					box_hi = Vector3i(std::max(box_hi.x, x), std::max(box_hi.y, y), std::max(box_hi.z, z));
 				}
 			}
+		}
+	});
+	for (int k = 0; k < slices; k++) {
+		for (size_t c = 0; c < chunk_changed.size(); c++) {
+			chunk_changed[c] |= slice_changed[k][c];
+		}
+		const auto &[box_lo, box_hi] = slice_box[k];
+		if (box_lo.x <= box_hi.x) {
+			changed_lo = Vector3i(std::min(changed_lo.x, box_lo.x), std::min(changed_lo.y, box_lo.y), std::min(changed_lo.z, box_lo.z));
+			changed_hi = Vector3i(std::max(changed_hi.x, box_hi.x), std::max(changed_hi.y, box_hi.y), std::max(changed_hi.z, box_hi.z));
 		}
 	}
 	brush_strokes++;
@@ -1827,6 +1924,7 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 	}
 	const int CH = VoxelWorld::CHUNK;
 	std::vector<Vector3i> created;
+	std::vector<Vector3i> mip_chunks;
 	for (int cz = c0.z; cz <= c1.z; cz++) {
 		for (int cy = c0.y; cy <= c1.y; cy++) {
 			for (int cx = c0.x; cx <= c1.x; cx++) {
@@ -1857,18 +1955,26 @@ void SculptTerrain::commit_edit(const Vector3i &lo, const Vector3i &hi, const Ve
 						}
 					}
 				}
-				world.update_mips(c);
+				mip_chunks.push_back(c);
 			}
 		}
 	}
+	// Each chunk's mips from its own points only: side by side.
+	WorkerPool::get().run((int)mip_chunks.size(), [&](int i) {
+		world.update_mips(mip_chunks[i]);
+	});
+	brush_lap(BRUSH_T_WRITE);
 	clipmap.refresh(world, changed_lo, changed_hi);
+	brush_lap(BRUSH_T_REFRESH);
 	mark_edited(changed_lo, changed_hi);
+	brush_lap(BRUSH_T_MARK);
 	// A newly edited chunk's coarse levels now come from its mips rather
 	// than the generator: refresh it whole, once.
 	const int CHUNK_LAST = VoxelWorld::CHUNK - 1;
 	for (const Vector3i &c : created) {
 		clipmap.refresh(world, c * VoxelWorld::CHUNK, c * VoxelWorld::CHUNK + Vector3i(CHUNK_LAST, CHUNK_LAST, CHUNK_LAST));
 	}
+	brush_lap(BRUSH_T_REFRESH);
 }
 
 // --- Grab and snake hook ----------------------------------------------------------

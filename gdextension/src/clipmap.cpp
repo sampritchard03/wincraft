@@ -100,15 +100,18 @@ int Clipmap::brick_value(const Level &p_level, const Vector3i &p_texel) const {
 	return p_level.bricks[brick_index(Vector3i(floor_div(p_texel.x, BRICK), floor_div(p_texel.y, BRICK), floor_div(p_texel.z, BRICK)))];
 }
 
-void Clipmap::mark_layers(Level &r_level, int p_z0, int p_z1) {
+void Clipmap::mark_layers(Level &r_level, int p_z0, int p_z1, uint8_t p_priority) {
 	// The GPU layer for slice z also holds slice z + 1's densities (see
 	// SculptTerrain::upload_level()), so the slice below changes too.
 	if (p_z1 - p_z0 + 2 >= size) {
-		std::fill(r_level.layer_dirty.begin(), r_level.layer_dirty.end(), 1);
+		for (uint8_t &d : r_level.layer_dirty) {
+			d = std::max(d, p_priority);
+		}
 		return;
 	}
 	for (int z = p_z0 - 1; z <= p_z1; z++) {
-		r_level.layer_dirty[wrap(z, size)] = 1;
+		uint8_t &d = r_level.layer_dirty[wrap(z, size)];
+		d = std::max(d, p_priority);
 	}
 }
 
@@ -186,7 +189,7 @@ bool Clipmap::write_texels(Level &r_level, int p_level, VoxelWorld &r_world, con
 			}
 		}
 	}
-	mark_layers(r_level, p_min.z, p_max.z);
+	mark_layers(r_level, p_min.z, p_max.z, 2);
 	return update_has_surface(r_level, p_min, p_max);
 }
 
@@ -307,59 +310,91 @@ void Clipmap::refresh(VoxelWorld &r_world, const Vector3i &p_min, const Vector3i
 // --- Bricks ----------------------------------------------------------------------
 
 void Clipmap::update_brick_distances(Level &r_level) {
-	// Breadth-first search over the 26 neighbours, in the level's own brick
-	// coordinates, gives the Chebyshev distance.
+	// The Chebyshev distance (in bricks, capped at MAX_BRICK_DISTANCE) to the
+	// nearest brick with surface, in the level's own brick coordinates. Two
+	// sweeps over the 13 neighbours before / after each brick, each step 1,
+	// give it exactly for this metric; a 1-brick border of "far" means no
+	// bounds checks. (A breadth-first search with a queue took several ms a
+	// level.)
 	const int nb = size / BRICK;
 	const Vector3i first(floor_div(r_level.origin.x, BRICK), floor_div(r_level.origin.y, BRICK), floor_div(r_level.origin.z, BRICK));
-	auto local_index = [nb](int x, int y, int z) { return ((size_t)z * nb + y) * nb + x; };
 	if (r_level.brick_layers_dirty.size() != (size_t)nb) {
 		r_level.brick_layers_dirty.assign(nb, 1);
 	}
-	std::vector<uint8_t> distance((size_t)nb * nb * nb, MAX_BRICK_DISTANCE);
-	std::vector<int> queue;
+	const int p = nb + 2;
+	const ptrdiff_t psy = p, psz = (ptrdiff_t)p * p;
+	std::vector<uint8_t> d((size_t)p * p * p, MAX_BRICK_DISTANCE);
+	auto pat = [&](int x, int y, int z) { return (z + 1) * psz + (y + 1) * psy + (x + 1); };
+	// Storage rows wrap: their starts once per row, x stepped.
+	const int wx0 = wrap(first.x, nb);
 	for (int z = 0; z < nb; z++) {
 		for (int y = 0; y < nb; y++) {
+			const size_t row = ((size_t)wrap(first.z + z, nb) * nb + wrap(first.y + y, nb)) * nb;
+			uint8_t *out = &d[pat(0, y, z)];
+			int wx = wx0;
 			for (int x = 0; x < nb; x++) {
-				if (r_level.has_surface[brick_index(first + Vector3i(x, y, z))]) {
-					distance[local_index(x, y, z)] = 0;
-					queue.push_back((int)local_index(x, y, z));
+				if (r_level.has_surface[row + wx]) {
+					out[x] = 0;
+				}
+				if (++wx == nb) {
+					wx = 0;
 				}
 			}
 		}
 	}
-	for (size_t head = 0; head < queue.size(); head++) {
-		const int i = queue[head];
-		const int x = i % nb, y = i / nb % nb, z = i / (nb * nb);
-		const uint8_t next = distance[i] + 1;
-		if (next >= MAX_BRICK_DISTANCE) {
-			continue;
-		}
-		for (int dz = -1; dz <= 1; dz++) {
-			for (int dy = -1; dy <= 1; dy++) {
-				for (int dx = -1; dx <= 1; dx++) {
-					const int nx = x + dx, ny = y + dy, nz = z + dz;
-					if (nx < 0 || ny < 0 || nz < 0 || nx >= nb || ny >= nb || nz >= nb) {
-						continue;
-					}
-					const size_t j = local_index(nx, ny, nz);
-					if (distance[j] > next) {
-						distance[j] = next;
-						queue.push_back((int)j);
-					}
+	ptrdiff_t offset[13];
+	int count = 0;
+	for (int dz = -1; dz <= 0; dz++) {
+		for (int dy = -1; dy <= 1; dy++) {
+			for (int dx = -1; dx <= 1; dx++) {
+				if (dz == 0 && (dy > 0 || (dy == 0 && dx >= 0))) {
+					continue;
 				}
+				offset[count++] = dz * psz + dy * psy + dx;
 			}
 		}
 	}
+	uint8_t *dd = d.data();
 	for (int z = 0; z < nb; z++) {
 		for (int y = 0; y < nb; y++) {
+			uint8_t *q = dd + pat(0, y, z);
+			for (int x = 0; x < nb; x++, q++) {
+				int best = *q;
+				for (int k = 0; k < 13; k++) {
+					best = std::min(best, q[offset[k]] + 1);
+				}
+				*q = (uint8_t)std::min(best, (int)MAX_BRICK_DISTANCE);
+			}
+		}
+	}
+	for (int z = nb - 1; z >= 0; z--) {
+		for (int y = nb - 1; y >= 0; y--) {
+			uint8_t *q = dd + pat(nb - 1, y, z);
+			for (int x = nb - 1; x >= 0; x--, q--) {
+				int best = *q;
+				for (int k = 0; k < 13; k++) {
+					best = std::min(best, q[-offset[k]] + 1);
+				}
+				*q = (uint8_t)std::min(best, (int)MAX_BRICK_DISTANCE);
+			}
+		}
+	}
+	// Write back (wrapped), noting the storage layers that changed.
+	for (int z = 0; z < nb; z++) {
+		const int layer = wrap(first.z + z, nb);
+		for (int y = 0; y < nb; y++) {
+			const size_t row = ((size_t)layer * nb + wrap(first.y + y, nb)) * nb;
+			const uint8_t *in = &d[pat(0, y, z)];
+			int wx = wx0;
 			for (int x = 0; x < nb; x++) {
-				const size_t at = brick_index(first + Vector3i(x, y, z));
-				uint8_t &stored = r_level.bricks[at];
-				const uint8_t d = distance[local_index(x, y, z)];
-				if (stored != d) {
-					stored = d;
+				uint8_t &stored = r_level.bricks[row + wx];
+				if (stored != in[x]) {
+					stored = in[x];
 					r_level.bricks_dirty = true;
-					r_level.brick_layers_dirty[at / ((size_t)nb * nb)] = 1;
+					r_level.brick_layers_dirty[layer] = 1;
+				}
+				if (++wx == nb) {
+					wx = 0;
 				}
 			}
 		}
@@ -403,6 +438,10 @@ void Clipmap::queue_fix(Level &r_level, const Vector3i &p_min, const Vector3i &p
 
 bool Clipmap::fix_pending(const VoxelWorld &p_world, bool p_all) {
 	bool changed = false;
+	double copy_ms = 0.0, apply_ms = 0.0;
+	auto ms_since = [](std::chrono::steady_clock::time_point p_from) {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p_from).count();
+	};
 	for (int l = 1; l < (int)levels.size(); l++) {
 		Level &level = levels[l];
 		std::unique_ptr<FixJob> &job = fix_jobs[l];
@@ -433,7 +472,9 @@ bool Clipmap::fix_pending(const VoxelWorld &p_world, bool p_all) {
 			// Texels are stored by world position: what is still in the
 			// level is still right after a move (apply_fix() clips to it).
 			if (level.valid && !jobs[l]) {
+				const auto t = std::chrono::steady_clock::now();
 				level.distances_stale |= apply_fix(level, *job);
+				apply_ms += ms_since(t);
 				changed = true;
 			} else if (level.valid) {
 				queue_fix(level, job->min, job->max); // a move is running: again after it
@@ -481,7 +522,9 @@ bool Clipmap::fix_pending(const VoxelWorld &p_world, bool p_all) {
 		const auto [lo, hi] = level.fix_boxes[best];
 		level.fix_boxes[best] = level.fix_boxes.back();
 		level.fix_boxes.pop_back();
+		const auto t = std::chrono::steady_clock::now();
 		job = start_fix(level, l, p_world, lo, hi);
+		copy_ms += ms_since(t);
 		if (!job) {
 			continue;
 		}
@@ -491,6 +534,8 @@ bool Clipmap::fix_pending(const VoxelWorld &p_world, bool p_all) {
 			raw->finished = true;
 		});
 	}
+	finish_part_ms[5] = std::max(finish_part_ms[5], copy_ms);
+	finish_part_ms[6] = std::max(finish_part_ms[6], apply_ms);
 	return changed;
 }
 
@@ -794,7 +839,7 @@ bool Clipmap::apply_fix(Level &r_level, const FixJob &p_job) {
 	if (z0 > z1) {
 		return false;
 	}
-	mark_layers(r_level, z0, z1);
+	mark_layers(r_level, z0, z1, 2);
 	return update_has_surface(r_level, c0, c1);
 }
 
@@ -943,8 +988,8 @@ void Clipmap::copy_raw(const Slab &p_slab, const uint8_t *p_texels, uint8_t *r_r
 
 std::vector<std::pair<std::string, double>> Clipmap::take_finish_times() {
 	std::vector<std::pair<std::string, double>> out;
-	static const char *const parts[5] = { "raw", "patch", "queue", "pending", "start" };
-	for (int i = 0; i < 5; i++) {
+	static const char *const parts[7] = { "raw", "patch", "queue", "pending", "start", "fix_copy", "fix_apply" };
+	for (int i = 0; i < 7; i++) {
 		out.emplace_back(parts[i], finish_part_ms[i]);
 		finish_part_ms[i] = 0.0;
 	}
@@ -1014,7 +1059,7 @@ void Clipmap::finish_job(int p_level, VoxelWorld &r_world) {
 		part_ms[0] += since(t);
 		t = std::chrono::steady_clock::now();
 		// (The worker wrote the edited chunks too: see take_patches().)
-		mark_layers(level, slab.lo.z, slab.hi.z);
+		mark_layers(level, slab.lo.z, slab.hi.z, 1);
 		part_ms[1] += since(t);
 		t = std::chrono::steady_clock::now();
 		if (coarse) {

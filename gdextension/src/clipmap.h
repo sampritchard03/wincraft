@@ -69,7 +69,16 @@ public:
 		// both costs less than two (see queue_fix()), so edits far apart
 		// don't make one pass over everything between them.
 		std::vector<std::pair<Vector3i, Vector3i>> fix_boxes;
-		std::vector<uint8_t> layer_dirty; // per storage layer: changed since uploaded
+		// Per storage layer: changed since uploaded, 0 = no; 2 = by an edit or
+		// a fix (goes up first: it's where the player is looking), 1 = by a move.
+		std::vector<uint8_t> layer_dirty;
+		// The brick distances on the GPU. While some layers aren't up yet, the
+		// GPU holds texels of older and newer contents at once: each brick
+		// goes up as the least of what it said and says now (safe for both;
+		// with only the new ones, rays skipped surface still shown: gaps
+		// while sculpting), and exactly again once every layer is up.
+		std::vector<uint8_t> bricks_gpu;
+		bool bricks_conservative = false;
 		// Where the GPU copy is placed. After a move it stays at the old origin
 		// until every changed layer is uploaded (see SculptTerrain); meanwhile
 		// the shader uses only where the old and new boxes overlap, whose
@@ -181,7 +190,7 @@ private:
 	int size = 128;
 	std::vector<Level> levels;
 	std::vector<std::unique_ptr<Job>> jobs; // per level, or null
-	double finish_part_ms[5] = {}; // see take_finish_times(); [4]: start_job()
+	double finish_part_ms[7] = {}; // see take_finish_times(); [4]: start_job(), [5] fix_pending()'s start_fix(), [6] its apply_fix()
 	double finish_level_ms[16] = {};
 	// fix_pending()'s passes, one per level at a time, on a worker thread:
 	// the raw values needed are copied out first, and the result written
@@ -252,7 +261,7 @@ private:
 	bool update_has_surface(Level &r_level, const Vector3i &p_min, const Vector3i &p_max);
 	void update_brick_distances(Level &r_level);
 	// Marks the layers holding world texels z in [p_z0, p_z1] as changed.
-	void mark_layers(Level &r_level, int p_z0, int p_z1);
+	void mark_layers(Level &r_level, int p_z0, int p_z1, uint8_t p_priority);
 
 	static int wrap(int p_value, int p_size) {
 		const int m = p_value % p_size;
