@@ -74,7 +74,7 @@ extends Node
 ## keep the player near 0 (_wrap_player()), differently on each computer.
 ## Each receiver puts a remote player at the repeat nearest its own.
 
-const BodyAnimation := preload("res://body_animation.gd")
+const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
 
 signal settings_received  ## joining: open the world with host_settings, then call world_opened()
 signal joined  ## joining: every edited chunk has arrived and been applied
@@ -650,7 +650,7 @@ func _apply_changes(p_changes: Array, p_remote := true) -> void:
 func world_ready() -> void:
 	ready_for_bodies = true
 	if mode == Mode.HOST:
-		world.balls.load_all(world.player.global_position)  # online, everything stays loaded
+		world.objects.load_all(world.player.global_position)  # online, everything stays loaded
 	for call in early_bodies:
 		call.call()
 	early_bodies.clear()
@@ -730,7 +730,7 @@ func _describe(p_body: DensityBody3D) -> Dictionary:
 	for key in BODY_PROPERTIES:
 		props[key] = p_body.get(key)
 	var frozen: bool = p_body.freeze if p_body.get_meta("net_sim", true) else p_body.get_meta("net_frozen", false)
-	return {"scene": p_body.scene_file_path, "shape": p_body.shape.to_dict(), "props": props,
+	return {"scene": p_body.scene_file_path, "kind": world.objects.kind_of(p_body), "shape": p_body.shape.to_dict(), "props": props,
 			"position": _wrapped(p_body.global_position), "turn": p_body.global_basis.get_rotation_quaternion(),
 			"velocity": p_body.linear_velocity, "spin": p_body.angular_velocity, "frozen": frozen, "pose": _pose_of(p_body), "animation": BodyAnimation.to_dict(p_body)}
 
@@ -783,7 +783,7 @@ func _scan_bodies() -> void:
 			bodies.erase(id)
 			_despawn.rpc(id)
 	var me := multiplayer.get_unique_id()
-	for parent in [world.balls, world.camera.get_parent()]:
+	for parent in [world.objects, world.camera.get_parent()]:
 		for b in parent.get_children():
 			if b is DensityBody3D and not b is DensityCharacter3D and b.pickable and b.shape != null \
 					and not b.has_meta("net_id") and not b.has_meta("net_avatar") and not b.is_queued_for_deletion():
@@ -813,8 +813,10 @@ func _spawn_now(p_id: String, p_owner: int, p_desc: Dictionary) -> void:
 		b = load(p_desc.scene).instantiate()
 		world.camera.get_parent().add_child(b)
 		b.shape = shape
+	elif p_desc.get("kind", "") == "ball":
+		b = world.objects.add_ball_body(shape, Vector3.ZERO)
 	else:
-		b = world.balls.add_shape_body(shape, Vector3.ZERO)
+		b = world.objects.add_shape_body(shape, Vector3.ZERO)
 	for key in p_desc.props:
 		b.set(key, p_desc.props[key])
 	b.set_meta("net_id", p_id)
@@ -841,7 +843,7 @@ func _despawn(p_id: String) -> void:
 	var b = bodies.get(p_id)
 	bodies.erase(p_id)
 	if b != null and is_instance_valid(b):
-		world.balls.remove(b)
+		world.objects.remove(b)
 
 ## Where the objects simulated here are, and their shapes when sculpted.
 ## Moving ones: every BODY_INTERVAL to players within INTEREST_RADIUS, every

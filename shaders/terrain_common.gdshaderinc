@@ -11,14 +11,15 @@
 // otherwise the point is a plain color whose 15 bits (5 red, 5 green, 5
 // blue, red highest) are B's low 7 bits and A. Storage wraps around: world
 // texel w (= position / 2^l) is at w mod clip_size, hence repeat.
-uniform sampler2DArray clip_texture0 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture1 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture2 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture3 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture4 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture5 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture6 : filter_linear, repeat_enable;
-uniform sampler2DArray clip_texture7 : filter_linear, repeat_enable;
+//
+// Every level is in the one texture: level l's slice z is layer
+// l * clip_size + z. One sampler rather than one a level, because a phone's
+// GPU may have only 16 texture units and Godot binds its own textures (the
+// sky, shadow atlases, the screen) to the top ones: with a sampler a level,
+// the bodies' and blocks' samplers landed on those and read the engine's
+// textures instead (Mali: invisible objects, white ground). Keep this
+// shader's samplers few (they're given units in the order declared).
+uniform sampler2DArray clip_texture : filter_linear, repeat_enable;
 // Brick distances of every level (see far_distance): layer l * bricks + z is
 // slice z of level l's bricks, which wrap around like the texels.
 uniform sampler2DArray clip_bricks : filter_nearest, repeat_enable;
@@ -87,31 +88,31 @@ float far_distance(vec3 w, float level, float reach_left, float scale) {
 	return max(jump, 0.6 * CLAMP) * scale;
 }
 
-// One level's density at p (and in r_far a safe step there), each with its
-// own sampler: indexing the uniform arrays or choosing a sampler with a
+// One level's density at p (and in r_far a safe step there), a function a
+// level with its constants built in: indexing the uniform arrays with a
 // variable is several times slower on Intel GPUs.
 //
 // Layers are z slices, so the hardware filters within a layer and the shader
 // blends the two slices around the point: layer z (storage wraps: layer = z
 // mod size) holds both, in R and G.
-#define LEVEL_SAMPLER(NAME, TEX, LEVEL, SCALE) \
+#define LEVEL_SAMPLER(NAME, LEVEL, SCALE) \
 float NAME(vec3 p, float reach_left, out float r_far) { \
 	vec3 w = p / SCALE; \
 	vec2 uv = (w.xy + 0.5) / clip_size; \
 	float z0 = floor(w.z); \
-	vec2 slices = textureLod(TEX, vec3(uv, mod(z0, clip_size)), 0.0).rg; \
+	vec2 slices = textureLod(clip_texture, vec3(uv, LEVEL * clip_size + mod(z0, clip_size)), 0.0).rg; \
 	float d = (mix(slices.x, slices.y, w.z - z0) * 255.0 - 128.0) / 16.0 * SCALE; \
 	r_far = near_surface(d, SCALE) ? -d : far_distance(w, LEVEL, reach_left, SCALE); \
 	return d; \
 }
-LEVEL_SAMPLER(level0, clip_texture0, 0.0, 1.0)
-LEVEL_SAMPLER(level1, clip_texture1, 1.0, 2.0)
-LEVEL_SAMPLER(level2, clip_texture2, 2.0, 4.0)
-LEVEL_SAMPLER(level3, clip_texture3, 3.0, 8.0)
-LEVEL_SAMPLER(level4, clip_texture4, 4.0, 16.0)
-LEVEL_SAMPLER(level5, clip_texture5, 5.0, 32.0)
-LEVEL_SAMPLER(level6, clip_texture6, 6.0, 64.0)
-LEVEL_SAMPLER(level7, clip_texture7, 7.0, 128.0)
+LEVEL_SAMPLER(level0, 0.0, 1.0)
+LEVEL_SAMPLER(level1, 1.0, 2.0)
+LEVEL_SAMPLER(level2, 2.0, 4.0)
+LEVEL_SAMPLER(level3, 3.0, 8.0)
+LEVEL_SAMPLER(level4, 4.0, 16.0)
+LEVEL_SAMPLER(level5, 5.0, 32.0)
+LEVEL_SAMPLER(level6, 6.0, 64.0)
+LEVEL_SAMPLER(level7, 7.0, 128.0)
 
 // The material at p, from the finest level that covers it (as density()
 // picks them): x is a block's texture layer, or -1 for a plain color, which
@@ -123,61 +124,73 @@ LEVEL_SAMPLER(level7, clip_texture7, 7.0, 128.0)
 // The boundary then runs where the votes balance, a smooth curve between
 // the points. A colored result's color is not blended: the colored point
 // with the most weight gives it (nearest filtering), so paint stays crisp.
-#define MATERIAL_LEVEL(L, TEX, SCALE) \
+// The votes are summed per kind (block kinds 0-15, four to a vec4), rather
+// than kept per point and compared pairwise: no local arrays, and 8 reads
+// and sums instead of 64 comparisons.
+#define MATERIAL_LEVEL(L, SCALE) \
 if (clip_count > L && reach <= clip_reach * SCALE && inside((p - clip_origin[L]) / SCALE, clip_extent[L])) { \
 	vec3 w = p / SCALE; \
 	vec3 b = floor(w); \
 	vec3 f = w - b; \
-	int kinds[8]; \
-	vec3 colors[8]; \
-	float votes[8]; \
-	for (int k = 0; k < 8; k++) { \
-		vec3 o = vec3(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1)); \
-		vec4 texel = texelFetch(TEX, ivec3(mod(b + o, clip_size)), 0); \
-		vec3 tw = mix(1.0 - f, f, o); \
-		float solid = texel.r * 255.0 > 128.5 ? 1.0 : 0.15; \
-		int g = int(texel.b * 255.0 + 0.5); \
-		int bits = (g & 127) * 256 + int(texel.a * 255.0 + 0.5); \
-		kinds[k] = g < 128 ? g : 128; \
-		colors[k] = vec3(float((bits >> 10) & 31), float((bits >> 5) & 31), float(bits & 31)) / 31.0; \
-		votes[k] = tw.x * tw.y * tw.z * solid; \
-	} \
-	int best = kinds[0]; \
-	float best_votes = -1.0; \
-	for (int k = 0; k < 8; k++) { \
-		float total = 0.0; \
-		for (int j = 0; j < 8; j++) { \
-			total += kinds[j] == kinds[k] ? votes[j] : 0.0; \
-		} \
-		if (total > best_votes) { \
-			best_votes = total; \
-			best = kinds[k]; \
-		} \
-	} \
-	if (best < 128) { \
-		return vec4(float(best), 0.0, 0.0, 0.0); \
-	} \
+	vec4 kinds0 = vec4(0.0); \
+	vec4 kinds1 = vec4(0.0); \
+	vec4 kinds2 = vec4(0.0); \
+	vec4 kinds3 = vec4(0.0); \
+	float painted = 0.0; \
 	vec3 nearest = vec3(0.0); \
 	float nearest_vote = -1.0; \
 	for (int k = 0; k < 8; k++) { \
-		if (kinds[k] == 128 && votes[k] > nearest_vote) { \
-			nearest_vote = votes[k]; \
-			nearest = colors[k]; \
+		vec3 o = vec3(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1)); \
+		ivec3 at = ivec3(mod(b + o, clip_size)); \
+		vec4 texel = texelFetch(clip_texture, ivec3(at.xy, L * int(clip_size) + at.z), 0); \
+		vec3 tw = mix(1.0 - f, f, o); \
+		float solid = texel.r * 255.0 > 128.5 ? 1.0 : 0.15; \
+		float vote = tw.x * tw.y * tw.z * solid; \
+		int g = int(texel.b * 255.0 + 0.5); \
+		if (g < 128) { \
+			vec4 kind = vec4(float(g)); \
+			kinds0 += vote * step(abs(kind - vec4(0.0, 1.0, 2.0, 3.0)), vec4(0.5)); \
+			kinds1 += vote * step(abs(kind - vec4(4.0, 5.0, 6.0, 7.0)), vec4(0.5)); \
+			kinds2 += vote * step(abs(kind - vec4(8.0, 9.0, 10.0, 11.0)), vec4(0.5)); \
+			kinds3 += vote * step(abs(kind - vec4(12.0, 13.0, 14.0, 15.0)), vec4(0.5)); \
+		} else { \
+			painted += vote; \
+			if (vote > nearest_vote) { \
+				nearest_vote = vote; \
+				int bits = (g & 127) * 256 + int(texel.a * 255.0 + 0.5); \
+				nearest = vec3(float((bits >> 10) & 31), float((bits >> 5) & 31), float(bits & 31)) / 31.0; \
+			} \
 		} \
 	} \
-	return vec4(-1.0, nearest); \
+	float best = -1.0; \
+	float best_votes = painted > 0.0 ? painted : -1.0; \
+	heaviest_kind(kinds0, 0.0, best, best_votes); \
+	heaviest_kind(kinds1, 4.0, best, best_votes); \
+	heaviest_kind(kinds2, 8.0, best, best_votes); \
+	heaviest_kind(kinds3, 12.0, best, best_votes); \
+	return best >= 0.0 ? vec4(best, 0.0, 0.0, 0.0) : vec4(-1.0, nearest); \
 }
+
+// MATERIAL_LEVEL's tally: the kind (p_first .. p_first + 3) with the most
+// votes, if it has more than r_best_votes.
+void heaviest_kind(vec4 p_votes, float p_first, inout float r_best, inout float r_best_votes) {
+	if (p_votes.x > r_best_votes) { r_best_votes = p_votes.x; r_best = p_first; }
+	if (p_votes.y > r_best_votes) { r_best_votes = p_votes.y; r_best = p_first + 1.0; }
+	if (p_votes.z > r_best_votes) { r_best_votes = p_votes.z; r_best = p_first + 2.0; }
+	if (p_votes.w > r_best_votes) { r_best_votes = p_votes.w; r_best = p_first + 3.0; }
+}
+
 vec4 material_at(vec3 p) {
 	vec3 rel = abs(p - view_position);
 	float reach = max(max(rel.x, rel.y), rel.z);
-	MATERIAL_LEVEL(0, clip_texture0, 1.0)
-	MATERIAL_LEVEL(1, clip_texture1, 2.0)
-	MATERIAL_LEVEL(2, clip_texture2, 4.0)
-	MATERIAL_LEVEL(3, clip_texture3, 8.0)
-	MATERIAL_LEVEL(4, clip_texture4, 16.0)
-	MATERIAL_LEVEL(5, clip_texture5, 32.0)
-	MATERIAL_LEVEL(6, clip_texture6, 64.0)
-	MATERIAL_LEVEL(7, clip_texture7, 128.0)
+	MATERIAL_LEVEL(0, 1.0)
+	MATERIAL_LEVEL(1, 2.0)
+	MATERIAL_LEVEL(2, 4.0)
+	MATERIAL_LEVEL(3, 8.0)
+	MATERIAL_LEVEL(4, 16.0)
+	MATERIAL_LEVEL(5, 32.0)
+	MATERIAL_LEVEL(6, 64.0)
+	MATERIAL_LEVEL(7, 128.0)
 	return vec4(2.0, 0.0, 0.0, 0.0); // stone
 }
 

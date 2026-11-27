@@ -60,7 +60,7 @@ func _ready() -> void:
 	sun = (terrain_material.get_shader_parameter("sun_direction") as Vector3).normalized()
 	right = Vector3.UP.cross(sun).normalized() if absf(sun.y) < 0.99 else Vector3.RIGHT
 	up = sun.cross(right).normalized()
-	var shader: Shader = load("res://terrain_sun_map.gdshader")
+	var shader: Shader = load("res://shaders/terrain_sun_map.gdshader")
 	var extra: Array = []
 	for i in 2:
 		var c := Cascade.new()
@@ -72,7 +72,10 @@ func _ready() -> void:
 			view.name = "SunMap%d%s" % [i, "ab"[b]]
 			view.size = Vector2i(SIZE, SIZE)
 			view.disable_3d = true
-			view.use_hdr_2d = true  # 16-bit float: depth to about a voxel
+			# 8 bits a channel, the depth split over two (terrain_sun_map.gdshader):
+			# a 16-bit float target isn't there on every GPU (Mali in Compatibility
+			# falls back to 8 bits, which banded the shadows into blotches).
+			view.use_hdr_2d = false
 			view.transparent_bg = false
 			view.render_target_clear_mode = SubViewport.CLEAR_MODE_NEVER  # strips keep the rest
 			view.render_target_update_mode = SubViewport.UPDATE_DISABLED

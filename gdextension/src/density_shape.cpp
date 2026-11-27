@@ -2217,6 +2217,7 @@ void DensityShape::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_mass"), &DensityShape::get_mass);
 	ClassDB::bind_method(D_METHOD("split_parts", "min_voxels"), &DensityShape::split_parts, DEFVAL(4));
 	ClassDB::bind_static_method("DensityShape", D_METHOD("make_hull", "points", "material", "voxel_size"), &DensityShape::make_hull, DEFVAL(1.0));
+	ClassDB::bind_static_method("DensityShape", D_METHOD("make_solids", "solids", "voxel_size"), &DensityShape::make_solids, DEFVAL(1.0));
 
 	// Saved: size first (it sizes the rest). `keys` is how older files saved
 	// the shape: still read, no longer written.
@@ -3056,5 +3057,101 @@ Ref<DensityShape> DensityShape::make_hull(const PackedVector3Array &p_points, in
 	}
 	shape->edited = true;
 	shape->changed();
+	return shape;
+}
+
+// --- Solids (scripts' shapes) ------------------------------------------------------
+
+Ref<DensityShape> DensityShape::make_solids(const Array &p_solids, double p_voxel_size) {
+	struct Solid {
+		int type = 0;
+		Vector3 a, b, r;
+		float ra = 0.0f, rb = 0.0f;
+		MaterialId material = MAT_STONE;
+		Vector3 lo, hi;
+	};
+	std::vector<Solid> solids;
+	Vector3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+	for (int64_t i = 0; i < p_solids.size(); i++) {
+		const Dictionary d = p_solids[i];
+		Solid solid;
+		solid.type = d.get("type", 0);
+		solid.a = d.get("a", Vector3());
+		solid.material = (MaterialId)(int)d.get("material", (int)MAT_STONE);
+		if (solid.type == 0) {
+			solid.r = ((Vector3)d.get("r", Vector3(1, 1, 1))).max(Vector3(0.01f, 0.01f, 0.01f));
+			solid.lo = solid.a - solid.r;
+			solid.hi = solid.a + solid.r;
+		} else {
+			solid.b = d.get("b", solid.a);
+			solid.ra = std::max((float)(double)d.get("ra", 1.0), 0.01f);
+			solid.rb = std::max((float)(double)d.get("rb", solid.ra), 0.01f);
+			const float r = std::max(solid.ra, solid.rb);
+			solid.lo = solid.a.min(solid.b) - Vector3(r, r, r);
+			solid.hi = solid.a.max(solid.b) + Vector3(r, r, r);
+		}
+		lo = lo.min(solid.lo);
+		hi = hi.max(solid.hi);
+		solids.push_back(solid);
+	}
+	ERR_FAIL_COND_V_MSG(solids.empty(), Ref<DensityShape>(), "DensityShape.make_solids(): no solids.");
+	// A few voxels of air round them (the surface's outside), coarser
+	// voxels while it doesn't fit.
+	double vs = std::max(p_voxel_size, 0.01);
+	Vector3i n;
+	Vector3 origin;
+	while (true) {
+		const float margin = 3.0f * (float)vs;
+		origin = ((lo - Vector3(margin, margin, margin)) / (float)vs).floor() * (float)vs;
+		const Vector3 far = hi + Vector3(margin, margin, margin);
+		n = Vector3i(((far - origin) / (float)vs).ceil()) + Vector3i(1, 1, 1);
+		if ((n.x <= MAX_SIZE && n.y <= MAX_SIZE && n.z <= MAX_SIZE) || vs >= MAX_VOXEL_SIZE) {
+			n = n.min(Vector3i(MAX_SIZE, MAX_SIZE, MAX_SIZE));
+			break;
+		}
+		vs *= 2.0;
+	}
+	const size_t count = (size_t)n.x * n.y * n.z;
+	std::vector<float> density(count, -1e30f);
+	std::vector<MaterialId> materials(count, solids[0].material);
+	auto distance = [](const Solid &s, const Vector3 &p) -> float {
+		if (s.type == 0) {
+			// Ellipsoid: a close bound of the true distance.
+			const Vector3 q = (p - s.a) / s.r;
+			const float k0 = q.length();
+			if (k0 < 1e-5f) {
+				return std::min({ s.r.x, s.r.y, s.r.z });
+			}
+			const float k1 = (q / s.r).length();
+			return -k0 * (k0 - 1.0f) / k1;
+		}
+		const Vector3 ab = s.b - s.a;
+		const float t = std::clamp((p - s.a).dot(ab) / std::max(ab.length_squared(), 1e-6f), 0.0f, 1.0f);
+		return s.ra + (s.rb - s.ra) * t - p.distance_to(s.a + ab * t);
+	};
+	// Each solid at the points within the stored distances of it (each
+	// point's material: the most solid one's, so air near a surface has the
+	// surface's; farther points are clamped air anyway).
+	const float reach = (DENSITY_CLAMP + 1.0f) * (float)vs;
+	for (const Solid &s : solids) {
+		const Vector3i a = Vector3i(((s.lo - Vector3(reach, reach, reach) - origin) / (float)vs).floor()).max(Vector3i()).min(n - Vector3i(1, 1, 1));
+		const Vector3i b = Vector3i(((s.hi + Vector3(reach, reach, reach) - origin) / (float)vs).ceil()).max(Vector3i()).min(n - Vector3i(1, 1, 1));
+		WorkerPool::get().run(b.z - a.z + 1, [&](int dz) {
+			const int z = a.z + dz;
+			for (int y = a.y; y <= b.y; y++) {
+				for (int x = a.x; x <= b.x; x++) {
+					const size_t i = ((size_t)z * n.y + y) * n.x + x;
+					const float d = distance(s, origin + Vector3((float)x, (float)y, (float)z) * (float)vs) / (float)vs;
+					if (d > density[i]) {
+						density[i] = d;
+						materials[i] = s.material;
+					}
+				}
+			}
+		});
+	}
+	Ref<DensityShape> shape;
+	shape.instantiate();
+	shape->init_grid(n, origin, vs, std::move(density), std::move(materials));
 	return shape;
 }

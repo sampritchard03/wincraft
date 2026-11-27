@@ -1,7 +1,7 @@
-[gd_scene format=3]
+[gd_scene format=3 uid="uid://claoexgme20hh"]
 
-[ext_resource type="DensityShape" uid="uid://d06f2ws5b1l45" path="res://forg_shape_v2.res" id="1_r13a2"]
-[ext_resource type="Script" uid="uid://1ql53yemushh" path="res://forg.gd" id="2_5crkg"]
+[ext_resource type="DensityShape" uid="uid://d06f2ws5b1l45" path="res://assets/entities/frog/forg_shape_v2.res" id="1_r13a2"]
+[ext_resource type="Script" uid="uid://1ql53yemushh" path="res://scripts/objects/entities/forg.gd" id="2_5crkg"]
 
 [sub_resource type="Animation" id="Animation_r13a2"]
 length = 6.6666665

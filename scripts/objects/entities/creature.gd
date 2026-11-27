@@ -1,5 +1,6 @@
-extends DensityBody3D
-## What frogs and chiggins have in common (chiggin.gd, forg.gd extend it):
+extends "res://scripts/objects/entities/entity.gd"
+## An entity that lives: what frogs and chiggins have in common (chiggin.gd,
+## forg.gd extend it):
 ##
 ## Falling over: it only holds itself up gently while nearly upright, so a
 ## good shove knocks it over. Tipped past fall_angle it's down: it lies

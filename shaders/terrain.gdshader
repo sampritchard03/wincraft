@@ -13,8 +13,8 @@ render_mode unshaded, cull_disabled, depth_draw_always, shadows_disabled;
 // needs no march at all, and the others start where it first came close to a
 // surface.
 
-#include "res://terrain_common.gdshaderinc"
-#include "res://terrain_shadow.gdshaderinc"
+#include "res://shaders/terrain_common.gdshaderinc"
+#include "res://shaders/terrain_shadow.gdshaderinc"
 
 // R: where to start (voxels along the ray / START_SCALE), G: 1 if the
 // block is all sky.
@@ -141,8 +141,11 @@ uniform float texture_size = 8.0;
 // only where two are close, so the pixel art stays crisp). p_footprint: how
 // wide a pixel is there, in voxels, which picks the mip level.
 vec3 block_albedo(vec3 p_position, vec3 n, int block, float p_footprint) {
-	// One texture (16 texels) across texture_size voxels.
-	vec3 p = p_position / texture_size;
+	// One texture (16 texels) across texture_size voxels, wrapped to one
+	// repeat here, so the coordinates stay small however far from the origin
+	// (kinder to a mobile GPU's texture unit). The mip level is explicit, so
+	// the wrap leaves no seam.
+	vec3 p = fract(p_position / texture_size);
 	float lod = max(log2(p_footprint * 16.0 / texture_size), 0.0);
 	vec3 w = pow(abs(n), vec3(8.0));
 	w /= w.x + w.y + w.z;
@@ -253,7 +256,7 @@ vec3 sea_view(vec3 ro, vec3 rd, float t_ground, vec3 ground_color, vec3 sun, flo
 	vec3 below = mix(scatter, ground_color, water_transmission(through));
 	// The water texture as ripples, at the blocks' scale (see texture_size).
 	float lod = max(log2(cone * t_sea * 16.0 / texture_size), 0.0);
-	float ripple = textureLod(water_texture, q.xz / texture_size, lod).r;
+	float ripple = textureLod(water_texture, fract(q.xz / texture_size), lod).r;  // (wrapped: see block_albedo())
 	below *= 0.7 + 0.7 * ripple;
 	float fresnel = 0.02 + 0.98 * pow(1.0 - abs(rd.y), 5.0);
 	r_t_seen = t_sea;

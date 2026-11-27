@@ -17,7 +17,13 @@ extends Node
 ## a kind's shape and animations the game's own (its scene's files). Multiplayer: a kind's shape goes to the other players
 ## when it's changed here (network.gd, send_kind_shape()).
 
-const BodyAnimation := preload("res://body_animation.gd")
+const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
+## Where kinds' scenes were before the project's files were tidied into
+## folders: saves made then name them so.
+const MOVED_SCENES := {
+	"res://forg.tscn": "res://scenes/entities/forg.tscn",
+	"res://chiggin.tscn": "res://scenes/entities/chiggin.tscn",
+}
 const META_SEEN := "creature_shape"  # the shape the creature had when last looked at
 const META_VERSION := "creature_version"  # and its version (edits in place)
 
@@ -183,8 +189,15 @@ func to_save() -> Dictionary:
 
 
 func load_from(p_config: ConfigFile) -> void:
-	loaded_kinds = p_config.get_value("creatures", "kinds", {})
+	loaded_kinds = {}
+	var kinds = p_config.get_value("creatures", "kinds", {})
+	if kinds is Dictionary:
+		for path in kinds:
+			loaded_kinds[MOVED_SCENES.get(path, path)] = kinds[path]
 	loaded_creatures = p_config.get_value("creatures", "list", [])
+	for entry in loaded_creatures:
+		if entry is Dictionary and MOVED_SCENES.has(entry.get("scene", "")):
+			entry.scene = MOVED_SCENES[entry.scene]
 
 
 ## Makes the loaded creatures, each at the repeat of the wrapping world
@@ -199,7 +212,7 @@ func restore_loaded(p_player: Vector3) -> void:
 		if scene == null:
 			continue
 		var at: Vector3 = entry.get("position", Vector3.ZERO)
-		var body := spawn(scene, p_player + world.balls._offset_from(p_player, at))
+		var body := spawn(scene, p_player + world.objects._offset_from(p_player, at))
 		if entry.get("shape") is Dictionary:
 			body.shape = DensityShape.from_dict(entry.shape)
 			body.set_meta(META_SEEN, body.shape)
@@ -215,8 +228,8 @@ func restore_loaded(p_player: Vector3) -> void:
 
 ## Makes p_body's kind (its scene) start out as it is now, for every world:
 ## its shape (and shape keys) into the scene's shape file, its animations
-## into their files (res://<scene name>/<animation>.tres, where the scene
-## keeps them there), or into the scene itself. Returns what it did, or
+## into their files (the folder the scene's animation files are in, where
+## it keeps them in files), or into the scene itself. Returns what it did, or
 ## what went wrong. (Only while running from the project: an exported
 ## game's files can't be written.)
 ## Every one of a kind faces p_degrees off (creature.gd, facing_offset): here,
@@ -254,8 +267,14 @@ func save_as_default(p_body: DensityBody3D) -> String:
 	var player := BodyAnimation.player_of(root)
 	var files := 0
 	if library != null and player != null:
-		var folder := path.get_basename()  # res://chiggin.tscn -> res://chiggin/
-		var in_files := DirAccess.dir_exists_absolute(folder)
+		# (New animations go beside the ones already in files, if any are.)
+		var folder := ""
+		for anim_name in library.get_animation_list():
+			var file := library.get_animation(anim_name).resource_path
+			if file != "" and not file.contains("::"):
+				folder = file.get_base_dir()
+				break
+		var in_files := folder != ""
 		for anim_name in library.get_animation_list():
 			var anim := library.get_animation(anim_name)
 			var file := anim.resource_path

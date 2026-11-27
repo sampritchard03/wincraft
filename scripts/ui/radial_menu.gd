@@ -9,7 +9,7 @@ extends Control
 ## slot / slot_hover / slot_active (behind each icon: normal, pointed at,
 ## the tool in use), radial_pointer, and the tools' icons.
 
-const UiSkin := preload("res://ui_skin.gd")
+const UiSkin := preload("res://scripts/ui/ui_skin.gd")
 
 const RING := 190.0  # the icons' distance from the middle, at full size
 const SLOT := 64.0  # an icon's slot, at full size

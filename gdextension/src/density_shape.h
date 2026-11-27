@@ -171,6 +171,13 @@ public:
 	// A convex solid round some points (the hull of them, at least a voxel
 	// or so thick), in their own space, of p_material.
 	static Ref<DensityShape> make_hull(const PackedVector3Array &p_points, int p_material, double p_voxel_size = 1.0);
+	// A shape of simple solids unioned (the most solid wins, with its
+	// material), for shapes built by scripts (ShapeBuilder). Each a
+	// Dictionary: {"type": 0, "a": centre, "r": Vector3 half-sizes,
+	// "material"} an ellipsoid, or {"type": 1, "a", "b", "ra", "rb",
+	// "material"} a capsule from a (ra thick) to b (rb thick). Coarser
+	// voxels than p_voxel_size if they don't fit in MAX_SIZE points a side.
+	static Ref<DensityShape> make_solids(const Array &p_solids, double p_voxel_size = 1.0);
 	// Changes with every edit (the drawing atlas re-uploads).
 	int64_t get_version() const { return version; }
 

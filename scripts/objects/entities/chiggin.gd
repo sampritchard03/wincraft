@@ -1,9 +1,9 @@
-extends "res://creature.gd"
+extends "res://scripts/objects/entities/creature.gd"
 ## The chiggin: wanders about on its feet and looks around as it goes. A
 ## good shove knocks it over: it flaps a while, then rolls itself upright
 ## (creature.gd).
 ##
-## Its animations are in its AnimationPlayer, one file each in res://chiggin/
+## Its animations are in its AnimationPlayer, one file each in res://assets/entities/chiggin/animations/
 ## (edit one on a chiggin with the object editor, M; every chiggin shares
 ## them, and they're saved with the world):
 ##   chiggin_idle       standing about

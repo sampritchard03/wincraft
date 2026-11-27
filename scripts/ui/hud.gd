@@ -14,8 +14,8 @@ extends Control
 ##
 ## Laid out for a 720-pixel-high window and scaled to the real one.
 
-const UiSkin := preload("res://ui_skin.gd")
-const RadialMenu := preload("res://radial_menu.gd")
+const UiSkin := preload("res://scripts/ui/ui_skin.gd")
+const RadialMenu := preload("res://scripts/ui/radial_menu.gd")
 
 const ICON := 32.0  # icon size in the bar, before scaling
 const DESIGN_HEIGHT := 720.0
@@ -24,9 +24,16 @@ var world: Node  # world.gd
 ## In a headset (vr_ui.gd) the HUD is a panel on the wrist: no crosshair.
 var vr_mode := false
 
-## The material slot was clicked (the color picker), and the help slot.
+## The material slot was clicked (the color picker), and the help slot;
+## on a touch screen, the tool slot (the wheel).
 signal color_pressed
 signal help_pressed
+signal tool_pressed
+## On a touch screen (touch_controls.gd): the bar along the top, out of the
+## thumbs' way, without its keyboard captions.
+var touch_mode := false
+var bar: HBoxContainer
+const TOUCH_BAR_SCALE := 0.8
 var radial: RadialMenu
 var help_panel: PanelContainer
 
@@ -76,6 +83,8 @@ func fit(p_window: Vector2) -> void:
 	var cross := 32.0
 	crosshair.size = Vector2(cross, cross)
 	crosshair.position = size * 0.5 - crosshair.size * 0.5
+	if bar != null and touch_mode:
+		_place_bar.call_deferred()
 
 ## Each frame (world.gd's _sculpt): shows the world's state.
 func refresh() -> void:
@@ -114,6 +123,8 @@ func refresh() -> void:
 
 	(slots.undo.value as Label).text = "%d / %d" % [world.terrain.get_undo_count(), world.terrain.get_redo_count()]
 
+	if touch_mode:
+		bar.position.x = (size.x - bar.size.x * bar.scale.x) * 0.5  # (as its values change width)
 	fps_label.text = "%d FPS" % Engine.get_frames_per_second()
 	var online: String = world.network.hud_text() if not world.network.status.is_empty() else ""
 	network_label.text = online
@@ -197,7 +208,7 @@ func _make_corner() -> void:
 	net_row.add_child(network_label)
 
 func _make_bar() -> void:
-	var bar := HBoxContainer.new()
+	bar = HBoxContainer.new()
 	bar.set_anchors_and_offsets_preset(Control.PRESET_CENTER_BOTTOM)
 	bar.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	bar.grow_vertical = Control.GROW_DIRECTION_BEGIN
@@ -218,6 +229,7 @@ func _make_bar() -> void:
 	(slots.help.value as Label).text = "Keys"
 	_clickable("material", color_pressed)
 	_clickable("help", help_pressed)
+	_clickable("tool", tool_pressed)
 
 ## A slot that does something when clicked (with the mouse free, or a
 ## headset's laser).
@@ -229,6 +241,36 @@ func _clickable(p_name: String, p_signal: Signal) -> void:
 		if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
 			p_signal.emit()
 			panel.accept_event())
+
+## Touch screen layout on or off (see touch_mode).
+func set_touch_mode(p_on: bool) -> void:
+	touch_mode = p_on
+	for slot in slots.values():
+		(slot.caption as Label).visible = not p_on
+	(slots.help.panel as Control).visible = not p_on  # (the key list)
+	radial.hints = [] if p_on else radial.hints  # (no keys to show)
+	bar.scale = Vector2.ONE * (TOUCH_BAR_SCALE if p_on else 1.0)
+	if p_on:
+		bar.set_anchors_and_offsets_preset(Control.PRESET_CENTER_TOP)
+		bar.grow_vertical = Control.GROW_DIRECTION_END
+		bar.offset_top = 6
+	else:
+		bar.set_anchors_and_offsets_preset(Control.PRESET_CENTER_BOTTOM)
+		bar.grow_vertical = Control.GROW_DIRECTION_BEGIN
+		bar.offset_bottom = -10
+	bar.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_place_bar.call_deferred()
+
+## Keeps the (scaled) bar centred: anchors centre it at full size.
+func _place_bar() -> void:
+	bar.reset_size()
+	var width := bar.size.x * bar.scale.x
+	bar.position.x = (size.x - width) * 0.5
+	if touch_mode:
+		bar.position.y = 6.0
+		status_panel.position = Vector2(12, 6.0 + bar.size.y * bar.scale.y + 8.0)
+	else:
+		status_panel.position = Vector2(12, 10)
 
 ## Whether a point (in the HUD's viewport) is on one of its panels.
 func has_point(p_point: Vector2) -> bool:
