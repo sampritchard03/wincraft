@@ -85,12 +85,15 @@ func load_all(p_player: Vector3) -> void:
 		_restore(entry, p_player + _offset_from(p_player, entry.get("position", Vector3.ZERO)))
 	unloaded.clear()
 
-func save(p_path: String) -> void:
+## p_creatures: creatures.gd's to_save(), saved beside them.
+func save(p_path: String, p_creatures := {}) -> void:
 	var list := unloaded.duplicate()
 	for ball in balls:
 		list.append(_entry_of(ball))
 	var config := ConfigFile.new()
 	config.set_value("objects", "balls", list)
+	for key in p_creatures:
+		config.set_value("creatures", key, p_creatures[key])
 	var path := ProjectSettings.globalize_path(p_path)
 	if config.save(path + ".tmp") == OK:
 		DirAccess.rename_absolute(path + ".tmp", path)

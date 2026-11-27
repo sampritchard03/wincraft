@@ -207,6 +207,12 @@ public:
 	void begin_grab();
 	void warp(const PackedVector3Array &p_centers, const PackedVector3Array &p_deltas, double p_radius, bool p_grab);
 	void end_grab();
+	// Rotate and scale (between begin_grab() and end_grab(), like a grab):
+	// material within p_radius of p_centers[i] is turned and scaled about it
+	// by p_bases[i] (a rotation times a uniform scale: the whole change since
+	// begin_grab(), passed again every frame), all of it at the centre and
+	// fading out towards the radius. One entry per symmetry copy.
+	void twist(const PackedVector3Array &p_centers, const Array &p_bases, double p_radius);
 	// Undo history, one entry per stroke: everything edited between
 	// begin_stroke() and end_stroke() (e.g. mouse press to release) undoes
 	// together. Starting a new stroke clears the redo history. undo() / redo()

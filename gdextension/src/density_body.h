@@ -144,6 +144,9 @@ public:
 	bool warp(const Vector3 &p_center, const Vector3 &p_delta, double p_radius, bool p_grab);
 	// The same with a centre and delta per symmetry copy (world space).
 	bool warp_copies(const PackedVector3Array &p_centers, const PackedVector3Array &p_deltas, double p_radius, bool p_grab);
+	// Rotate / scale what's within p_radius of each centre (world space) by its
+	// basis (world space), from the shape as begin_grab() kept it.
+	bool twist(const PackedVector3Array &p_centers, const Array &p_bases, double p_radius);
 	void end_grab();
 	// Where a ray first enters the body, or null.
 	Variant raycast(const Vector3 &p_from, const Vector3 &p_direction, double p_max_distance);

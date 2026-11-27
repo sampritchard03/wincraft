@@ -32,6 +32,9 @@ const BodyAnimation := preload("res://body_animation.gd")
 var world: Node  # world.gd
 var active := false
 var body: DensityBody3D = null
+var make_default_button: Button
+var notice := ""  # said in the status line for a while
+var notice_until := 0
 
 # What the body was like before editing, put back on leaving.
 var was_frozen := false
@@ -151,8 +154,9 @@ func open(p_body: DensityBody3D) -> void:
 	body.freeze = true
 	body.linear_velocity = Vector3.ZERO
 	body.angular_velocity = Vector3.ZERO
-	# Its own copy to edit (frogs share one shape).
-	body.shape = body.shape.duplicate_shape()
+	# Shared again, so the first edit makes it a copy of its own (frogs share
+	# one shape; creatures.gd then gives that to every one of the kind).
+	body.shape = body.shape
 	anim_tree = BodyAnimation.tree_of(body)
 	if anim_tree != null:
 		tree_was_active = anim_tree.active
@@ -509,6 +513,8 @@ func _make_panels() -> void:
 	box.add_child(files)
 	_button(files, "Export model", _export_model)
 	_button(files, "Export scene", _export_scene)
+	make_default_button = _button(files, "Make game default", _make_default)
+	make_default_button.tooltip_text = "A frog or chiggin: every one, in every world, starts out with this shape, these shape keys and these animations (writes the game's files)"
 
 	# Animation: along the bottom.
 	timeline_panel = PanelContainer.new()
@@ -856,6 +862,8 @@ func _update_status() -> void:
 	var frame := roundi(time * fps)
 	status_label.text = "%s   frame %d / %d (%.2f s)   current key: %s" % [anim_name if anim != null else "(no animation: I keys one)", frame,
 			roundi(anim.length * fps) if anim != null else 0, time, body.shape.get_key_label(_current_key())]
+	if Time.get_ticks_msec() < notice_until:
+		status_label.text += "      " + notice
 	world.info_label.text = "Object editor - %d shape keys   %d FPS" % [body.shape.get_key_count(), Engine.get_frames_per_second()]
 
 
@@ -879,6 +887,15 @@ func _save(p_resource: Resource, p_path: String) -> void:
 	var error := ResourceSaver.save(p_resource, p_path)
 	if error != OK:
 		push_error("Couldn't save %s: %s" % [p_path, error_string(error)])
+
+## A creature's kind (creatures.gd): its scene's files take this shape and
+## these animations, so every one starts out so, in every world.
+func _make_default() -> void:
+	if body.scene_file_path == "":
+		notice = "Only for a frog or chiggin (something with a scene of its own): Export scene makes one"
+	else:
+		notice = world.creatures.save_as_default(body)
+	notice_until = Time.get_ticks_msec() + 8000
 
 ## The shape with its pose keys (load it with Ctrl+O, or set it as a body's shape).
 func _export_model() -> void:
@@ -940,9 +957,14 @@ func export_scene_to(path: String) -> void:
 
 
 ## The timeline: a tick per frame, a diamond per key, the current frame's
-## line; click or drag to move through it.
+## line; click or drag to move through it. Dragging a diamond moves its keys
+## (every track's at that time) to another frame; keys it passes over come
+## back as it moves on, and the one it's let go on is replaced.
 class Timeline extends Control:
 	var editor  # object_editor.gd
+	var moving_from := -1.0  # the dragged keys' time when the drag began (-1: scrubbing)
+	var moving_to := -1.0
+	var before: Array = []  # every track's keys when the drag began: [[time, value, transition], ...] per track
 
 	func _draw() -> void:
 		var w := size.x
@@ -961,8 +983,9 @@ class Timeline extends Control:
 		for t in editor._key_times():
 			var x: float = t / anim.length * w
 			var c := Vector2(x, h * 0.3)
-			var r := 5.0
-			draw_colored_polygon(PackedVector2Array([c + Vector2(0, -r), c + Vector2(r, 0), c + Vector2(0, r), c + Vector2(-r, 0)]), Color(1, 0.8, 0.2))
+			var r := 6.0 if moving_from >= 0.0 and absf(t - moving_to) < 0.001 else 5.0
+			var color := Color(1, 1, 1) if r > 5.0 else Color(1, 0.8, 0.2)
+			draw_colored_polygon(PackedVector2Array([c + Vector2(0, -r), c + Vector2(r, 0), c + Vector2(0, r), c + Vector2(-r, 0)]), color)
 		var px: float = editor.time / anim.length * w
 		draw_line(Vector2(px, 0), Vector2(px, h), Color(0.3, 0.8, 1.0), 2.0)
 
@@ -970,7 +993,70 @@ class Timeline extends Control:
 		var anim: Animation = editor._anim()
 		if anim == null:
 			return
-		if (event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT) or \
-				(event is InputEventMouseMotion and event.button_mask & MOUSE_BUTTON_MASK_LEFT):
-			editor.scrub(clampf(event.position.x / maxf(size.x, 1.0), 0.0, 1.0) * anim.length)
+		var w := maxf(size.x, 1.0)
+		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
+			if event.pressed:
+				moving_from = _key_at(anim, event.position)
+				if moving_from >= 0.0:
+					moving_to = moving_from
+					before = _keys_of(anim)
+					editor.scrub(moving_from)
+				else:
+					editor.scrub(clampf(event.position.x / w, 0.0, 1.0) * anim.length)
+			else:
+				moving_from = -1.0
+				before = []
 			accept_event()
+			queue_redraw()
+		elif event is InputEventMouseMotion and event.button_mask & MOUSE_BUTTON_MASK_LEFT:
+			var at := clampf(event.position.x / w, 0.0, 1.0) * anim.length
+			if moving_from >= 0.0:
+				var fps: float = editor.fps
+				var to := clampf(roundf(at * fps) / fps, 0.0, anim.length)
+				if absf(to - moving_to) > 0.0005:
+					moving_to = to
+					_move_keys(anim, moving_from, to)
+					editor.scrub(to)
+			else:
+				editor.scrub(at)
+			accept_event()
+			queue_redraw()
+
+	## The time of the key diamond under p_point, or -1.
+	func _key_at(p_anim: Animation, p_point: Vector2) -> float:
+		if p_point.y > size.y * 0.65:
+			return -1.0
+		var best := -1.0
+		var best_d := 8.0
+		for t in editor._key_times():
+			var d := absf(t / p_anim.length * size.x - p_point.x)
+			if d < best_d:
+				best_d = d
+				best = t
+		return best
+
+	func _keys_of(p_anim: Animation) -> Array:
+		var all := []
+		for track in p_anim.get_track_count():
+			var keys := []
+			for k in p_anim.track_get_key_count(track):
+				keys.append([p_anim.track_get_key_time(track, k), p_anim.track_get_key_value(track, k), p_anim.track_get_key_transition(track, k)])
+			all.append(keys)
+		return all
+
+	## Every track as it was when the drag began, but with its keys at
+	## p_from at p_to instead (over any there).
+	func _move_keys(p_anim: Animation, p_from: float, p_to: float) -> void:
+		for track in mini(p_anim.get_track_count(), before.size()):
+			for k in range(p_anim.track_get_key_count(track) - 1, -1, -1):
+				p_anim.track_remove_key(track, k)
+			var moved = null
+			for key in before[track]:
+				if absf(key[0] - p_from) < 0.001:
+					moved = key
+			for key in before[track]:
+				if moved != null and (key == moved or absf(key[0] - p_to) < 0.001):
+					continue  # (the moved key, and whatever it's on now)
+				p_anim.track_insert_key(track, key[0], key[1], key[2])
+			if moved != null:
+				p_anim.track_insert_key(track, p_to, moved[1], moved[2])

@@ -1007,6 +1007,31 @@ bool DensityBody3D::warp_copies(const PackedVector3Array &p_centers, const Packe
 	return any;
 }
 
+bool DensityBody3D::twist(const PackedVector3Array &p_centers, const Array &p_bases, double p_radius) {
+	if (shape.is_null()) {
+		return false;
+	}
+	if (!own_shape) {
+		shape = shape->duplicate_shape();
+		own_shape = true;
+	}
+	const Transform3D t = get_global_transform();
+	const Transform3D inv = t.affine_inverse();
+	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
+	std::vector<Vector3> centers;
+	std::vector<Basis> bases;
+	for (int64_t i = 0; i < std::min<int64_t>(p_centers.size(), p_bases.size()); i++) {
+		centers.push_back(inv.xform(p_centers[i]));
+		const Basis b = p_bases[i];
+		bases.push_back(inv.basis * b * t.basis); // (the same turn and scale, about the body's axes)
+	}
+	const bool any = shape->twist(centers, bases, p_radius / s, edit_key, pose, key_weights);
+	if (any) {
+		inertia_dirty = true;
+	}
+	return any;
+}
+
 void DensityBody3D::end_grab() {
 	if (shape.is_valid()) {
 		shape->end_grab();
@@ -1133,6 +1158,7 @@ void DensityBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("warp", "center", "delta", "radius", "grab"), &DensityBody3D::warp);
 	ClassDB::bind_method(D_METHOD("warp_copies", "centers", "deltas", "radius", "grab"), &DensityBody3D::warp_copies);
 	ClassDB::bind_method(D_METHOD("end_grab"), &DensityBody3D::end_grab);
+	ClassDB::bind_method(D_METHOD("twist", "centers", "bases", "radius"), &DensityBody3D::twist);
 	ClassDB::bind_static_method("DensityBody3D", D_METHOD("raycast_bodies", "from", "direction", "max_distance"), &DensityBody3D::raycast_bodies);
 	ClassDB::bind_method(D_METHOD("get_density_at", "position"), &DensityBody3D::get_density_at);
 	ClassDB::bind_method(D_METHOD("get_bound_radius"), &DensityBody3D::get_bound_radius);
