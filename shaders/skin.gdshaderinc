@@ -20,13 +20,16 @@ uniform vec4 bone_rows2[MAX_DRAWN_BONES];
 uniform vec4 bone_head[MAX_DRAWN_BONES];
 uniform vec4 bone_tail[MAX_DRAWN_BONES];
 uniform vec4 bone_soft[MAX_DRAWN_BONES];
+// Always 1: loop counts are multiplied by it so compilers can't unroll them
+// (see "Mind the size" below).
+uniform int loop_unit = 1;
 // A bone (index into the above) whose weight tints the body: the object
 // editor's weight preview (-1: none).
 uniform int bone_preview = -1;
 
 // --- Bones (as skinning.cpp does it; keep the two alike) ----------------------
 // (Loops take their counts in the condition, with no continue or early
-// break: Mali's compiler got those wrong.)
+// break: simpler control flow for drivers' compilers.)
 //
 // Mind the size: GLSL compilers inline every call, so a function called
 // from n places is n copies, and one calling another multiplies them. With

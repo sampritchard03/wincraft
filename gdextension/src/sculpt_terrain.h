@@ -60,7 +60,7 @@ public:
 		WORLD_ISLANDS = godot::WORLD_ISLANDS,
 		WORLD_TERRAIN = godot::WORLD_TERRAIN,
 	};
-	static constexpr int MAX_CLIP_LEVELS = 8; // MATERIAL_LEVEL / LEVEL_SAMPLER uses in terrain_common.gdshaderinc
+	static constexpr int MAX_CLIP_LEVELS = 8; // samplers in terrain.gdshader
 
 	// Size of a new world (a saved one keeps its own): x and z wrap every
 	// world_size voxels (a power of 2); world_height voxels tall, centred on 0.
@@ -534,10 +534,7 @@ private:
 	VoxelWorld world;
 	bool opened = false;
 	Clipmap clipmap;
-	// Every level's texels in one texture: layer l * clip_size + z holds slice z
-	// of level l. (One sampler, not one a level: a phone's GPU may have only 16
-	// texture units, and Godot binds its own textures to the top ones.)
-	Ref<Texture2DArray> clip_texture;
+	Ref<Texture2DArray> clip_textures[MAX_CLIP_LEVELS];
 	Ref<Texture2DArray> brick_texture; // all levels' brick distances (see Clipmap)
 	int64_t upload_bytes = 0;
 	// Time spent uploading texture layers (z slices) a frame, roughly: at

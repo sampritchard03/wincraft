@@ -72,10 +72,7 @@ func _ready() -> void:
 			view.name = "SunMap%d%s" % [i, "ab"[b]]
 			view.size = Vector2i(SIZE, SIZE)
 			view.disable_3d = true
-			# 8 bits a channel, the depth split over two (terrain_sun_map.gdshader):
-			# a 16-bit float target isn't there on every GPU (Mali in Compatibility
-			# falls back to 8 bits, which banded the shadows into blotches).
-			view.use_hdr_2d = false
+			view.use_hdr_2d = true  # 16-bit float: depth to about a voxel
 			view.transparent_bg = false
 			view.render_target_clear_mode = SubViewport.CLEAR_MODE_NEVER  # strips keep the rest
 			view.render_target_update_mode = SubViewport.UPDATE_DISABLED

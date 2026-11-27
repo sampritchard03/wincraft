@@ -18,11 +18,8 @@ uniform float texture_size = 8.0;
 // only where two are close, so the pixel art stays crisp). p_footprint: how
 // wide a pixel is there, in voxels, which picks the mip level.
 vec3 block_albedo(vec3 p_position, vec3 n, int block, float p_footprint) {
-	// One texture (16 texels) across texture_size voxels, wrapped to one
-	// repeat here, so the coordinates stay small however far from the origin
-	// (kinder to a mobile GPU's texture unit). The mip level is explicit, so
-	// the wrap leaves no seam.
-	vec3 p = fract(p_position / texture_size);
+	// One texture (16 texels) across texture_size voxels.
+	vec3 p = p_position / texture_size;
 	float lod = max(log2(p_footprint * 16.0 / texture_size), 0.0);
 	vec3 w = pow(abs(n), vec3(8.0));
 	w /= w.x + w.y + w.z;

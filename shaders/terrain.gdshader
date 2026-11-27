@@ -215,7 +215,7 @@ vec3 sea_view(vec3 ro, vec3 rd, float t_ground, vec3 ground_color, vec3 sun, flo
 	vec3 below = mix(scatter, ground_color, water_transmission(through));
 	// The water texture as ripples, at the blocks' scale (see texture_size).
 	float lod = max(log2(cone * t_sea * 16.0 / texture_size), 0.0);
-	float ripple = textureLod(water_texture, fract(q.xz / texture_size), lod).r;  // (wrapped: see block_albedo())
+	float ripple = textureLod(water_texture, q.xz / texture_size, lod).r;
 	below *= 0.7 + 0.7 * ripple;
 	float fresnel = 0.02 + 0.98 * pow(1.0 - abs(rd.y), 5.0);
 	r_t_seen = t_sea;

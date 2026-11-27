@@ -339,19 +339,20 @@ bool SculptTerrain::open_world() {
 	island_settings = world.get_settings(); // a saved world keeps its own
 	const int64_t opened_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 	clipmap.configure(clip_size, clip_levels);
-	clip_texture.unref();
-	// Create the texture now (empty), while the game is loading: creating it
-	// later means uploading all of it in one frame. Layer l * clip_size + z
-	// is slice z of level l.
-	{
+	for (Ref<Texture2DArray> &texture : clip_textures) {
+		texture.unref();
+	}
+	// Create every texture now (empty), while the game is loading: creating
+	// one later means uploading all of it in one frame.
+	for (int l = 0; l < clip_levels; l++) {
 		TypedArray<Image> layers;
-		layers.resize(clip_size * clip_levels);
+		layers.resize(clip_size);
 		const Ref<Image> blank = Image::create_empty(clip_size, clip_size, false, Image::FORMAT_RGBA8); // see upload_level()
-		for (int i = 0; i < clip_size * clip_levels; i++) {
-			layers[i] = blank;
+		for (int z = 0; z < clip_size; z++) {
+			layers[z] = blank;
 		}
-		clip_texture.instantiate();
-		clip_texture->create_from_images(layers);
+		clip_textures[l].instantiate();
+		clip_textures[l]->create_from_images(layers);
 	}
 	// Brick distances of all levels: layer l * bricks + z holds slice z of level l.
 	const int nb = clipmap.get_brick_count();
@@ -505,8 +506,7 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 	}
 	const int n = clipmap.get_size();
 	const int64_t layer_texels = (int64_t)n * n;
-	Ref<Texture2DArray> &texture = clip_texture;
-	const int first_layer = p_level * n; // (this level's slices in it)
+	Ref<Texture2DArray> &texture = clip_textures[p_level];
 	bool changed = false;
 	// Brick distances are tiny, but a layer is a call of its own: only the
 	// changed ones go up.
@@ -595,7 +595,7 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 		});
 		lap(upload_ms[UPLOAD_PACK]);
 		for (int i = 0; i < count; i++) {
-			texture->update_layer(Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, buffers[i]), first_layer + batch[i]);
+			texture->update_layer(Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, buffers[i]), batch[i]);
 			level.layer_dirty[batch[i]] = 0;
 		}
 		lap(upload_ms[UPLOAD_GPU]);
@@ -648,11 +648,13 @@ void SculptTerrain::bind_material() {
 		extents.push_back(Vector3((hi - lo).maxi(0)));
 	}
 	int count = 0;
-	while (count < clipmap.get_level_count() && clipmap.level(count).published && clip_texture.is_valid()) {
+	while (count < clipmap.get_level_count() && clipmap.level(count).published && clip_textures[count].is_valid()) {
 		count++;
 	}
 	for (const Ref<ShaderMaterial> &m : clip_materials()) {
-		m->set_shader_parameter("clip_texture", clip_texture);
+		for (int l = 0; l < MAX_CLIP_LEVELS; l++) {
+			m->set_shader_parameter(vformat("clip_texture%d", l), clip_textures[l]);
+		}
 		m->set_shader_parameter("clip_bricks", brick_texture);
 		m->set_shader_parameter("clip_brick_count", (float)clipmap.get_brick_count());
 		m->set_shader_parameter("clip_count", count);

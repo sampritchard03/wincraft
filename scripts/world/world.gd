@@ -73,10 +73,6 @@ var network: Network
 ## VR (vr.gd): a headset, if one is running (Meta Quest through OpenXR).
 const VR := preload("res://scripts/vr/vr.gd")
 var vr: VR
-## Touch screen controls (touch_controls.gd): a phone or tablet without a
-## headset (or --touch on the command line, to try them with the mouse).
-const TouchControls := preload("res://scripts/ui/touch_controls.gd")
-var touch: TouchControls
 ## The HUD (hud.gd): the bar of tool / material / brush slots, the status
 ## panel, the help list (H) and the tool wheel (hold Tab), all skinned from
 ## res://assets/ui/.
@@ -487,12 +483,6 @@ func _finish_ready(p_start: int) -> void:
 	vr.world = self
 	add_child(vr)
 	vr.start()
-	if not vr.active and TouchControls.wanted():
-		assume_captured = true  # no mouse to capture: the on-screen buttons sculpt
-		touch = TouchControls.new(self)
-		hud.add_child(touch)
-		hud.set_touch_mode(true)
-		_fit_screen()
 	if network.mode == Network.Mode.HOST:
 		network.start_host()
 	network.world_ready()
@@ -631,19 +621,6 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
 		_save_player()
 		_save_objects()
-	elif what == NOTIFICATION_APPLICATION_PAUSED and terrain != null and terrain.is_world_open():
-		# A phone: the app may be killed in the background without a close request.
-		_save_player()
-		_save_objects()
-		terrain.save_world()
-		if touch != null:
-			touch.release_all()
-	elif what == NOTIFICATION_WM_GO_BACK_REQUEST:
-		# Android's back: closes what's open (application/config/quit_on_go_back is off), else quits.
-		if touch == null or not touch.go_back():
-			_save_player()
-			_save_objects()
-			get_tree().quit()
 
 func _save_objects() -> void:
 	if not terrain.save_path.is_empty():
@@ -655,23 +632,11 @@ func _sync_prepass_camera() -> void:
 	prepass_camera.global_transform = camera.global_transform
 	prepass_camera.fov = camera.fov
 
-## Scales the low-resolution view up to fill the window, and fits the HUD
-## to the window; the color panel (bottom left, above the HUD's bar) shrinks
-## if it wouldn't fit. The view keeps its height in pixels (world.tscn's)
-## and is as wide as the window's shape needs (a 16:10 tablet, a 20:9
-## phone), so it fills the screen without bars or stretched pixels.
-var _view_height := 0
+## Scales the low-resolution view up as far as it fits, centred, and fits
+## the HUD to the window; the color panel (bottom left, above the HUD's
+## bar) shrinks if it wouldn't fit.
 func _fit_screen() -> void:
 	var window := get_viewport().get_visible_rect().size
-	var sub := camera.get_viewport() as SubViewport
-	if _view_height == 0:
-		_view_height = sub.size.y
-	if window.y > 0.0 and (vr == null or not vr.active):
-		var width := maxi(roundi(_view_height * window.x / window.y), 1)
-		if sub.size.x != width:
-			sub.size = Vector2i(width, _view_height)
-			screen.size = Vector2(sub.size)
-			prepass_viewport.size = sub.size / 2
 	var view := Vector2(screen.size)
 	var fit := minf(window.x / view.x, window.y / view.y)
 	screen.scale = Vector2(fit, fit)
@@ -690,16 +655,21 @@ func _fit_screen() -> void:
 ## Mouse look. The camera's rotation is rebuilt from these angles each time, so
 ## pitch always tilts around the camera's own right axis whichever way you face.
 func _input(event: InputEvent) -> void:
-	if touch != null and event is InputEventMouse and not touch.sending:
-		return  # touch screen: fingers act through touch_controls.gd (a tap's emulated mouse is the GUI's)
 	if editor != null and editor.handle_input(event):
 		get_viewport().set_input_as_handled()
 		return
 	if hud.radial.visible and _radial_input(event):
 		get_viewport().set_input_as_handled()
 		return
-	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		look_input(event.relative, event.shift_pressed, Input.is_physical_key_pressed(KEY_TAB))
+	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and twisting:
+		_twist_input(event.relative, event.shift_pressed)
+	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and gun_body != null \
+			and Input.is_physical_key_pressed(KEY_TAB):
+		_turn_gun_body(event.relative)
+	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		yaw -= event.relative.x * mouse_sensitivity
+		pitch = clampf(pitch - event.relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
+		camera.rotation = Vector3(pitch, yaw, 0.0)
 	elif event is InputEventMouseButton and event.pressed:
 		if not _captured():
 			if hud.has_point(event.position):
@@ -885,7 +855,7 @@ func _input(event: InputEvent) -> void:
 				_set_player_height(player_height + 1)
 			KEY_L:
 				_set_player_height(player_height - 1)
-			KEY_ALT, KEY_CTRL, KEY_META, KEY_SHIFT:
+			KEY_ALT, KEY_CTRL, KEY_META:
 				pass  # (modifiers: held with the mouse)
 			_:
 				if not _is_action(event):
@@ -893,44 +863,12 @@ func _input(event: InputEvent) -> void:
 						OS.get_keycode_string(event.physical_keycode), OS.get_keycode_string(event.keycode),
 						OS.get_keycode_string(event.key_label), event.unicode])
 
-## Mouse movement (or a touch screen's drag, in mouse pixels): turns what's
-## being rotated / scaled, the physics gun's body while p_turn (Tab, or the
-## touch screen's Turn button), or else the view. p_roll: Shift (rotating
-## rolls about the view).
-func look_input(p_relative: Vector2, p_roll: bool, p_turn: bool) -> void:
-	if twisting:
-		_twist_input(p_relative, p_roll)
-	elif gun_body != null and p_turn:
-		_turn_gun_body(p_relative)
-	else:
-		yaw -= p_relative.x * mouse_sensitivity
-		pitch = clampf(pitch - p_relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
-		camera.rotation = Vector3(pitch, yaw, 0.0)
-
-## Mouse buttons and modifier keys as the tools see them: the mouse and
-## keyboard's, or on a touch screen the on-screen buttons' (touch_controls.gd).
-func _button(p_button: MouseButton) -> bool:
-	if touch != null:
-		return touch.is_held(p_button)
-	return Input.is_mouse_button_pressed(p_button)
-
-func _shift_held() -> bool:
-	return Input.is_key_pressed(KEY_SHIFT) or (touch != null and touch.shift)
-
-func _alt_held() -> bool:
-	return Input.is_key_pressed(KEY_ALT) or (touch != null and touch.alt)
-
-## Whether opening a panel frees the mouse (not in a headset or on a touch
-## screen, where there's no captured mouse to free).
-func _frees_mouse() -> bool:
-	return (vr == null or not vr.active) and touch == null
-
 ## The color picker (C, or the HUD's material slot): on or off, freeing
 ## the mouse for it on a screen.
 func toggle_color_panel() -> void:
 	color_panel.visible = not color_panel.visible
 	_fit_screen()
-	if _frees_mouse():
+	if vr == null or not vr.active:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if color_panel.visible else Input.MOUSE_MODE_CAPTURED
 	get_viewport().gui_release_focus()
 
@@ -1223,9 +1161,9 @@ func take_step_times() -> String:
 
 func _process(delta: float) -> void:
 	_follow_symmetry_body()
-	if Input.is_action_pressed("ui_cancel") and touch == null:
+	if Input.is_action_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-	if not _button(MOUSE_BUTTON_LEFT):
+	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		capture_click = false
 
 	# The camera rides on top of the player (moved in _physics_process).
@@ -1290,7 +1228,7 @@ func _physics_process(delta: float) -> void:
 ## The player's move this physics frame, walking (or hoisting).
 func _walk(delta: float) -> void:
 	var size_scale := player_height / BASE_PLAYER_HEIGHT
-	if hoisting and not _button(MOUSE_BUTTON_RIGHT):
+	if hoisting and not Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
 		hoisting = false  # let go: falls from there, keeping the speed it had
 	if hoisting:
 		# Drawn to hoist_distance back along the line of sight to the hold
@@ -1486,8 +1424,8 @@ func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
 	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting \
 			and not (editor != null and editor.active and editor.bone_mode != editor.BoneMode.OFF)  # (the bone tools have the mouse)
-	var held := sculpting and _button(MOUSE_BUTTON_LEFT)
-	var pressing := held or (sculpting and _button(MOUSE_BUTTON_RIGHT))
+	var held := sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	var pressing := held or (sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX]:
 		pressing = false  # these don't sculpt
 	if pressing and not stroking:
@@ -1541,14 +1479,14 @@ func _sculpt(delta: float) -> void:
 	if tool in NON_SCULPT_TOOLS:
 		pass  # not a sculpting tool
 	elif hit != null and sculpting and not dragging and not twisting:
-		if _button(MOUSE_BUTTON_RIGHT):
+		if Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
 			mode = TOOL_MODES[tool] if tool in INVERTIBLE_TOOLS else SculptTerrain.BRUSH_SUBTRACT
 			inverted = tool in INVERTIBLE_TOOLS
 		elif held and TOOL_MODES[tool] >= 0:
 			mode = TOOL_MODES[tool]
 		# Alt: the opposite, with any brush (Draw carves, Carve draws, Smooth
 		# sharpens, Flatten pushes away from its plane, Layer lowers...).
-		if mode >= 0 and _alt_held():
+		if mode >= 0 and Input.is_key_pressed(KEY_ALT):
 			if mode == SculptTerrain.BRUSH_ADD:
 				mode = SculptTerrain.BRUSH_SUBTRACT
 			elif mode == SculptTerrain.BRUSH_SUBTRACT:
@@ -1623,7 +1561,7 @@ func _pick_flatten_plane(p_hit: Vector3, p_body: DensityBody3D) -> void:
 	var here := _surface_normal(p_hit, p_body)
 	match flatten_plane:
 		FlattenPlane.FACE:
-			if not flatten_locked or (not _shift_held() and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
+			if not flatten_locked or (not Input.is_key_pressed(KEY_SHIFT) and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
 				flatten_locked = true
 				flatten_point = p_hit
 				flatten_normal = here
@@ -1689,7 +1627,7 @@ func _brush_line(p_from: Vector3) -> void:
 		return
 	capture_click = true  # (the click isn't a stroke of its own too)
 	var mode: int = TOOL_MODES[tool]
-	var inverted := _alt_held()
+	var inverted := Input.is_key_pressed(KEY_ALT)
 	if inverted and mode == SculptTerrain.BRUSH_ADD:
 		mode = SculptTerrain.BRUSH_SUBTRACT
 		inverted = false
@@ -1811,7 +1749,7 @@ func toggle_brush_panel() -> void:
 	brush_panel.visible = not brush_panel.visible
 	if brush_panel.visible:
 		brush_panel.refresh()
-	if _frees_mouse():
+	if vr == null or not vr.active:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if brush_panel.visible else Input.MOUSE_MODE_CAPTURED
 	get_viewport().gui_release_focus()
 
@@ -2044,7 +1982,7 @@ func _record_history(p_force := false) -> void:
 	var serial: int = terrain.get_selection_serial()
 	if serial == sel_serial or floating != null:
 		return
-	if not p_force and (_button(MOUSE_BUTTON_LEFT) or _button(MOUSE_BUTTON_RIGHT)):
+	if not p_force and (Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)):
 		return
 	var state: Array = terrain.get_selection_state()
 	if history.size() > before_count:
@@ -2149,8 +2087,8 @@ func _cancel_lift() -> void:
 ## where you click, or (right button) just what's coloured like it, within
 ## brush_strength / 32 (an RGB distance: raise the strength to take more).
 func _select(p_hit, p_sculpting: bool) -> void:
-	var left := p_sculpting and _button(MOUSE_BUTTON_LEFT)
-	var right := p_sculpting and _button(MOUSE_BUTTON_RIGHT)
+	var left := p_sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+	var right := p_sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
 	if not (left or right):
 		fill_clicked = false
 	if not (left or right):
@@ -2260,7 +2198,7 @@ func _selection_to_body() -> void:
 func _update_physics_gun(p_delta: float) -> void:
 	if gun_body == null:
 		return
-	if not is_instance_valid(gun_body) or tool != Tool.PHYSICS_GUN or not _button(MOUSE_BUTTON_LEFT):
+	if not is_instance_valid(gun_body) or tool != Tool.PHYSICS_GUN or not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 		gun_body = null
 		return
 	network.use(gun_body)  # (multiplayer: stays with us while held)
@@ -2337,10 +2275,6 @@ func _set_player_height(p_height: float) -> void:
 	player.step_height = STEP_HEIGHT * size_scale
 
 func _tool_hint() -> String:
-	var hint := _key_hint()
-	return touch.reword(hint) if touch != null else hint
-
-func _key_hint() -> String:
 	if Time.get_ticks_msec() < notice_until:
 		return notice
 	match tool:
@@ -2365,7 +2299,7 @@ func _key_hint() -> String:
 			if box_dragging:
 				var size := _box_size()
 				return "Box %d x %d x %d: let go to %s (wheel: far corner nearer / farther, RMB: give up)" % [size.x, size.y, size.z,
-					"cut it out" if _shift_held() else "build it (Shift: cut it out)"]
+					"cut it out" if Input.is_key_pressed(KEY_SHIFT) else "build it (Shift: cut it out)"]
 			return "Box: drag from one corner to the other (Shift when you let go: cut it out)"
 		Tool.SELECT_BOX:
 			if box_dragging:
@@ -2546,7 +2480,7 @@ func _update_gizmo() -> void:
 			handle.global_transform = Transform3D(_basis_along(axes[i]), origin + axes[i] * length * 0.5)
 	# Dragging.
 	if gizmo_axis >= 0:
-		if not _button(MOUSE_BUTTON_LEFT):
+		if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
 			gizmo_axis = -1
 			if target == floating and not floating.global_transform.is_equal_approx(gizmo_start):
 				_push_history({"floating": floating, "before": gizmo_start, "after": floating.global_transform})
@@ -2685,7 +2619,7 @@ func _extrude(p_hit, p_held: bool) -> void:
 		extruding = true
 		extrude_origin = p_hit
 		extrude_dir = terrain.get_normal(p_hit, 2.0)
-		extrude_whole = _shift_held()
+		extrude_whole = Input.is_key_pressed(KEY_SHIFT)
 		extrude_last = -1.0
 	# Out along the normal, or (dragging back) in.
 	var distance := _line_param(extrude_origin, extrude_dir, from, dir)
@@ -2734,7 +2668,7 @@ func _update_geometry() -> void:
 	if geo_preview != null:
 		geo_preview.visible = on
 	if geo_drag >= 0:
-		if not on or not _button(MOUSE_BUTTON_LEFT) or geo_drag >= geo_points.size():
+		if not on or not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or geo_drag >= geo_points.size():
 			geo_drag = -1
 		else:
 			var to := camera.global_position - camera.global_basis.z * geo_drag_distance
@@ -2912,12 +2846,12 @@ func _update_box() -> void:
 	if box_dragging and (not tool in [Tool.BOX, Tool.SELECT_BOX] or not _captured()):
 		box_dragging = false
 	var box_button := MOUSE_BUTTON_LEFT if tool != Tool.SELECT_BOX or box_select_add else MOUSE_BUTTON_RIGHT
-	if box_dragging and not _button(box_button):
+	if box_dragging and not Input.is_mouse_button_pressed(box_button):
 		box_dragging = false
 		if tool == Tool.SELECT_BOX:
 			_apply_box_select(box_select_add)
 		else:
-			_apply_box(_shift_held())
+			_apply_box(Input.is_key_pressed(KEY_SHIFT))
 	if not box_dragging:
 		if box_preview != null:
 			box_preview.queue_free()
@@ -2926,7 +2860,7 @@ func _update_box() -> void:
 		return
 	var corners := _box_corners()
 	# (Select box: shown as a selection would be, or red taking away.)
-	var cut := _shift_held() if tool == Tool.BOX else not box_select_add
+	var cut := Input.is_key_pressed(KEY_SHIFT) if tool == Tool.BOX else not box_select_add
 	var changed := corners.size() != box_shown.size() or cut != box_preview_cut
 	for i in mini(corners.size(), box_shown.size()):
 		changed = changed or corners[i].distance_to(box_shown[i]) > 0.05
