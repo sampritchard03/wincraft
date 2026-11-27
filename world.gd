@@ -334,6 +334,10 @@ const SNAKE_STEPS_PER_FRAME := 8
 ## removes it, Z switches mirror / radial, + / - change the radial count.
 ## Mirror reflects across the plane holding the axis and the camera's up
 ## direction (left <-> right as seen when it was placed).
+## E on an object instead fixes the axis to it (symmetry_body), through its
+## centre of mass, and it moves and turns with it: along the way a frog or
+## chiggin faces (creature.gd, _forward(); its left and right mirrored),
+## or for anything else as the view was when E was pressed.
 enum Symmetry { MIRROR, RADIAL }
 var symmetry_on := false
 var symmetry := Symmetry.MIRROR
@@ -341,6 +345,9 @@ var radial_count := 4
 var axis_origin := Vector3.ZERO
 var axis_dir := Vector3.FORWARD
 var mirror_normal := Vector3.RIGHT
+var symmetry_body: DensityBody3D = null
+var symmetry_attached := false  # (a freed symmetry_body reads as null)
+var symmetry_local := Transform3D()  # (on symmetry_body) origin: the axis's point; x: axis_dir; y: mirror_normal
 var axis_line: MeshInstance3D
 var plane_line: MeshInstance3D  # mirror only: shows which way the mirror plane runs
 var ghost_previews: Array[MeshInstance3D] = []
@@ -678,9 +685,8 @@ func _input(event: InputEvent) -> void:
 		elif tool == Tool.TRANSFORM and event.button_index == MOUSE_BUTTON_LEFT and floating != null:
 			_gizmo_press()
 		elif event.button_index == MOUSE_BUTTON_MIDDLE:
-			var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
-			if hit != null:
-				var picked: int = terrain.get_block_material(hit)
+			var picked := _material_under_crosshair()
+			if picked != -1:
 				if picked >= 32768:  # a color
 					paint_color = terrain.get_material_color(picked)
 					color_picker.color = paint_color
@@ -795,12 +801,17 @@ func _input(event: InputEvent) -> void:
 			KEY_E:
 				if not dragging:
 					symmetry_on = true
+					symmetry_body = null
+					symmetry_attached = false
 					axis_origin = camera.global_position
 					axis_dir = -camera.global_basis.z
 					mirror_normal = camera.global_basis.x
+					_attach_symmetry()
 			KEY_Q:
 				if not dragging:
 					symmetry_on = false
+					symmetry_body = null
+					symmetry_attached = false
 			KEY_Z:
 				if not dragging:
 					symmetry = Symmetry.RADIAL if symmetry == Symmetry.MIRROR else Symmetry.MIRROR
@@ -896,6 +907,66 @@ func _cycle_tool(p_tools: Array) -> void:
 	var at := p_tools.find(tool)
 	_set_tool(p_tools[(at + 1) % p_tools.size()] if at >= 0 else p_tools[0])
 
+## Middle click: the material (or color, 32768 and up) of what the crosshair
+## is on, the ground or an object, whichever is nearer. -1: nothing.
+func _material_under_crosshair() -> int:
+	var from := camera.global_position
+	var dir := -camera.global_basis.z
+	var hit = terrain.raycast(from, dir, reach)
+	var aimed := DensityBody3D.raycast_bodies(from, dir, reach)
+	if not aimed.is_empty() and (hit == null or from.distance_to(aimed.position) < from.distance_to(hit)):
+		var body: DensityBody3D = aimed.body
+		if body.shape == null:
+			return body.material
+		# A little inside, so the nearest grid point is solid.
+		var inside: Vector3 = aimed.position + dir * 0.6 * _voxel_scale(body)
+		var m: int = body.shape.get_material_at(body.to_local(inside), body.pose, body.key_weights)
+		return m if m >= 0 else body.material
+	if hit != null:
+		return terrain.get_block_material(hit)
+	return -1
+
+## E while aiming at an object (nearer than the ground): the symmetry axis
+## goes on it, see symmetry_body.
+func _attach_symmetry() -> void:
+	var from := camera.global_position
+	var dir := -camera.global_basis.z
+	var aimed := DensityBody3D.raycast_bodies(from, dir, reach)
+	if aimed.is_empty():
+		return
+	var hit = terrain.raycast(from, dir, reach)
+	if hit != null and from.distance_to(hit) < from.distance_to(aimed.position):
+		return
+	var body: DensityBody3D = aimed.body
+	var forward := -camera.global_basis.z
+	var up := camera.global_basis.y
+	if body.has_method("_forward"):
+		# A creature: along where it faces, mirrored left to right.
+		up = body.global_basis.y.normalized()
+		forward = body._forward()
+		forward = (forward - up * forward.dot(up)).normalized()
+	var side := forward.cross(up).normalized()
+	symmetry_body = body
+	symmetry_attached = true
+	var inverse := body.global_transform.affine_inverse()
+	symmetry_local = Transform3D(Basis(inverse.basis * forward, inverse.basis * side, Vector3.ZERO), body.to_local(body.get_global_center_of_mass()))
+	_follow_symmetry_body()
+	_notify("Symmetry on the %s (E elsewhere: by the view again, Q: off)" % (body.scene_file_path.get_file().get_basename() if body.scene_file_path != "" else "object"))
+
+## The axis of an attached symmetry where its object is now.
+func _follow_symmetry_body() -> void:
+	if not symmetry_attached:
+		return
+	if not is_instance_valid(symmetry_body) or not symmetry_body.is_inside_tree():
+		symmetry_body = null
+		symmetry_attached = false
+		symmetry_on = false
+		return
+	var t := symmetry_body.global_transform
+	axis_origin = t * symmetry_local.origin
+	axis_dir = (t.basis * symmetry_local.basis.x).normalized()
+	mirror_normal = (t.basis * symmetry_local.basis.y).normalized()
+
 ## The symmetry copies of a brush as transforms (identity first).
 func _symmetry_copies() -> Array[Transform3D]:
 	var copies: Array[Transform3D] = [Transform3D.IDENTITY]
@@ -913,7 +984,11 @@ func _symmetry_copies() -> Array[Transform3D]:
 	return copies
 
 ## Positions of p_point under each copy, leaving out ones that land on an
-## earlier copy (on the axis or the mirror plane) so they don't apply twice.
+## earlier copy (the brush right on the axis or the mirror plane) so they
+## don't apply twice. Copies merely near each other are all kept: their
+## brushes (and markers) overlap, as they would in Blender. (This used to
+## merge copies within a quarter radius, so near the line the mirror
+## brush's marker vanished and only one of them applied.)
 ## Returns the indices of the copies kept.
 func _distinct_copies(p_copies: Array[Transform3D], p_point: Vector3) -> PackedInt32Array:
 	var kept := PackedInt32Array()
@@ -921,12 +996,24 @@ func _distinct_copies(p_copies: Array[Transform3D], p_point: Vector3) -> PackedI
 		var q := p_copies[i] * p_point
 		var duplicate := false
 		for j in kept:
-			if (p_copies[j] * p_point).distance_to(q) < maxf(1.0, brush_radius * 0.25):
+			if (p_copies[j] * p_point).distance_to(q) < 0.05:
 				duplicate = true
 				break
 		if not duplicate:
 			kept.append(i)
 	return kept
+
+## How big a voxel of p_body is in the world (1: the terrain's). Brushes on
+## a body are scaled by it, so the brush covers as many of its voxels as it
+## would of the terrain's: a fine-grained object gets a finer brush.
+func _voxel_scale(p_body: DensityBody3D) -> float:
+	if p_body == null or not is_instance_valid(p_body) or p_body.shape == null:
+		return 1.0
+	return p_body.shape.get_voxel_size() * absf(p_body.global_basis.get_scale().x)
+
+## The brush's radius in the world on p_body (null: the terrain).
+func _radius_on(p_body: DensityBody3D) -> float:
+	return brush_radius * _voxel_scale(p_body)
 
 ## _distinct_copies() for a body: only the copies whose brush reaches it
 ## (the axis needn't run through it; a copy off in the air would only grow
@@ -934,7 +1021,7 @@ func _distinct_copies(p_copies: Array[Transform3D], p_point: Vector3) -> PackedI
 func _body_copies(p_body: DensityBody3D, p_copies: Array[Transform3D], p_point: Vector3) -> PackedInt32Array:
 	var kept := PackedInt32Array()
 	for i in _distinct_copies(p_copies, p_point):
-		if i == 0 or p_body.get_density_at(p_copies[i] * p_point) > -brush_radius:
+		if i == 0 or p_body.get_density_at(p_copies[i] * p_point) > -_radius_on(p_body):
 			kept.append(i)
 	return kept
 
@@ -1011,6 +1098,7 @@ func take_step_times() -> String:
 	return ", ".join(parts)
 
 func _process(delta: float) -> void:
+	_follow_symmetry_body()
 	if Input.is_action_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
@@ -1310,7 +1398,7 @@ func _sculpt(delta: float) -> void:
 	brush_preview.visible = hit != null
 	if hit != null:
 		brush_preview.global_position = hit
-		brush_preview.scale = Vector3.ONE * brush_radius
+		brush_preview.scale = Vector3.ONE * _radius_on(target_body)
 
 	# Multiplayer: a body being sculpted or dragged stays with us meanwhile.
 	if held_body != null:
@@ -1378,13 +1466,16 @@ func _dab(p_hit: Vector3, p_body: DensityBody3D, p_strength: float, p_mode: int)
 		terrain.brush_stroke_direction = copies[i].basis * direction
 		var planed := p_mode == SculptTerrain.BRUSH_FLATTEN and flatten_locked
 		if p_body != null:
+			# In its voxels: the radius, and the strength (a distance for
+			# some brushes, which the body turns into its voxels).
+			var k := _voxel_scale(p_body)
 			# (Flattening a body to its own face: its own surface's, each dab.)
 			if planed and flatten_plane != FlattenPlane.FACE:
 				p_body.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
 			if p_mode == SculptTerrain.BRUSH_PAINT and coloring:
-				p_body.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
+				p_body.paint_color(at, brush_radius * k, paint_color, paint_opacity, paint_hardness)
 			else:
-				p_body.apply_brush(at, brush_radius, p_strength, p_mode, material)
+				p_body.apply_brush(at, brush_radius * k, p_strength * k, p_mode, material)
 			p_body.clear_flatten_plane()
 		elif p_mode == SculptTerrain.BRUSH_PAINT and coloring:
 			terrain.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
@@ -1422,7 +1513,7 @@ func _pick_flatten_plane(p_hit: Vector3, p_body: DensityBody3D) -> void:
 func _surface_normal(p_point: Vector3, p_body: DensityBody3D) -> Vector3:
 	if p_body == null:
 		return terrain.get_normal(p_point, brush_radius * 0.5)
-	var h := maxf(brush_radius * 0.5, 0.5)
+	var h := maxf(_radius_on(p_body) * 0.5, 0.5 * _voxel_scale(p_body))
 	var gradient := Vector3(
 			p_body.get_density_at(p_point + Vector3(h, 0, 0)) - p_body.get_density_at(p_point - Vector3(h, 0, 0)),
 			p_body.get_density_at(p_point + Vector3(0, h, 0)) - p_body.get_density_at(p_point - Vector3(0, h, 0)),
@@ -1443,12 +1534,12 @@ func _lazy(p_hit: Vector3) -> Vector3:
 	if lazy_point == null:
 		lazy_point = p_hit
 		return p_hit
-	var length := lazy_mouse * brush_radius * 3.0
+	var length := lazy_mouse * _radius_on(target_body) * 3.0
 	var d: Vector3 = p_hit - lazy_point
 	if d.length() > length:
 		lazy_point += d.normalized() * (d.length() - length)
 	var from := camera.global_position
-	var on = _surface_along(from, (lazy_point - from).normalized(), from.distance_to(lazy_point) + brush_radius * 2.0, target_body)
+	var on = _surface_along(from, (lazy_point - from).normalized(), from.distance_to(lazy_point) + _radius_on(target_body) * 2.0, target_body)
 	if on != null:
 		lazy_point = on
 	return lazy_point
@@ -1481,11 +1572,11 @@ func _brush_line(p_from: Vector3) -> void:
 	if body != null:
 		_hold_body(body)
 	flatten_locked = false
-	var spacing := maxf(brush_radius * 0.25, 0.5)
+	var spacing := maxf(_radius_on(body) * 0.25, 0.5 * _voxel_scale(body))
 	var steps := maxi(ceili(p_from.distance_to(to) / spacing), 1)
 	for k in steps + 1:
 		var q: Vector3 = p_from.lerp(to, float(k) / steps)
-		var on = _surface_along(from, (q - from).normalized(), from.distance_to(q) + brush_radius * 2.0, body)
+		var on = _surface_along(from, (q - from).normalized(), from.distance_to(q) + _radius_on(body) * 2.0, body)
 		_dab(on if on != null else q, body, brush_strength * LINE_DAB * (-1.0 if inverted else 1.0), mode)
 	_release_held_body()
 	terrain.end_stroke()
@@ -1549,7 +1640,7 @@ func _update_clone_marker(p_hit) -> void:
 	clone_marker.visible = p_hit != null and clone_source != null
 	if clone_marker.visible:
 		clone_marker.global_position = p_hit + clone_offset if clone_offset != null else clone_source
-		clone_marker.scale = Vector3.ONE * maxf(brush_radius * 0.3, 0.5)
+		clone_marker.scale = Vector3.ONE * maxf(_radius_on(target_body) * 0.3, 0.5 * _voxel_scale(target_body))
 
 ## The wheel eases the radius and strength to what it's set them to.
 func _ease_brush(delta: float) -> void:
@@ -1685,12 +1776,12 @@ func _drag(p_target: Vector3) -> Vector3:
 				deltas.append(drag_copies[i].basis * delta)
 			if drag_body != null:
 				if is_instance_valid(drag_body):
-					drag_body.warp_copies(centers, deltas, brush_radius, true)
+					drag_body.warp_copies(centers, deltas, _radius_on(drag_body), true)
 				return p_target
 			terrain.warp(centers, deltas, brush_radius, true)
 		return p_target
 	# Snake hook: pulls material along in short steps.
-	var max_step := minf(brush_radius * SNAKE_STEP, 8.0)
+	var max_step := minf(_radius_on(drag_body) * SNAKE_STEP, 8.0 * _voxel_scale(drag_body))
 	for step_index in SNAKE_STEPS_PER_FRAME:
 		var move := p_target - drag_start
 		if move.length() < 0.05:
@@ -1704,7 +1795,7 @@ func _drag(p_target: Vector3) -> Vector3:
 			deltas.append(drag_copies[i].basis * step)
 		if drag_body != null:
 			if is_instance_valid(drag_body):
-				drag_body.warp_copies(centers, deltas, brush_radius, false)
+				drag_body.warp_copies(centers, deltas, _radius_on(drag_body), false)
 			continue
 		terrain.warp(centers, deltas, brush_radius, false)
 	return drag_start
@@ -1764,7 +1855,7 @@ func _twist() -> Vector3:
 			bases.append(copy.basis * change * copy.basis.inverse())
 		if twist_body != null:
 			if is_instance_valid(twist_body):
-				twist_body.twist(centers, bases, brush_radius)
+				twist_body.twist(centers, bases, _radius_on(twist_body))
 		else:
 			terrain.twist(centers, bases, brush_radius)
 	return twist_center
