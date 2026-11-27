@@ -36,6 +36,16 @@ constexpr double WAKE_SPEED = 1.0;
 constexpr int MAX_CONTACTS = 16;
 // The player counts as standing when its lowest sphere is this close to a floor.
 constexpr double SKIN = 0.3;
+// The player's mass per cubic voxel: about what bodies made from the ground
+// weigh (DensityShape's MASS_PER_VOXEL), so pushing a boulder the size of
+// it is hard work and a pebble isn't.
+constexpr double PLAYER_MASS_PER_VOXEL = 0.01;
+
+// The player (a frozen capsule) walking into something pushes it itself,
+// in DensityCharacter3D::push_bodies(), as hard as it can.
+bool is_character(const DensityBody3D *p_body) {
+	return p_body != nullptr && p_body->is_freeze() && Object::cast_to<DensityCharacter3D>(const_cast<DensityBody3D *>(p_body)) != nullptr;
+}
 
 Basis zero_basis() {
 	return Basis(Vector3(), Vector3(), Vector3());
@@ -395,8 +405,21 @@ void DensityBody3D::separate(DensityBody3D *a, DensityBody3D *b, const Vector3 &
 
 void DensityBody3D::resolve(DensityBody3D *a, DensityBody3D *b, const Vector3 &p_point, const Vector3 &p_normal, double p_depth,
 		double p_rest_speed, int p_sphere_a, int p_sphere_b, bool p_separate) {
-	const Vector3 vb = b != nullptr ? b->point_velocity(p_point) : Vector3();
-	const double approach = (a->point_velocity(p_point) - vb).dot(p_normal);
+	// The player's own push is already done (DensityCharacter3D::push_bodies()):
+	// here it only stops what it's in the way of, not shoving it at full
+	// walking speed whatever it weighs (its mass counts as infinite here).
+	const bool character = is_character(b);
+	auto b_velocity = [&]() {
+		Vector3 v = b != nullptr ? b->point_velocity(p_point) : Vector3();
+		if (character) {
+			const double towards = v.dot(p_normal);
+			if (towards > 0.0) {
+				v -= p_normal * towards;
+			}
+		}
+		return v;
+	};
+	const double approach = (a->point_velocity(p_point) - b_velocity()).dot(p_normal);
 	// Something moving (or frozen, so pushing) wakes a sleeper it hits.
 	const bool hard = p_depth > 2.0 * SLOP || approach < -WAKE_SPEED;
 	if (b != nullptr && hard) {
@@ -420,7 +443,7 @@ void DensityBody3D::resolve(DensityBody3D *a, DensityBody3D *b, const Vector3 &p
 		separate(a, b, p_normal, p_depth);
 	}
 	auto relative = [&]() {
-		return a->point_velocity(p_point) - (b != nullptr ? b->point_velocity(p_point) : Vector3());
+		return a->point_velocity(p_point) - b_velocity();
 	};
 	Vector3 v = relative();
 	const double vn = v.dot(p_normal);
@@ -1158,7 +1181,6 @@ void DensityBody3D::_bind_methods() {
 DensityCharacter3D::DensityCharacter3D() {
 	freeze = true;
 	can_sleep = false;
-	mass = 1000.0;
 	rebuild_spheres();
 }
 
@@ -1225,6 +1247,7 @@ void DensityCharacter3D::rebuild_spheres() {
 		list.push_back(q);
 	}
 	set_spheres(list);
+	mass = std::max(PLAYER_MASS_PER_VOXEL * Math_PI * r * r * (h - 2.0 * r + 4.0 / 3.0 * r), 1e-3);
 	capsule_radius = r;
 	capsule_a = Vector3(0, (float)r, 0);
 	capsule_b = Vector3(0, (float)(h - r), 0);
@@ -1418,6 +1441,66 @@ double DensityCharacter3D::gap(SculptTerrain *p_terrain, const Vector3 &p_center
 	return best;
 }
 
+void DensityCharacter3D::push_bodies(const Vector3 &p_feet, double p_dt, double p_gravity) {
+	if (near_bodies.empty() || p_dt <= 0.0) {
+		return;
+	}
+	const double floor_cos = std::cos(floor_max_angle);
+	const Vector3 ahead = p_feet + velocity * (float)p_dt;
+	// The most it can push with over this step, however light it is.
+	const double most = push_strength * mass * std::max(p_gravity, 0.0) * p_dt;
+	for (DensityBody3D *b : near_bodies) {
+		if (!b->dynamic()) {
+			continue; // frozen (or another computer's, online): not pushed
+		}
+		// Where the capsule, moved on by this step, goes into it deepest
+		// (or comes within SKIN of it).
+		double deepest = -SKIN;
+		Vector3 normal, point;
+		bool found = false;
+		for (int k = 0; k < axis_count(); k++) {
+			const Vector3 c = axis_point(ahead, k);
+			const double r = samples[k].w;
+			const double reach = b->bound + r + 1.0;
+			if (b->com.distance_squared_to(c) > reach * reach) {
+				continue;
+			}
+			Vector3 n;
+			const double depth = b->distance_at(c, n) + r;
+			if (depth > deepest && n.length_squared() > 1e-12) {
+				deepest = depth;
+				normal = n.normalized();
+				point = c - normal * (float)r;
+				found = true;
+			}
+		}
+		// Standing on it isn't pushing it.
+		if (!found || normal.y >= floor_cos) {
+			continue;
+		}
+		const Vector3 into = -normal;
+		const double vp = velocity.dot(into);
+		const double vb = b->point_velocity(point).dot(into);
+		if (vp <= vb) {
+			continue; // not catching it up
+		}
+		// An inelastic collision between the two (both then move on at the
+		// same speed: a light thing at nearly the player's, a heavy one
+		// barely), unless that needs more than the player can push.
+		const double k = b->response(point, into);
+		const double j = std::min((vp - vb) / (1.0 / mass + k), most);
+		if (j <= 0.0) {
+			continue;
+		}
+		// (push() takes a world point, as response() does; apply_impulse()'s
+		// position is an offset from the body's origin.)
+		b->push(into * (float)j, point);
+		b->wake();
+		// No faster into it than it now gives way.
+		velocity -= into * (float)(vp - (vb + j * k));
+	}
+}
+
 bool DensityCharacter3D::move_and_slide() {
 	SculptTerrain *terrain = SculptTerrain::get_singleton();
 	const double dt = get_physics_process_delta_time();
@@ -1450,6 +1533,7 @@ bool DensityCharacter3D::move_and_slide() {
 			}
 		}
 	}
+	push_bodies(feet, dt, terrain->get_gravity());
 	bool touched = false;
 	auto classify = [&](const Vector3 &n) {
 		if (n.y >= floor_cos) {
@@ -1590,6 +1674,8 @@ void DensityCharacter3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_floor_snap_length"), &DensityCharacter3D::get_floor_snap_length);
 	ClassDB::bind_method(D_METHOD("set_step_height", "voxels"), &DensityCharacter3D::set_step_height);
 	ClassDB::bind_method(D_METHOD("get_step_height"), &DensityCharacter3D::get_step_height);
+	ClassDB::bind_method(D_METHOD("set_push_strength", "weights"), &DensityCharacter3D::set_push_strength);
+	ClassDB::bind_method(D_METHOD("get_push_strength"), &DensityCharacter3D::get_push_strength);
 	ClassDB::bind_method(D_METHOD("move_and_slide"), &DensityCharacter3D::move_and_slide);
 	ClassDB::bind_method(D_METHOD("is_on_floor"), &DensityCharacter3D::is_on_floor);
 	ClassDB::bind_method(D_METHOD("is_on_wall"), &DensityCharacter3D::is_on_wall);
@@ -1604,4 +1690,5 @@ void DensityCharacter3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "floor_max_angle", PROPERTY_HINT_RANGE, "0,180,0.1,radians_as_degrees"), "set_floor_max_angle", "get_floor_max_angle");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "floor_snap_length", PROPERTY_HINT_RANGE, "0,32,0.1,suffix:voxels"), "set_floor_snap_length", "get_floor_snap_length");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "step_height", PROPERTY_HINT_RANGE, "0,32,0.1,suffix:voxels"), "set_step_height", "get_step_height");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "push_strength", PROPERTY_HINT_RANGE, "0,10,0.1,or_greater"), "set_push_strength", "get_push_strength");
 }

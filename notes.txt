@@ -1,3 +1,8 @@
-Player should not be as strong as they are. Objects should be 
-harder to push proportional to their mass.
+When using physics gun, if holding tab, the object should be rotated with the mouse.
+
+Shift right click with any tool should grab onto the ground and allow you to hoist into the air
+like the handles in create aeronautics. Do not copy the code directly from aeronautics or mention
+it in comments.
+
+There should be a hotkey to toggle between walking with physics, freecam and orbital freecam.
 

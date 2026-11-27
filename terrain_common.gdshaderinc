@@ -25,6 +25,10 @@ uniform sampler2DArray clip_bricks : filter_nearest, repeat_enable;
 uniform float clip_brick_count = 32.0; // bricks per level side
 uniform int clip_count = 0;
 uniform vec3 clip_origin[8]; // world position of each level's first texel
+// Texels from clip_origin each level holds right: its size, or less while a
+// move is uploading (only where the old and new boxes overlap; see
+// SculptTerrain::bind_material()).
+uniform vec3 clip_extent[8];
 uniform float clip_size = 256.0;
 // Level l is used within clip_reach * 2^l voxels of the camera (largest of
 // |dx|, |dy|, |dz|); Clipmap::reach(). Its box always reaches 3 texels beyond.
@@ -46,9 +50,15 @@ const int MAX_STEPS = 160;
 // edited chunks.
 const float HIT_LIMIT = 4.0;
 
-bool inside(vec3 q) {
+bool inside(vec3 q, vec3 extent) {
 	// Keep a texel of margin for interpolation and the normal's samples.
-	return all(greaterThanEqual(q, vec3(1.0))) && all(lessThanEqual(q, vec3(clip_size - 2.0)));
+	return all(greaterThanEqual(q, vec3(1.0))) && all(lessThanEqual(q, extent - 2.0));
+}
+
+// How many texels q is inside that box (Chebyshev, like the reach).
+float box_left(vec3 q, vec3 extent) {
+	vec3 left = min(q - 1.0, extent - 2.0 - q);
+	return min(min(left.x, left.y), left.z);
 }
 
 // Whether a density read from a level with `scale` voxels per texel is an
@@ -63,8 +73,10 @@ bool near_surface(float d, float scale) {
 // (Chebyshev) from one with surface, so the surface is at least k - 1 bricks
 // of texels away (2 fewer for interpolation). Surface beyond this level's
 // reach is the next level's business (and unknown to this one), so the jump
-// stops just past it: reach_left is how far that is, in texels. Both depend
-// only on the camera and the world, not on where the level's box sits.
+// stops just past it: reach_left is how far that is, in texels (or to the
+// edge of what the level holds right, if nearer: while a move uploads).
+// Normally both depend only on the camera and the world, not on where the
+// level's box sits.
 float far_distance(vec3 w, float level, float reach_left, float scale) {
 	vec3 brick = floor(w / BRICK);
 	float layer = level * clip_brick_count + mod(brick.z, clip_brick_count);
@@ -112,7 +124,7 @@ LEVEL_SAMPLER(level7, clip_texture7, 7.0, 128.0)
 // the points. Colors blend: a colored result is the vote-weighted average of
 // the colored points, so painted gradients come out smooth.
 #define MATERIAL_LEVEL(L, TEX, SCALE) \
-if (clip_count > L && reach <= clip_reach * SCALE && inside((p - clip_origin[L]) / SCALE)) { \
+if (clip_count > L && reach <= clip_reach * SCALE && inside((p - clip_origin[L]) / SCALE, clip_extent[L])) { \
 	vec3 w = p / SCALE; \
 	vec3 b = floor(w); \
 	vec3 f = w - b; \
@@ -180,15 +192,15 @@ vec4 material_at(vec3 p) {
 #define TRY_LEVEL(L, NAME, NEXT, SCALE, BLENDING) \
 if (clip_count > L && reach <= clip_reach * SCALE) { \
 	vec3 q = (p - clip_origin[L]) / SCALE; \
-	if (inside(q)) { \
+	if (inside(q, clip_extent[L])) { \
 		r_scale = SCALE; \
-		float d = NAME(p, clip_reach - reach / SCALE, r_far); \
+		float d = NAME(p, min(clip_reach - reach / SCALE, box_left(q, clip_extent[L])), r_far); \
 		float w = clamp((clip_reach * SCALE - reach) / (BLEND * SCALE), 0.0, 1.0); \
 		if (BLENDING && w < 1.0 && clip_count > L + 1) { \
 			vec3 q_next = (p - clip_origin[L + 1]) / (SCALE * 2.0); \
-			if (inside(q_next)) { \
+			if (inside(q_next, clip_extent[L + 1])) { \
 				float far_next; \
-				d = mix(NEXT(p, clip_reach - reach / (SCALE * 2.0), far_next), d, w); \
+				d = mix(NEXT(p, min(clip_reach - reach / (SCALE * 2.0), box_left(q_next, clip_extent[L + 1])), far_next), d, w); \
 				r_far = near_surface(d, SCALE) ? -d : min(r_far, far_next); \
 			} \
 		} \
@@ -208,9 +220,9 @@ if (clip_count > L && reach <= clip_reach * SCALE) { \
 	TRY_LEVEL(6, level6, level7, 64.0, BLENDING) \
 	if (clip_count > 7 && reach <= clip_reach * 128.0) { \
 		vec3 q = (p - clip_origin[7]) / 128.0; \
-		if (inside(q)) { \
+		if (inside(q, clip_extent[7])) { \
 			r_scale = 128.0; \
-			return level7(p, clip_reach - reach / 128.0, r_far); \
+			return level7(p, min(clip_reach - reach / 128.0, box_left(q, clip_extent[7])), r_far); \
 		} \
 	} \
 	r_scale = exp2(float(max(clip_count - 1, 0))); \

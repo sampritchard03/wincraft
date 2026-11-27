@@ -93,6 +93,33 @@ var drag_body: DensityBody3D = null
 var gun_body: DensityBody3D = null
 var gun_distance := 0.0
 var gun_point := Vector3.ZERO
+## Holding Tab while the physics gun holds a body turns it with the mouse
+## (about the view's up and right axes); from then on it's held at that
+## turn (gun_basis, world space) rather than left to spin.
+var gun_turned := false
+var gun_basis := Basis.IDENTITY
+
+## How you get about (V cycles): walking (the player's capsule, gravity,
+## collisions), a free camera flying through everything, or one orbiting a
+## point (WASD / Space / Shift move the point, Alt + wheel the distance).
+## Flying, the capsule rides along under the camera, not touching bodies.
+enum MoveMode { WALK, FREECAM, ORBIT }
+const MOVE_MODE_NAMES := ["Walking", "Freecam", "Orbit cam"]
+var move_mode := MoveMode.WALK
+var orbit_pivot := Vector3.ZERO
+var orbit_distance := 60.0
+
+## Hoist (Shift + RMB, any tool, walking): holds on to the ground where you
+## clicked. While held you're drawn to the point hoist_distance back along
+## your line of sight to it, so looking down at it lifts you up, looking
+## around swings you round it, and the wheel lets out or takes in the reach.
+var hoisting := false
+var hoist_anchor := Vector3.ZERO
+var hoist_distance := 0.0
+## How quickly you're drawn there (per second), and at most how fast, in
+## walking speeds.
+const HOIST_PULL := 8.0
+const HOIST_MAX_SPEED := 6.0
 ## Select fill acts once per click.
 var fill_clicked := false
 ## Physics objects picked with the selection tools (clicking one; right
@@ -521,7 +548,10 @@ func _input(event: InputEvent) -> void:
 	if hud.radial.visible and _radial_input(event):
 		get_viewport().set_input_as_handled()
 		return
-	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and gun_body != null \
+			and Input.is_physical_key_pressed(KEY_TAB):
+		_turn_gun_body(event.relative)
+	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		yaw -= event.relative.x * mouse_sensitivity
 		pitch = clampf(pitch - event.relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
 		camera.rotation = Vector3(pitch, yaw, 0.0)
@@ -535,6 +565,8 @@ func _input(event: InputEvent) -> void:
 				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 				capture_click = true
 				get_viewport().gui_release_focus()  # back to playing: keys are hotkeys again
+		elif event.button_index == MOUSE_BUTTON_RIGHT and event.shift_pressed and _begin_hoist():
+			pass  # (and not the tool's right button)
 		elif tool == Tool.PHYSICS_GUN and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
 			var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
 			if not aimed.is_empty():
@@ -546,6 +578,7 @@ func _input(event: InputEvent) -> void:
 					body.sleeping = false
 				else:
 					gun_body = body
+					gun_turned = false
 					gun_distance = aimed.distance
 					gun_point = body.to_local(aimed.position)
 		elif tool in [Tool.BOX, Tool.BOX_CUT] and event.button_index in [MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT]:
@@ -568,7 +601,11 @@ func _input(event: InputEvent) -> void:
 					block = picked
 		elif event.button_index == MOUSE_BUTTON_WHEEL_UP or event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
 			var step := 1.15 if event.button_index == MOUSE_BUTTON_WHEEL_UP else 1.0 / 1.15
-			if event.shift_pressed:
+			if hoisting:
+				hoist_distance = clampf(hoist_distance * step, 2.0, reach)  # let out / take in
+			elif move_mode == MoveMode.ORBIT and event.alt_pressed:
+				orbit_distance = clampf(orbit_distance * step, 2.0, reach * 4.0)
+			elif event.shift_pressed:
 				_set_player_height(player_height * step)  # the player's size, and all that goes with it
 			elif gun_body != null:
 				gun_distance = clampf(gun_distance * step, 4.0, reach)  # pull in / push out
@@ -601,7 +638,8 @@ func _input(event: InputEvent) -> void:
 	elif event is InputEventKey and event.pressed and not event.echo:
 		if event.physical_keycode == KEY_TAB:
 			# Held: the tool wheel (_radial_input() picks on release).
-			if not dragging and not stroking and gizmo_axis < 0:
+			# (Holding a body with the physics gun, Tab turns it instead.)
+			if not dragging and not stroking and gizmo_axis < 0 and gun_body == null:
 				hud.radial.open(tool)
 			get_viewport().set_input_as_handled()  # not the GUI's focus-next
 			return
@@ -678,6 +716,8 @@ func _input(event: InputEvent) -> void:
 					radial_count = maxi(radial_count - 1, 2)
 			KEY_BACKSLASH:
 				respawn(camera.position)
+			KEY_V:
+				_cycle_move_mode()
 			KEY_K:
 				_set_player_height(player_height + 1)
 			KEY_L:
@@ -881,14 +921,17 @@ func _process(delta: float) -> void:
 	# The camera rides on top of the player (moved in _physics_process).
 	# Small ups and downs while walking (steps, rough ground) are eased, so
 	# the view glides instead of jolting; anything bigger is followed at once.
-	var eye := player.global_position + Vector3.UP * player_height
-	var off := camera_lag
-	if player.is_on_floor() and absf(off) < player.step_height * 2.0:
-		off *= exp(-delta * 18.0)
+	if move_mode == MoveMode.WALK:
+		var eye := player.global_position + Vector3.UP * player_height
+		var off := camera_lag
+		if player.is_on_floor() and absf(off) < player.step_height * 2.0:
+			off *= exp(-delta * 18.0)
+		else:
+			off = 0.0
+		camera_lag = off
+		camera.global_position = eye + Vector3.UP * camera_lag
 	else:
-		off = 0.0
-	camera_lag = off
-	camera.global_position = eye + Vector3.UP * camera_lag
+		_fly(delta)
 	var t := Time.get_ticks_usec()
 	if vr != null and vr.active:
 		vr.follow(player.global_position)  # the headset decides where the camera is
@@ -925,12 +968,29 @@ func _physics_process(delta: float) -> void:
 	# computer; see network.gd); only ones that fell out of the world go.
 	balls.stream(player.global_position, not network.is_online())
 
+	if move_mode == MoveMode.WALK:
+		_walk(delta)
+	_update_physics_gun(delta)
+
+## The player's move this physics frame, walking (or hoisting).
+func _walk(delta: float) -> void:
+	var size_scale := player_height / BASE_PLAYER_HEIGHT
+	if hoisting and not Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
+		hoisting = false  # let go: falls from there, keeping the speed it had
+	if hoisting:
+		# Drawn to hoist_distance back along the line of sight to the hold
+		# (camera z points back), no gravity meanwhile; still colliding.
+		var eye := player.global_position + Vector3.UP * player_height
+		var want := hoist_anchor + camera.global_basis.z * hoist_distance
+		player.velocity = ((want - eye) * HOIST_PULL).limit_length(move_speed * size_scale * HOIST_MAX_SPEED)
+		player.move_and_slide()
+		camera_lag = 0.0
+		return
 	var facing := -camera.global_basis.z
 	facing = Vector3(facing.x, 0.0, facing.z).normalized()
 	var side := facing.cross(Vector3.UP)
 	var forward: float = Input.get_action_strength("forward") - Input.get_action_strength("back")
 	var right: float = Input.get_action_strength("right") - Input.get_action_strength("left")
-	var size_scale := player_height / BASE_PLAYER_HEIGHT
 	var speed: float = move_speed * size_scale * (4.0 if Input.is_action_pressed("sprint") else 1.0)
 	var walk := (facing * forward + side * right).normalized() * speed
 	player.velocity.x = walk.x
@@ -945,7 +1005,78 @@ func _physics_process(delta: float) -> void:
 	camera_lag -= player.global_position.y - feet_before
 	if not player.is_on_floor():
 		camera_lag = 0.0
-	_update_physics_gun(delta)
+
+## Freecam / orbit cam, each frame: moves the camera (WASD, Space / Shift
+## for up / down, Ctrl 4x), and the player's capsule along under it, so
+## loading, wrapping and saving go on as if it walked there.
+func _fly(delta: float) -> void:
+	var size_scale := player_height / BASE_PLAYER_HEIGHT
+	var speed: float = move_speed * size_scale * 2.0 * (4.0 if Input.is_action_pressed("sprint") else 1.0)
+	var forward: float = Input.get_action_strength("forward") - Input.get_action_strength("back")
+	var right: float = Input.get_action_strength("right") - Input.get_action_strength("left")
+	var up: float = Input.get_action_strength("jump") - Input.get_action_strength("sneak")
+	var b := camera.global_basis
+	if move_mode == MoveMode.FREECAM:
+		# Where you look, and straight up / down.
+		var move := -b.z * forward + b.x * right + Vector3.UP * up
+		if move.length_squared() > 0.0:
+			camera.global_position += move.normalized() * speed * delta
+	else:
+		# The point moves level with the view (and up / down), faster the
+		# farther out it's looked at from.
+		var facing := Vector3(-b.z.x, 0.0, -b.z.z).normalized()
+		var move := facing * forward + b.x * right + Vector3.UP * up
+		if move.length_squared() > 0.0:
+			orbit_pivot += move.normalized() * speed * maxf(1.0, orbit_distance / 60.0) * delta
+		camera.global_position = orbit_pivot + b.z * orbit_distance
+	player.global_position = camera.global_position - Vector3.UP * player_height
+	player.velocity = Vector3.ZERO
+	camera_lag = 0.0
+
+## V: walking -> freecam -> orbit cam -> walking.
+func _cycle_move_mode() -> void:
+	if vr != null and vr.active:
+		return  # (the headset decides where the camera is)
+	hoisting = false
+	move_mode = ((move_mode + 1) % MOVE_MODE_NAMES.size()) as MoveMode
+	player.collide_with_bodies = move_mode == MoveMode.WALK
+	camera_lag = 0.0
+	match move_mode:
+		MoveMode.ORBIT:
+			# Round what's under the crosshair (or a way in front).
+			var look := -camera.global_basis.z
+			var hit = terrain.raycast(camera.global_position, look, reach)
+			orbit_distance = maxf(camera.global_position.distance_to(hit), 2.0) if hit != null else 60.0 * player_height / BASE_PLAYER_HEIGHT
+			orbit_pivot = camera.global_position + look * orbit_distance
+		MoveMode.WALK:
+			player.velocity = Vector3.ZERO
+			# Not inside the ground: up out of it if the camera was.
+			if terrain.get_density(player.global_position + Vector3.UP * player_height * 0.5) > -1.0:
+				respawn(camera.position)
+	_notify("%s (V switches)" % MOVE_MODE_NAMES[move_mode])
+
+## Shift + RMB: takes hold of the ground under the crosshair (walking).
+## False if there's none, so the click goes to the tool.
+func _begin_hoist() -> bool:
+	if move_mode != MoveMode.WALK or (vr != null and vr.active):
+		return false
+	var hit = terrain.raycast(camera.global_position, -camera.global_basis.z, reach)
+	if hit == null:
+		return false
+	hoisting = true
+	hoist_anchor = hit
+	hoist_distance = maxf(camera.global_position.distance_to(hit), 2.0)
+	return true
+
+## Tab + mouse with the physics gun: turns the held body about the view's
+## up axis (left / right) and right axis (up / down), the near side
+## following the mouse.
+func _turn_gun_body(p_relative: Vector2) -> void:
+	if not gun_turned:
+		gun_basis = gun_body.global_basis.orthonormalized()
+		gun_turned = true
+	var b := camera.global_basis
+	gun_basis = (Basis(b.y, p_relative.x * mouse_sensitivity) * Basis(b.x, p_relative.y * mouse_sensitivity) * gun_basis).orthonormalized()
 
 ## The world wraps around in x and z every world_size voxels. Coordinates
 ## are kept within about half that of 0 (where float precision is best) by
@@ -970,6 +1101,8 @@ func _wrap_player() -> void:
 	axis_origin += offset
 	for i in geo_points.size():
 		geo_points[i] += offset  # (the preview body moves itself)
+	hoist_anchor += offset
+	orbit_pivot += offset
 
 ## The color picker (C): an RGB picker with opacity and hardness sliders.
 func _make_color_panel() -> void:
@@ -1033,7 +1166,7 @@ func _spawn_frog() -> void:
 
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
-	var sculpting := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not capture_click and not hud.radial.visible
+	var sculpting := Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and not capture_click and not hud.radial.visible and not hoisting
 	var held := sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var pressing := held or (sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX, Tool.BOX_CUT]:
@@ -1466,12 +1599,23 @@ func _update_physics_gun(p_delta: float) -> void:
 		return
 	network.use(gun_body)  # (multiplayer: stays with us while held)
 	var target := camera.global_position - camera.global_basis.z * gun_distance
-	var point := gun_body.to_global(gun_point)
 	if gun_body.freeze:
-		gun_body.global_position += target - point
+		if gun_turned:
+			gun_body.global_basis = gun_basis * Basis.from_scale(gun_body.global_basis.get_scale())
+		gun_body.global_position += target - gun_body.to_global(gun_point)
 	else:
+		var point := gun_body.to_global(gun_point)
 		gun_body.linear_velocity = (target - point) * 12.0 + Vector3.UP * gravity * gun_body.gravity_scale * p_delta
-		gun_body.angular_velocity *= 0.85
+		if gun_turned:
+			# Spun towards the turn it's held at (the grabbed point is pulled
+			# back to the crosshair meanwhile).
+			var q := (gun_basis * gun_body.global_basis.orthonormalized().inverse()).get_rotation_quaternion()
+			if q.w < 0.0:
+				q = -q
+			var angle := q.get_angle()
+			gun_body.angular_velocity = q.get_axis() * angle * 12.0 if angle > 1e-4 else Vector3.ZERO
+		else:
+			gun_body.angular_velocity *= 0.85
 
 ## Ctrl+P: saves the selection (shape, colours and materials) as a
 ## DensityShape file, which a body's `shape` can use (a frog's, say).

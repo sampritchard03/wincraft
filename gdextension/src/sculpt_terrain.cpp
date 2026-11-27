@@ -462,10 +462,32 @@ bool SculptTerrain::upload_level(int p_level, int &r_budget) {
 }
 
 void SculptTerrain::bind_material() {
+	// What each level's GPU copy holds right: its box, or while a move is
+	// uploading (published_origin, the old box, still drawn; origin the new
+	// one) only where the two overlap. Layers go up whole, so some of the old
+	// box's storage slots already hold the new box's texels from the far side
+	// (storage wraps); they lie beyond the level's reach only while the camera
+	// carries on the way it was going. Coming back (landing from a jump,
+	// walking to and fro) brought them in reach: terrain from the far side
+	// flashed up in front of the camera.
 	PackedVector3Array origins;
+	PackedVector3Array extents;
+	const int n = clipmap.get_size();
 	for (int l = 0; l < MAX_CLIP_LEVELS; l++) {
 		const bool used = l < clipmap.get_level_count() && clipmap.level(l).published;
-		origins.push_back(used ? Vector3(clipmap.level(l).published_origin * clipmap.level(l).scale) : Vector3());
+		if (!used) {
+			origins.push_back(Vector3());
+			extents.push_back(Vector3());
+			continue;
+		}
+		const Clipmap::Level &level = clipmap.level(l);
+		Vector3i lo = level.published_origin, hi = level.published_origin + Vector3i(n, n, n);
+		if (level.origin != level.published_origin) {
+			lo = lo.max(level.origin);
+			hi = hi.min(level.origin + Vector3i(n, n, n));
+		}
+		origins.push_back(Vector3(lo * level.scale));
+		extents.push_back(Vector3((hi - lo).maxi(0)));
 	}
 	int count = 0;
 	while (count < clipmap.get_level_count() && clipmap.level(count).published && clip_textures[count].is_valid()) {
@@ -479,6 +501,7 @@ void SculptTerrain::bind_material() {
 		m->set_shader_parameter("clip_brick_count", (float)clipmap.get_brick_count());
 		m->set_shader_parameter("clip_count", count);
 		m->set_shader_parameter("clip_origin", origins);
+		m->set_shader_parameter("clip_extent", extents);
 		m->set_shader_parameter("clip_size", (float)clipmap.get_size());
 		m->set_shader_parameter("clip_reach", (float)clipmap.reach());
 		m->set_shader_parameter("view_distance_limit", (float)view_distance);

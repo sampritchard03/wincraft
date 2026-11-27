@@ -285,7 +285,7 @@ func _icon(p_texture: Texture2D, p_size: float) -> TextureRect:
 
 const HELP := [
 	["Tools", ""],
-	["Tab (hold)", "Tool wheel: point at a tool, let go to pick it"],
+	["Tab (hold)", "Tool wheel: point at a tool, let go to pick it (holding with the physics gun: turn it with the mouse)"],
 	["1 - 0", "Draw / Inflate, Smooth / Pinch, Flatten, Grab, Snake hook, Paint, Select (paint / fill / geometry), Extrude / Transform, Physics gun, Geometry / Box / Box cut"],
 	["LMB / RMB", "Sculpt / carve (Inflate, Pinch: the opposite)"],
 	["Wheel", "Brush radius (Ctrl: strength, Shift: your size)"],
@@ -310,6 +310,8 @@ const HELP := [
 	["B", "Blocky mode"],
 	["Ctrl+Z / Ctrl+Y", "Undo / redo (Ctrl+Shift+Z too)"],
 	["K / L", "Grow / shrink"],
+	["V", "Walk / freecam / orbit cam (WASD, Space / Shift: up / down; orbit: Alt+wheel zooms)"],
+	["Shift+RMB (hold)", "Hoist: hold on to the ground and swing up by looking at it (wheel: reach)"],
 	["\\", "Respawn"],
 	["H", "This list"],
 ]

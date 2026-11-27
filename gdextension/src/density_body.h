@@ -312,7 +312,10 @@ protected:
 // its axis, its feet at the origin) with CharacterBody3D's way of moving:
 // set `velocity`, call move_and_slide() in _physics_process. It slides
 // along the terrain and can stand on (but not be pushed by) other bodies;
-// they bounce off it.
+// they bounce off it. Walking into one pushes it, as hard as push_strength
+// lets it: heavy things barely move, and slow the player down to their pace.
+// Its mass goes with its size (the capsule's volume, at the density bodies
+// get from their shapes), set whenever the radius or height change.
 class DensityCharacter3D : public DensityBody3D {
 	GDCLASS(DensityCharacter3D, DensityBody3D)
 
@@ -332,6 +335,9 @@ public:
 	// Ledges up to this high are stepped onto while walking into them.
 	void set_step_height(double p_value) { step_height = std::max(p_value, 0.0); }
 	double get_step_height() const { return step_height; }
+	// The most it can push with, in its own weights (mass * gravity).
+	void set_push_strength(double p_value) { push_strength = std::max(p_value, 0.0); }
+	double get_push_strength() const { return push_strength; }
 
 	// Moves by velocity * the physics frame time, pushed out of the ground
 	// and sliding along it. Returns whether it touched anything.
@@ -351,11 +357,15 @@ private:
 	double floor_max_angle = 0.785398;
 	double floor_snap_length = 4.0;
 	double step_height = 3.0;
+	double push_strength = 2.0;
 	double standing_height = 0.0; // feet height when last on the floor
 	bool on_floor = false, on_wall = false, on_ceiling = false;
 	Vector3 floor_normal = Vector3(0, 1, 0);
 
 	void rebuild_spheres();
+	// Pushes the near bodies it would walk into this move (from p_feet, over
+	// p_dt), as hard as push_strength allows, and slows to what they move at.
+	void push_bodies(const Vector3 &p_feet, double p_dt, double p_gravity);
 	// The axis points (sphere centres) of the capsule with its feet at p_feet.
 	int axis_count() const;
 	Vector3 axis_point(const Vector3 &p_feet, int p_index) const;

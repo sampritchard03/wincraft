@@ -62,9 +62,10 @@ public:
 		std::vector<uint8_t> texels; // TEXEL_BYTES per texel: density + 128, material (wrapped)
 		std::vector<uint8_t> layer_dirty; // per storage layer: changed since uploaded
 		// Where the GPU copy is placed. After a move it stays at the old origin
-		// until every changed layer is uploaded (see SculptTerrain), which is
-		// safe because texels inside both boxes keep their storage slot and the
-		// changed ones lie beyond the range the shader uses this level for.
+		// until every changed layer is uploaded (see SculptTerrain); meanwhile
+		// the shader uses only where the old and new boxes overlap, whose
+		// texels keep their storage slot (the rest of the old box's slots may
+		// already hold the new box's texels).
 		Vector3i published_origin;
 		bool published = false;
 		std::vector<uint8_t> has_surface; // per brick (wrapped)
