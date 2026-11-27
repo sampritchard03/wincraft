@@ -5,7 +5,8 @@ render_mode unshaded, cull_disabled, depth_draw_always, shadows_disabled;
 // the screen; each pixel steps along its view ray through the finest clipmap
 // level that contains the current point, then shades the hit with a sun
 // shadow ray and ambient occlusion through the same data. The physics
-// bodies' spheres (DensityBody3D) are drawn here too, lit the same way.
+// bodies' spheres (DensityBody3D) are drawn here too, lit the same way;
+// posed ones (bones) by skinned_bodies.gdshader, after this.
 // Writes depth so ordinary meshes (the brush preview) sit in the scene.
 //
 // terrain_prepass.gdshader marches a half-resolution image first, with rays
@@ -15,19 +16,13 @@ render_mode unshaded, cull_disabled, depth_draw_always, shadows_disabled;
 
 #include "res://shaders/terrain_common.gdshaderinc"
 #include "res://shaders/terrain_shadow.gdshaderinc"
+#include "res://shaders/terrain_look.gdshaderinc"
 
 // R: where to start (voxels along the ray / START_SCALE), G: 1 if the
 // block is all sky.
 uniform sampler2D prepass_texture : filter_nearest;
 uniform bool use_prepass = false;
 
-uniform vec3 sun_direction = vec3(0.45, 0.75, 0.35);
-uniform vec3 sun_color : source_color = vec3(1.0, 0.94, 0.82);
-uniform vec3 sky_color : source_color = vec3(0.45, 0.62, 0.88);
-uniform vec3 horizon_color : source_color = vec3(0.78, 0.84, 0.9);
-// Block textures, one layer per material (SculptTerrain.get_material_names()
-// order), 16 texels per voxel. Set by world.gd.
-uniform sampler2DArray block_textures : source_color, filter_nearest_mipmap, repeat_enable;
 
 // The sea (terrain worlds): still water at sea_level wherever open air
 // there has nothing solid straight above it (so caves and overhangs stay
@@ -40,7 +35,6 @@ uniform vec3 water_tint : source_color = vec3(0.24, 0.42, 0.86);
 uniform float water_clarity = 7.0;
 // Ripples on the surface (res://assets/block/water.png, set by world.gd).
 uniform sampler2D water_texture : filter_nearest_mipmap, repeat_enable;
-uniform float ambient_strength : hint_range(0.0, 1.0) = 0.45;
 
 // The selection (SculptTerrain.select_*()): a mask over its bounding box,
 // a texel per selection_cell points from selection_origin, layer = z.
@@ -134,35 +128,6 @@ float ambient_occlusion(vec3 p, vec3 n, float scale) {
 	return clamp(1.0 - 0.35 * occlusion, 0.0, 1.0);
 }
 
-// Voxels one repeat of a block texture (and the sea's ripples) covers.
-uniform float texture_size = 8.0;
-
-// A block texture projected along the axis the surface faces most (blending
-// only where two are close, so the pixel art stays crisp). p_footprint: how
-// wide a pixel is there, in voxels, which picks the mip level.
-vec3 block_albedo(vec3 p_position, vec3 n, int block, float p_footprint) {
-	// One texture (16 texels) across texture_size voxels, wrapped to one
-	// repeat here, so the coordinates stay small however far from the origin
-	// (kinder to a mobile GPU's texture unit). The mip level is explicit, so
-	// the wrap leaves no seam.
-	vec3 p = fract(p_position / texture_size);
-	float lod = max(log2(p_footprint * 16.0 / texture_size), 0.0);
-	vec3 w = pow(abs(n), vec3(8.0));
-	w /= w.x + w.y + w.z;
-	float layer = float(block);
-	vec3 c = vec3(0.0);
-	if (w.x > 0.01) {
-		c += w.x * textureLod(block_textures, vec3(p.z * sign(n.x), -p.y, layer), lod).rgb;
-	}
-	if (w.y > 0.01) {
-		c += w.y * textureLod(block_textures, vec3(p.x, p.z * sign(n.y), layer), lod).rgb;
-	}
-	if (w.z > 0.01) {
-		c += w.z * textureLod(block_textures, vec3(-p.x * sign(n.z), -p.y, layer), lod).rgb;
-	}
-	return c;
-}
-
 // The topmost ground's height at a column position, interpolated between
 // the four columns around it (so shorelines are smooth curves).
 // Whether nothing solid is straight above p, as far as the clipmap knows:
@@ -193,12 +158,6 @@ bool in_sea(vec3 p) {
 vec3 water_transmission(float p_distance) {
 	vec3 absorb = vec3(1.6, 0.75, 0.45);
 	return exp(-p_distance * absorb / water_clarity);
-}
-
-// The sky's colour in a direction, without the sun.
-vec3 sky_base(vec3 rd) {
-	vec3 c = mix(horizon_color, sky_color, sqrt(clamp(rd.y, 0.0, 1.0)));
-	return mix(c, horizon_color * 0.6, clamp(-rd.y * 3.0, 0.0, 1.0));
 }
 
 vec3 sky(vec3 rd, vec3 sun) {

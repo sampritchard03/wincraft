@@ -140,7 +140,7 @@ bool DensityBody3D::shape_changed() const {
 	if (shape.is_null()) {
 		return false;
 	}
-	return shape->get_version() != shape_version || nearest_frame() != probe_frame;
+	return shape->get_version() != shape_version || nearest_frame() != probe_frame || shape->get_bone_version() != probe_bone_version;
 }
 
 int DensityBody3D::nearest_frame() const {
@@ -221,8 +221,11 @@ void DensityBody3D::update_inertia() {
 				inertia.rows[a][b] = mass * (unit.rows[a][b] * scale * scale + (a == b ? shift.length_squared() : 0.0) - shift[a] * shift[b]);
 			}
 		}
+		const Skin &bones = get_skin();
+		probe_bone_version = grid->get_bone_version();
 		for (const Vector4 &p : grid->probes(probe_frame)) {
-			local_offsets.push_back((Vector3(p.x, p.y, p.z) - com_local) * scale);
+			const Vector3 at = bones.active() ? bones.forward(Vector3(p.x, p.y, p.z)) : Vector3(p.x, p.y, p.z);
+			local_offsets.push_back((at - com_local) * scale);
 			local_radii.push_back(p.w * (float)scale);
 		}
 	} else {
@@ -777,7 +780,219 @@ void DensityBody3D::set_shape(const Ref<DensityShape> &p_shape) {
 	shape = p_shape;
 	own_shape = false; // shared until sculpted
 	inertia_dirty = true;
+	skin_dirty = true;
 	wake();
+}
+
+// --- Bones ---------------------------------------------------------------------
+
+BonePose *DensityBody3D::pose_of(int p_bone, bool p_make) {
+	if (shape.is_null() || p_bone < 0 || p_bone >= shape->get_bone_count()) {
+		return nullptr;
+	}
+	const String name = shape->get_bone_name(p_bone);
+	for (NamedPose &p : bone_poses) {
+		if (p.name == name) {
+			return &p.pose;
+		}
+	}
+	if (!p_make) {
+		return nullptr;
+	}
+	bone_poses.push_back({ name, BonePose() });
+	return &bone_poses.back().pose;
+}
+
+const BonePose *DensityBody3D::pose_of(int p_bone) const {
+	return const_cast<DensityBody3D *>(this)->pose_of(p_bone, false);
+}
+
+void DensityBody3D::pose_changed() {
+	skin_dirty = true;
+	inertia_dirty = true; // (the probes move with it)
+	wake();
+}
+
+void DensityBody3D::set_bone_rotation(int p_bone, const Quaternion &p_rotation) {
+	BonePose *p = pose_of(p_bone, true);
+	ERR_FAIL_NULL(p);
+	const Quaternion q = p_rotation.length_squared() > 1e-12f ? p_rotation.normalized() : Quaternion();
+	if (!Basis(q).is_equal_approx(p->rotation)) {
+		p->rotation = Basis(q);
+		pose_changed();
+	}
+}
+
+Quaternion DensityBody3D::get_bone_rotation(int p_bone) const {
+	const BonePose *p = pose_of(p_bone);
+	return p ? p->rotation.get_rotation_quaternion() : Quaternion();
+}
+
+void DensityBody3D::set_bone_location(int p_bone, const Vector3 &p_location) {
+	BonePose *p = pose_of(p_bone, true);
+	ERR_FAIL_NULL(p);
+	if (!p->location.is_equal_approx(p_location)) {
+		p->location = p_location;
+		pose_changed();
+	}
+}
+
+Vector3 DensityBody3D::get_bone_location(int p_bone) const {
+	const BonePose *p = pose_of(p_bone);
+	return p ? p->location : Vector3();
+}
+
+void DensityBody3D::set_bone_scale(int p_bone, const Vector3 &p_scale) {
+	BonePose *p = pose_of(p_bone, true);
+	ERR_FAIL_NULL(p);
+	const Vector3 s = p_scale.max(Vector3(0.01f, 0.01f, 0.01f));
+	if (!p->scale.is_equal_approx(s)) {
+		p->scale = s;
+		pose_changed();
+	}
+}
+
+Vector3 DensityBody3D::get_bone_scale(int p_bone) const {
+	const BonePose *p = pose_of(p_bone);
+	return p ? p->scale : Vector3(1, 1, 1);
+}
+
+void DensityBody3D::reset_bone_pose() {
+	bone_poses.clear();
+	pose_changed();
+}
+
+const Skin &DensityBody3D::get_skin() const {
+	const int64_t bone_version = shape.is_valid() ? shape->get_bone_version() : -1;
+	if (skin_dirty || skin_shape != shape.ptr() || skin_bone_version != bone_version) {
+		skin_dirty = false;
+		skin_shape = shape.ptr();
+		skin_bone_version = bone_version;
+		if (shape.is_null() || shape->get_bone_count() == 0) {
+			skin.clear();
+		} else {
+			std::vector<BonePose> poses(shape->get_bone_count());
+			for (int b = 0; b < (int)poses.size(); b++) {
+				const BonePose *p = pose_of(b);
+				if (p) {
+					poses[b] = *p;
+				}
+			}
+			skin.build(shape->skeleton(), poses);
+		}
+	}
+	return skin;
+}
+
+Vector3 DensityBody3D::unskin(const Vector3 &p_local, Basis *r_linear) const {
+	const Skin &s = get_skin();
+	if (!s.active()) {
+		if (r_linear) {
+			*r_linear = Basis();
+		}
+		return p_local;
+	}
+	const Vector3 q = s.inverse(p_local);
+	if (r_linear) {
+		s.forward(q, r_linear);
+	}
+	return q;
+}
+
+double DensityBody3D::skinned_density(const Vector3 &p_local, Vector3 *r_rest, Basis *r_linear) const {
+	const DensityShape::Blend &b = get_blend();
+	const Skin &s = get_skin();
+	if (!s.active()) {
+		if (r_rest) {
+			*r_rest = p_local;
+		}
+		if (r_linear) {
+			*r_linear = Basis();
+		}
+		return shape->get_blend_density(p_local, b);
+	}
+	Skin::Candidate c[Skin::MAX_CANDIDATES];
+	const int n = s.inverse_candidates(p_local, c);
+	double best = -1e30;
+	int which = 0;
+	for (int i = 0; i < n; i++) {
+		const double d = shape->get_blend_density(c[i].rest, b) - c[i].miss;
+		if (d > best) {
+			best = d;
+			which = i;
+		}
+	}
+	if (r_rest) {
+		*r_rest = c[which].rest;
+	}
+	if (r_linear) {
+		s.forward(c[which].rest, r_linear);
+	}
+	return best;
+}
+
+Transform3D DensityBody3D::get_bone_pose_frame(int p_bone) const {
+	const Skin &s = get_skin();
+	ERR_FAIL_COND_V(p_bone < 0 || p_bone >= s.size(), Transform3D());
+	return s.frame(p_bone);
+}
+
+Vector3 DensityBody3D::get_bone_posed_tail(int p_bone) const {
+	const Skin &s = get_skin();
+	ERR_FAIL_COND_V(p_bone < 0 || p_bone >= s.size(), Vector3());
+	const float length = (shape->get_bone_tail(p_bone) - shape->get_bone_head(p_bone)).length();
+	return s.frame(p_bone).xform(Vector3(0, length, 0));
+}
+
+Vector3 DensityBody3D::posed_to_rest(const Vector3 &p_local) const {
+	return unskin(p_local);
+}
+
+Vector3 DensityBody3D::rest_to_posed(const Vector3 &p_rest) const {
+	const Skin &s = get_skin();
+	return s.active() ? s.forward(p_rest) : p_rest;
+}
+
+double DensityBody3D::get_bone_weight(int p_bone, const Vector3 &p_rest) const {
+	const Skin &s = get_skin();
+	if (p_bone < 0 || p_bone >= s.size()) {
+		return 0.0;
+	}
+	float w[Skin::MAX_BONES];
+	s.weights(p_rest, w);
+	return w[p_bone];
+}
+
+void DensityBody3D::set_bone_pose(const Dictionary &p_pose) {
+	bone_poses.clear();
+	const Array names = p_pose.keys();
+	for (int64_t i = 0; i < names.size(); i++) {
+		const Array v = p_pose[names[i]];
+		NamedPose p;
+		p.name = names[i];
+		if (v.size() >= 3) {
+			const Quaternion q = v[0];
+			p.pose.rotation = Basis(q.length_squared() > 1e-12f ? q.normalized() : Quaternion());
+			p.pose.location = v[1];
+			p.pose.scale = v[2];
+		}
+		bone_poses.push_back(p);
+	}
+	pose_changed();
+}
+
+Dictionary DensityBody3D::get_bone_pose() const {
+	Dictionary d;
+	for (const NamedPose &p : bone_poses) {
+		if (!p.pose.is_rest()) {
+			Array v;
+			v.push_back(p.pose.rotation.get_rotation_quaternion());
+			v.push_back(p.pose.location);
+			v.push_back(p.pose.scale);
+			d[p.name] = v;
+		}
+	}
+	return d;
 }
 
 void DensityBody3D::set_pose(double p_value) {
@@ -806,6 +1021,23 @@ double DensityBody3D::get_key_weight(int p_key) const {
 
 bool DensityBody3D::_set(const StringName &p_name, const Variant &p_value) {
 	const String name = p_name;
+	if (name.begins_with("bones/") && shape.is_valid()) {
+		const int bone = shape->find_bone(name.get_slicec('/', 1));
+		const String what = name.get_slicec('/', 2);
+		if (bone < 0) {
+			return false;
+		}
+		if (what == "rotation") {
+			set_bone_rotation(bone, p_value);
+		} else if (what == "location") {
+			set_bone_location(bone, p_value);
+		} else if (what == "scale") {
+			set_bone_scale(bone, p_value);
+		} else {
+			return false;
+		}
+		return true;
+	}
 	if (!name.begins_with("key_weight/")) {
 		return false;
 	}
@@ -815,6 +1047,23 @@ bool DensityBody3D::_set(const StringName &p_name, const Variant &p_value) {
 
 bool DensityBody3D::_get(const StringName &p_name, Variant &r_ret) const {
 	const String name = p_name;
+	if (name.begins_with("bones/") && shape.is_valid()) {
+		const int bone = shape->find_bone(name.get_slicec('/', 1));
+		const String what = name.get_slicec('/', 2);
+		if (bone < 0) {
+			return false;
+		}
+		if (what == "rotation") {
+			r_ret = get_bone_rotation(bone);
+		} else if (what == "location") {
+			r_ret = get_bone_location(bone);
+		} else if (what == "scale") {
+			r_ret = get_bone_scale(bone);
+		} else {
+			return false;
+		}
+		return true;
+	}
 	if (!name.begins_with("key_weight/")) {
 		return false;
 	}
@@ -827,6 +1076,14 @@ void DensityBody3D::_get_property_list(List<PropertyInfo> *p_list) const {
 	const int keys = shape.is_valid() ? shape->get_key_count() : 0;
 	for (int k = 0; k < keys; k++) {
 		p_list->push_back(PropertyInfo(Variant::FLOAT, vformat("key_weight/%d", k), PROPERTY_HINT_RANGE, "-1,2,0.001", PROPERTY_USAGE_EDITOR));
+	}
+	// Three per bone (saved as bone_pose).
+	const int bones = shape.is_valid() ? shape->get_bone_count() : 0;
+	for (int b = 0; b < bones; b++) {
+		const String base = String("bones/") + shape->get_bone_name(b) + String("/");
+		p_list->push_back(PropertyInfo(Variant::QUATERNION, base + String("rotation"), PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR));
+		p_list->push_back(PropertyInfo(Variant::VECTOR3, base + String("location"), PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR));
+		p_list->push_back(PropertyInfo(Variant::VECTOR3, base + String("scale"), PROPERTY_HINT_NONE, "", PROPERTY_USAGE_EDITOR));
 	}
 }
 
@@ -861,10 +1118,15 @@ double DensityBody3D::distance_at(const Vector3 &p_point, Vector3 &r_normal) {
 		begin_step(false);
 	}
 	if (shape.is_valid()) {
-		const Vector3 local = to_local(p_point);
-		const DensityShape::Blend &b = get_blend();
-		r_normal = rotation.xform(shape->get_blend_normal(local, b));
-		return shape->get_blend_density(local, b) * scale;
+		Basis stretch;
+		Vector3 rest;
+		const double d = skinned_density(to_local(p_point), &rest, &stretch);
+		Vector3 n = shape->get_blend_normal(rest, get_blend());
+		if (get_skin().active() && std::abs(stretch.determinant()) > 1e-9f) {
+			n = stretch.inverse().transposed().xform(n).normalized(); // (normals go by the inverse transpose)
+		}
+		r_normal = rotation.xform(n);
+		return d * scale;
 	}
 	if (capsule_radius > 0.0) {
 		Vector3 d;
@@ -891,8 +1153,7 @@ double DensityBody3D::density_at(const Vector3 &p_point) {
 		begin_step(false);
 	}
 	if (shape.is_valid()) {
-		const Vector3 local = to_local(p_point);
-		return shape->get_blend_density(local, get_blend()) * scale;
+		return skinned_density(to_local(p_point)) * scale;
 	}
 	if (capsule_radius > 0.0) {
 		Vector3 d;
@@ -944,7 +1205,7 @@ bool DensityBody3D::apply_brush(const Vector3 &p_center, double p_radius, double
 	const Transform3D t = get_global_transform();
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
 	const Transform3D inv = t.affine_inverse();
-	const Vector3 local = inv.xform(p_center);
+	const Vector3 local = unskin(inv.xform(p_center)); // (on a posed body: where that is at rest)
 	// The brush's settings in the shape's grid (its units: voxel_size).
 	DensityShape::BrushLocal &b = shape->brush_local;
 	const float vs = (float)shape->get_voxel_size();
@@ -974,7 +1235,7 @@ bool DensityBody3D::paint_color(const Vector3 &p_center, double p_radius, const 
 	}
 	const Transform3D t = get_global_transform();
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
-	const Vector3 local = t.affine_inverse().xform(p_center);
+	const Vector3 local = unskin(t.affine_inverse().xform(p_center));
 	return shape->paint_color(local, p_radius / s, p_color, p_opacity, p_hardness, pose, key_weights);
 }
 
@@ -1009,8 +1270,10 @@ bool DensityBody3D::warp_copies(const PackedVector3Array &p_centers, const Packe
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
 	std::vector<Vector3> centers, deltas;
 	for (int64_t i = 0; i < std::min(p_centers.size(), p_deltas.size()); i++) {
-		centers.push_back(inv.xform(p_centers[i]));
-		deltas.push_back(inv.basis.xform(p_deltas[i]));
+		Basis stretch;
+		centers.push_back(unskin(inv.xform(p_centers[i]), &stretch));
+		const Vector3 delta = inv.basis.xform(p_deltas[i]);
+		deltas.push_back(std::abs(stretch.determinant()) > 1e-9f ? stretch.inverse().xform(delta) : delta);
 	}
 	const bool any = shape->warp(centers, deltas, p_radius / s, p_grab, edit_key, pose, key_weights);
 	if (any) {
@@ -1033,9 +1296,14 @@ bool DensityBody3D::twist(const PackedVector3Array &p_centers, const Array &p_ba
 	std::vector<Vector3> centers;
 	std::vector<Basis> bases;
 	for (int64_t i = 0; i < std::min<int64_t>(p_centers.size(), p_bases.size()); i++) {
-		centers.push_back(inv.xform(p_centers[i]));
+		Basis stretch;
+		centers.push_back(unskin(inv.xform(p_centers[i]), &stretch));
 		const Basis b = p_bases[i];
-		bases.push_back(inv.basis * b * t.basis); // (the same turn and scale, about the body's axes)
+		Basis local = inv.basis * b * t.basis; // (the same turn and scale, about the body's axes)
+		if (std::abs(stretch.determinant()) > 1e-9f) {
+			local = stretch.inverse() * local * stretch; // (and about the rest shape's, on a posed body)
+		}
+		bases.push_back(local);
 	}
 	const bool any = shape->twist(centers, bases, p_radius / s, edit_key, pose, key_weights);
 	if (any) {
@@ -1103,6 +1371,20 @@ Dictionary DensityBody3D::raycast_bodies(const Vector3 &p_from, const Vector3 &p
 }
 
 void DensityBody3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_bone_rotation", "bone", "rotation"), &DensityBody3D::set_bone_rotation);
+	ClassDB::bind_method(D_METHOD("get_bone_rotation", "bone"), &DensityBody3D::get_bone_rotation);
+	ClassDB::bind_method(D_METHOD("set_bone_location", "bone", "location"), &DensityBody3D::set_bone_location);
+	ClassDB::bind_method(D_METHOD("get_bone_location", "bone"), &DensityBody3D::get_bone_location);
+	ClassDB::bind_method(D_METHOD("set_bone_scale", "bone", "scale"), &DensityBody3D::set_bone_scale);
+	ClassDB::bind_method(D_METHOD("get_bone_scale", "bone"), &DensityBody3D::get_bone_scale);
+	ClassDB::bind_method(D_METHOD("reset_bone_pose"), &DensityBody3D::reset_bone_pose);
+	ClassDB::bind_method(D_METHOD("get_bone_pose_frame", "bone"), &DensityBody3D::get_bone_pose_frame);
+	ClassDB::bind_method(D_METHOD("get_bone_posed_tail", "bone"), &DensityBody3D::get_bone_posed_tail);
+	ClassDB::bind_method(D_METHOD("posed_to_rest", "local"), &DensityBody3D::posed_to_rest);
+	ClassDB::bind_method(D_METHOD("rest_to_posed", "rest"), &DensityBody3D::rest_to_posed);
+	ClassDB::bind_method(D_METHOD("get_bone_weight", "bone", "rest"), &DensityBody3D::get_bone_weight);
+	ClassDB::bind_method(D_METHOD("set_bone_pose", "pose"), &DensityBody3D::set_bone_pose);
+	ClassDB::bind_method(D_METHOD("get_bone_pose"), &DensityBody3D::get_bone_pose);
 	ClassDB::bind_method(D_METHOD("set_spheres", "spheres"), &DensityBody3D::set_spheres);
 	ClassDB::bind_method(D_METHOD("get_spheres"), &DensityBody3D::get_spheres);
 	ClassDB::bind_method(D_METHOD("set_mass", "mass"), &DensityBody3D::set_mass);
@@ -1189,6 +1471,7 @@ void DensityBody3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "shape", PROPERTY_HINT_RESOURCE_TYPE, "DensityShape"), "set_shape", "get_shape");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pose", PROPERTY_HINT_RANGE, "0,64,0.001,or_greater"), "set_pose", "get_pose");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_FLOAT32_ARRAY, "key_weights", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_key_weights", "get_key_weights");
+	ADD_PROPERTY(PropertyInfo(Variant::DICTIONARY, "bone_pose", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_bone_pose", "get_bone_pose");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "edit_key", PROPERTY_HINT_RANGE, "-1,64,1,or_greater"), "set_edit_key", "get_edit_key");
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_VECTOR4_ARRAY, "spheres"), "set_spheres", "get_spheres");
 	ADD_GROUP("Physics", "");

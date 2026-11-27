@@ -287,6 +287,14 @@ public:
 	double get_lod_density(const Vector3i &p_point, int p_level);
 	// Counts of edited / loaded / unsaved chunks, region files, and the last error.
 	Dictionary get_stats() const;
+	// The object editor's weight preview: a bone of a body whose share tints
+	// it (p_bone -1, or a null body: none).
+	void set_bone_preview(Object *p_body, int p_bone);
+	// The posed bodies' material (skinned_bodies.gdshader, on a screen quad
+	// of its own drawn after the terrain's): bodies with bones are drawn by
+	// it, the others by `material`. world.gd sets it.
+	void set_body_material(const Ref<ShaderMaterial> &p_material) { body_material = p_material; }
+	Ref<ShaderMaterial> get_body_material() const { return body_material; }
 	// Moves the view's frame of reference by p_offset voxels (a multiple of
 	// world_size in x and z, 0 in y): the same place on the wrapping world,
 	// so the clipmap is relabelled, not rebuilt, and every DensityBody3D
@@ -311,6 +319,11 @@ public:
 	// pose key a run of layers (one per z) of a texture array GRID_SLOT
 	// square, GRID_SLOTS * GRID_SLOT deep.
 	static constexpr int MAX_GRID_BODIES = 48; // terrain_shadow.gdshaderinc
+	// Bones drawn in all (terrain_shadow.gdshaderinc): a body whose bones
+	// don't fit draws unposed.
+	static constexpr int MAX_DRAWN_BONES = 64;
+	// Posed bodies' shadow capsules, one a bone (terrain_shadow.gdshaderinc).
+	static constexpr int MAX_CAPSULES = 64;
 	static constexpr int GRID_SLOT = DensityShape::MAX_SIZE;
 	static constexpr int GRID_SLOTS = 24;
 
@@ -497,6 +510,9 @@ private:
 	void mark_edited(const Vector3i &p_min, const Vector3i &p_max);
 	// Sends the drawn bodies nearest p_camera to `material`.
 	void bind_bodies(const Vector3 &p_camera);
+	uint64_t preview_body = 0;
+	Ref<ShaderMaterial> body_material;
+	int preview_bone = -1;
 	Ref<Texture2DArray> body_atlas;
 	struct GridSlot {
 		uint64_t shape = 0; // its instance id

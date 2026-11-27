@@ -7,6 +7,7 @@
 #include <godot_cpp/variant/color.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_vector4_array.hpp>
+#include <godot_cpp/variant/quaternion.hpp>
 #include <godot_cpp/variant/transform3d.hpp>
 
 #include <cstdint>
@@ -109,6 +110,35 @@ public:
 	PackedFloat32Array get_key_weights() const { return key_weights; }
 	void set_key_weight(int p_key, double p_weight);
 	double get_key_weight(int p_key) const;
+	// --- Bones: its pose of the shape's skeleton (DensityShape, skinning.h) --
+	// Each bone's rotation, location and scale relative to its rest place,
+	// in its own axes (y along the bone), Blender style. Also properties
+	// "bones/<name>/rotation" (Quaternion), "bones/<name>/location" and
+	// "bones/<name>/scale" (Vector3), to animate on tracks of their own.
+	// Kept by bone name, so editing the skeleton keeps the poses.
+	void set_bone_rotation(int p_bone, const Quaternion &p_rotation);
+	Quaternion get_bone_rotation(int p_bone) const;
+	void set_bone_location(int p_bone, const Vector3 &p_location);
+	Vector3 get_bone_location(int p_bone) const;
+	void set_bone_scale(int p_bone, const Vector3 &p_scale);
+	Vector3 get_bone_scale(int p_bone) const;
+	// Every bone back to its rest place.
+	void reset_bone_pose();
+	// A posed bone in the body's space: origin at its head, y along it
+	// (get_bone_posed_tail(): where its tail is).
+	Transform3D get_bone_pose_frame(int p_bone) const;
+	Vector3 get_bone_posed_tail(int p_bone) const;
+	// Body space: the rest point shown at a posed point, and back.
+	Vector3 posed_to_rest(const Vector3 &p_local) const;
+	Vector3 rest_to_posed(const Vector3 &p_rest) const;
+	// A bone's skinning weight at a rest point (body space), normalised.
+	double get_bone_weight(int p_bone, const Vector3 &p_rest) const;
+	// Saved form: bone name -> [rotation, location, scale].
+	void set_bone_pose(const Dictionary &p_pose);
+	Dictionary get_bone_pose() const;
+	// The skin for this pose (rebuilt when the pose or skeleton changes).
+	const Skin &get_skin() const;
+
 	// The shape's centre of mass is its solid's centroid (off: center_of_mass).
 	void set_auto_center_of_mass(bool p_value);
 	bool is_auto_center_of_mass() const { return auto_center_of_mass; }
@@ -248,6 +278,27 @@ protected:
 	int64_t shape_version = -1; // the shape's, when the probes were made
 	int probe_frame = -1; // the shape frame the probes are of
 	PackedFloat32Array key_weights;
+	// Bone poses by name (see set_bone_rotation()), and the skin they make.
+	struct NamedPose {
+		String name;
+		BonePose pose;
+	};
+	std::vector<NamedPose> bone_poses;
+	mutable Skin skin;
+	mutable bool skin_dirty = true;
+	mutable int64_t skin_bone_version = -1;
+	mutable const DensityShape *skin_shape = nullptr;
+	int64_t probe_bone_version = -1; // the skeleton's, when the probes were placed
+	BonePose *pose_of(int p_bone, bool p_make);
+	const BonePose *pose_of(int p_bone) const;
+	void pose_changed();
+	// The rest point (shape space) at a body-space point, and how the skin
+	// stretches there (its linear part; identity without bones).
+	Vector3 unskin(const Vector3 &p_local, Basis *r_linear = nullptr) const;
+	// The shape's density at a body-space point through the skin: the most
+	// solid of the rest points there (a fold's union), less how far each
+	// misses; r_rest / r_linear: the one it came from, and F's Jacobian there.
+	double skinned_density(const Vector3 &p_local, Vector3 *r_rest = nullptr, Basis *r_linear = nullptr) const;
 	// The shape frame nearest how it looks now (the heaviest of get_blend()).
 	int nearest_frame() const;
 	mutable DensityShape::Blend shown;

@@ -604,6 +604,7 @@ Ref<DensityShape> DensityShape::duplicate_shape() const {
 	copy->keys = keys;
 	copy->materials = materials;
 	copy->edited = edited;
+	copy->bones = bones;
 	return copy;
 }
 
@@ -623,6 +624,9 @@ Dictionary DensityShape::to_dict() const {
 	d["key_sizes"] = sizes;
 	d["key_names"] = get_key_names();
 	d["materials"] = get_materials().compress(ZSTD);
+	if (!bones.empty()) {
+		d["bones"] = get_bones();
+	}
 	return d;
 }
 
@@ -654,8 +658,192 @@ Ref<DensityShape> DensityShape::from_dict(const Dictionary &p_dict) {
 	}
 	shape->set_materials(((PackedByteArray)p_dict.get("materials", PackedByteArray())).decompress(n * 2, ZSTD));
 	shape->set_key_names(p_dict.get("key_names", PackedStringArray()));
+	shape->set_bones(p_dict.get("bones", Array()));
 	shape->edited = true;
 	return shape;
+}
+
+// --- Bones ---------------------------------------------------------------------
+
+String DensityShape::unique_bone_name(const String &p_name, int p_except) const {
+	const String base = p_name.strip_edges().is_empty() ? String("Bone") : p_name.strip_edges();
+	String name = base;
+	for (int n = 1;; n++) {
+		bool taken = false;
+		for (int b = 0; b < (int)bones.size() && !taken; b++) {
+			taken = b != p_except && bones[b].name == name;
+		}
+		if (!taken) {
+			return name;
+		}
+		name = vformat("%s.%03d", base, n); // (Blender's way)
+	}
+}
+
+int DensityShape::add_bone(const String &p_name, int p_parent, const Vector3 &p_head, const Vector3 &p_tail) {
+	ERR_FAIL_COND_V_MSG((int)bones.size() >= Skin::MAX_BONES, -1, vformat("DensityShape: at most %d bones.", Skin::MAX_BONES));
+	SkinBone bone;
+	bone.name = unique_bone_name(p_name, -1);
+	bone.parent = valid_bone(p_parent) ? p_parent : -1;
+	bone.head = p_head;
+	bone.tail = p_tail.is_equal_approx(p_head) ? p_head + Vector3(0, 1, 0) : p_tail;
+	// By default it moves what's within about its length of it, handing over
+	// to its neighbours over a fifth of its length.
+	const float length = (bone.tail - bone.head).length();
+	bone.radius = std::max(length * 0.75f, 2.0f * (float)voxel_size);
+	bone.blend = std::max(length * 0.25f, 2.0f * (float)voxel_size);
+	bone.softness = std::max(length * 0.2f, (float)voxel_size);
+	bones.push_back(bone);
+	bones_changed();
+	return (int)bones.size() - 1;
+}
+
+void DensityShape::remove_bone(int p_bone) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	const int parent = bones[p_bone].parent;
+	bones.erase(bones.begin() + p_bone);
+	for (SkinBone &b : bones) {
+		if (b.parent == p_bone) {
+			b.parent = parent;
+		} else if (b.parent > p_bone) {
+			b.parent--;
+		}
+	}
+	bones_changed();
+}
+
+int DensityShape::find_bone(const String &p_name) const {
+	for (int b = 0; b < (int)bones.size(); b++) {
+		if (bones[b].name == p_name) {
+			return b;
+		}
+	}
+	return -1;
+}
+
+void DensityShape::set_bone_name(int p_bone, const String &p_name) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].name = unique_bone_name(p_name, p_bone);
+	bones_changed();
+}
+
+String DensityShape::get_bone_name(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), String());
+	return bones[p_bone].name;
+}
+
+void DensityShape::set_bone_parent(int p_bone, int p_parent) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	ERR_FAIL_COND_MSG(p_parent >= p_bone, "DensityShape: a bone's parent must come before it.");
+	bones[p_bone].parent = std::max(p_parent, -1);
+	bones_changed();
+}
+
+int DensityShape::get_bone_parent(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), -1);
+	return bones[p_bone].parent;
+}
+
+void DensityShape::set_bone_head(int p_bone, const Vector3 &p_head) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].head = p_head;
+	bones_changed();
+}
+
+Vector3 DensityShape::get_bone_head(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), Vector3());
+	return bones[p_bone].head;
+}
+
+void DensityShape::set_bone_tail(int p_bone, const Vector3 &p_tail) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].tail = p_tail;
+	bones_changed();
+}
+
+Vector3 DensityShape::get_bone_tail(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), Vector3());
+	return bones[p_bone].tail;
+}
+
+void DensityShape::set_bone_roll(int p_bone, double p_roll) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].roll = (float)p_roll;
+	bones_changed();
+}
+
+double DensityShape::get_bone_roll(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), 0.0);
+	return bones[p_bone].roll;
+}
+
+void DensityShape::set_bone_radius(int p_bone, double p_radius) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].radius = (float)std::max(p_radius, 0.0);
+	bones_changed();
+}
+
+double DensityShape::get_bone_radius(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), 0.0);
+	return bones[p_bone].radius;
+}
+
+void DensityShape::set_bone_blend(int p_bone, double p_blend) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].blend = (float)std::max(p_blend, 0.0);
+	bones_changed();
+}
+
+double DensityShape::get_bone_blend(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), 0.0);
+	return bones[p_bone].blend;
+}
+
+void DensityShape::set_bone_softness(int p_bone, double p_softness) {
+	ERR_FAIL_COND(!valid_bone(p_bone));
+	bones[p_bone].softness = (float)std::max(p_softness, 0.05);
+	bones_changed();
+}
+
+double DensityShape::get_bone_softness(int p_bone) const {
+	ERR_FAIL_COND_V(!valid_bone(p_bone), 0.0);
+	return bones[p_bone].softness;
+}
+
+void DensityShape::set_bones(const Array &p_bones) {
+	bones.clear();
+	for (int64_t i = 0; i < p_bones.size() && (int)bones.size() < Skin::MAX_BONES; i++) {
+		const Dictionary d = p_bones[i];
+		SkinBone bone;
+		bone.name = unique_bone_name(d.get("name", "Bone"), -1);
+		const int parent = d.get("parent", -1);
+		bone.parent = parent >= 0 && parent < (int)bones.size() ? parent : -1;
+		bone.head = d.get("head", Vector3());
+		bone.tail = d.get("tail", Vector3(0, 1, 0));
+		bone.roll = (float)(double)d.get("roll", 0.0);
+		bone.radius = (float)std::max((double)d.get("radius", 2.0), 0.0);
+		bone.blend = (float)std::max((double)d.get("blend", 2.0), 0.0);
+		bone.softness = (float)std::max((double)d.get("softness", 1.5), 0.05);
+		bones.push_back(bone);
+	}
+	bones_changed();
+}
+
+Array DensityShape::get_bones() const {
+	Array out;
+	for (const SkinBone &b : bones) {
+		Dictionary d;
+		d["name"] = b.name;
+		d["parent"] = b.parent;
+		d["head"] = b.head;
+		d["tail"] = b.tail;
+		d["roll"] = b.roll;
+		d["radius"] = b.radius;
+		d["blend"] = b.blend;
+		d["softness"] = b.softness;
+		out.push_back(d);
+	}
+	return out;
 }
 
 // --- Frames --------------------------------------------------------------------------
@@ -2218,6 +2406,29 @@ void DensityShape::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("split_parts", "min_voxels"), &DensityShape::split_parts, DEFVAL(4));
 	ClassDB::bind_static_method("DensityShape", D_METHOD("make_hull", "points", "material", "voxel_size"), &DensityShape::make_hull, DEFVAL(1.0));
 	ClassDB::bind_static_method("DensityShape", D_METHOD("make_solids", "solids", "voxel_size"), &DensityShape::make_solids, DEFVAL(1.0));
+	ClassDB::bind_method(D_METHOD("add_bone", "name", "parent", "head", "tail"), &DensityShape::add_bone);
+	ClassDB::bind_method(D_METHOD("remove_bone", "bone"), &DensityShape::remove_bone);
+	ClassDB::bind_method(D_METHOD("get_bone_count"), &DensityShape::get_bone_count);
+	ClassDB::bind_method(D_METHOD("find_bone", "name"), &DensityShape::find_bone);
+	ClassDB::bind_method(D_METHOD("set_bone_name", "bone", "name"), &DensityShape::set_bone_name);
+	ClassDB::bind_method(D_METHOD("get_bone_name", "bone"), &DensityShape::get_bone_name);
+	ClassDB::bind_method(D_METHOD("set_bone_parent", "bone", "parent"), &DensityShape::set_bone_parent);
+	ClassDB::bind_method(D_METHOD("get_bone_parent", "bone"), &DensityShape::get_bone_parent);
+	ClassDB::bind_method(D_METHOD("set_bone_head", "bone", "head"), &DensityShape::set_bone_head);
+	ClassDB::bind_method(D_METHOD("get_bone_head", "bone"), &DensityShape::get_bone_head);
+	ClassDB::bind_method(D_METHOD("set_bone_tail", "bone", "tail"), &DensityShape::set_bone_tail);
+	ClassDB::bind_method(D_METHOD("get_bone_tail", "bone"), &DensityShape::get_bone_tail);
+	ClassDB::bind_method(D_METHOD("set_bone_roll", "bone", "roll"), &DensityShape::set_bone_roll);
+	ClassDB::bind_method(D_METHOD("get_bone_roll", "bone"), &DensityShape::get_bone_roll);
+	ClassDB::bind_method(D_METHOD("set_bone_radius", "bone", "radius"), &DensityShape::set_bone_radius);
+	ClassDB::bind_method(D_METHOD("get_bone_radius", "bone"), &DensityShape::get_bone_radius);
+	ClassDB::bind_method(D_METHOD("set_bone_blend", "bone", "blend"), &DensityShape::set_bone_blend);
+	ClassDB::bind_method(D_METHOD("get_bone_blend", "bone"), &DensityShape::get_bone_blend);
+	ClassDB::bind_method(D_METHOD("set_bone_softness", "bone", "softness"), &DensityShape::set_bone_softness);
+	ClassDB::bind_method(D_METHOD("get_bone_softness", "bone"), &DensityShape::get_bone_softness);
+	ClassDB::bind_method(D_METHOD("set_bones", "bones"), &DensityShape::set_bones);
+	ClassDB::bind_method(D_METHOD("get_bones"), &DensityShape::get_bones);
+	ClassDB::bind_method(D_METHOD("get_bone_version"), &DensityShape::get_bone_version);
 
 	// Saved: size first (it sizes the rest). `keys` is how older files saved
 	// the shape: still read, no longer written.
@@ -2230,6 +2441,7 @@ void DensityShape::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_STRING_ARRAY, "key_names", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_key_names", "get_key_names"); // (after key_data: names the keys it made)
 	ADD_PROPERTY(PropertyInfo(Variant::PACKED_BYTE_ARRAY, "materials", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_materials", "get_materials");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "edited", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_edited", "is_edited");
+	ADD_PROPERTY(PropertyInfo(Variant::ARRAY, "bones", PROPERTY_HINT_NONE, "", PROPERTY_USAGE_STORAGE), "set_bones", "get_bones");
 }
 
 // --- Selections, grab and snake hook ---------------------------------------------

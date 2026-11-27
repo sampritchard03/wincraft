@@ -1,5 +1,6 @@
 #pragma once
 
+#include "skinning.h"
 #include "voxel_world.h"
 
 #include <godot_cpp/classes/resource.hpp>
@@ -220,6 +221,43 @@ public:
 	// Whether some key weight is in use.
 	static bool has_weights(const PackedFloat32Array &p_weights);
 	int get_frame_count() const;
+
+	// --- Bones (skinning.h) --------------------------------------------------
+	// A rest skeleton in the shape's space, Blender style: bones posed by a
+	// DensityBody3D (its "bones/<name>/rotation" ... properties) warp the
+	// space round the grid instead of changing it (keys still apply under
+	// them). Parents come before their children in the list. Editing bones
+	// changes get_bone_version(), not get_version() (the grid is the same).
+	int add_bone(const String &p_name, int p_parent, const Vector3 &p_head, const Vector3 &p_tail);
+	// Its children go to its parent.
+	void remove_bone(int p_bone);
+	int get_bone_count() const { return (int)bones.size(); }
+	int find_bone(const String &p_name) const;
+	void set_bone_name(int p_bone, const String &p_name);
+	String get_bone_name(int p_bone) const;
+	// p_parent must come before p_bone (-1: a root).
+	void set_bone_parent(int p_bone, int p_parent);
+	int get_bone_parent(int p_bone) const;
+	void set_bone_head(int p_bone, const Vector3 &p_head);
+	Vector3 get_bone_head(int p_bone) const;
+	void set_bone_tail(int p_bone, const Vector3 &p_tail);
+	Vector3 get_bone_tail(int p_bone) const;
+	void set_bone_roll(int p_bone, double p_roll);
+	double get_bone_roll(int p_bone) const;
+	// Envelope: full weight within radius of the bone, easing out over blend.
+	void set_bone_radius(int p_bone, double p_radius);
+	double get_bone_radius(int p_bone) const;
+	void set_bone_blend(int p_bone, double p_blend);
+	double get_bone_blend(int p_bone) const;
+	// How wide the hand-over to the next bone is at a joint (bigger: a
+	// rounder, softer bend; smaller: stiffer parts, a tighter crease).
+	void set_bone_softness(int p_bone, double p_softness);
+	double get_bone_softness(int p_bone) const;
+	// Saved form: one Dictionary a bone {name, parent, head, tail, roll, radius, blend, softness}.
+	void set_bones(const Array &p_bones);
+	Array get_bones() const;
+	const std::vector<SkinBone> &skeleton() const { return bones; }
+	int64_t get_bone_version() const { return bone_version; }
 	// Replaces everything with one key (distances are repaired).
 	void init_grid(const Vector3i &p_size, const Vector3 &p_origin, double p_voxel_size, std::vector<float> &&p_density, std::vector<MaterialId> &&p_materials);
 
@@ -239,6 +277,12 @@ private:
 		std::vector<MaterialId> materials; // empty: the rest shape's
 		std::vector<Vector3> to_rest; // the rest point (grid units) shown at each point; empty: the same point
 	};
+
+	std::vector<SkinBone> bones;
+	int64_t bone_version = 0;
+	bool valid_bone(int p_bone) const { return p_bone >= 0 && p_bone < (int)bones.size(); }
+	String unique_bone_name(const String &p_name, int p_except) const;
+	void bones_changed() { bone_version++; }
 
 	Vector3i size;
 	Vector3 origin;

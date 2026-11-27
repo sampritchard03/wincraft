@@ -64,7 +64,7 @@ var anim_times := {}
 var anim_speeds := {}
 var anim_blend := {}
 var head_time := 0.0
-var animated_keys := {}  # key index (-1: pose) -> true: what the layers set last frame
+var animated_keys := {}  # key index (-1: pose) or bone track ("bones/<name>/rotation") -> true: what the layers set last frame
 var last_action := ""
 
 
@@ -223,7 +223,7 @@ func _animate(p_action: String, delta: float) -> void:
 		anim_times[anim_name] = anim_times.get(anim_name, 0.0) + delta * anim_speeds.get(anim_name, 1.0)
 		var sampled := _sample(anim, anim_times[anim_name])
 		for k in sampled:
-			values[k] = values.get(k, 0.0) + sampled[k] * w
+			values[k] = _mix(values.get(k), sampled[k], w)
 	# Head layer: its own animation, or the turn keys.
 	var head_name := _head_animation()
 	var head := _animation(head_name) if head_name != "" else null
@@ -239,12 +239,17 @@ func _animate(p_action: String, delta: float) -> void:
 			values[key_l] = clampf(turned, 0.0, 1.0)
 		if key_r >= 0:
 			values[key_r] = clampf(-turned, 0.0, 1.0)
-	# Keys a layer let go of since last frame go back to 0.
+	# Keys a layer let go of since last frame go back to 0 (bones to rest).
 	for k in animated_keys:
 		if not values.has(k):
-			values[k] = 0.0
+			values[k] = _rest_value(k)
 	animated_keys = {}
 	for k in values:
+		if k is String:
+			animated_keys[k] = true
+			var v = values[k]
+			set(k, v.normalized() if v is Quaternion and v.length_squared() > 1e-12 else v)
+			continue
 		if values[k] != 0.0:
 			animated_keys[k] = true
 		if k == -1:
@@ -260,7 +265,33 @@ func _animation(p_name: String) -> Animation:
 	return animator.get_animation(p_name)
 
 
-## An animation's key weights (and pose, as -1) at p_time, looping as it says.
+## A layer's value weighed in (p_weight) on top of what's there: key weights
+## and bone locations and scales add up; rotations too, as quaternions
+## turned to agree (then normalised when set).
+func _mix(p_sum, p_value, p_weight: float):
+	if p_value is Quaternion:
+		var q: Quaternion = p_value
+		if p_sum is Quaternion:
+			if (p_sum as Quaternion).dot(q) < 0.0:
+				q = -q
+			return p_sum + q * p_weight
+		return q * p_weight
+	if p_value is Vector3:
+		return (p_sum if p_sum is Vector3 else Vector3.ZERO) + p_value * p_weight
+	return (p_sum if p_sum is float else 0.0) + p_value * p_weight
+
+
+## What a key or bone track goes back to when nothing plays it.
+func _rest_value(p_key):
+	if p_key is String:
+		if p_key.ends_with("/rotation"):
+			return Quaternion()
+		return Vector3.ONE if p_key.ends_with("/scale") else Vector3.ZERO
+	return 0.0
+
+
+## An animation's key weights (and pose, as -1) and bone tracks (by their
+## "bones/<name>/..." path) at p_time, looping as it says.
 func _sample(p_anim: Animation, p_time: float) -> Dictionary:
 	var length := maxf(p_anim.length, 0.001)
 	var t := p_time
@@ -276,6 +307,12 @@ func _sample(p_anim: Animation, p_time: float) -> Dictionary:
 		if p_anim.track_get_type(track) != Animation.TYPE_VALUE or p_anim.track_get_key_count(track) == 0:
 			continue
 		var path := str(p_anim.track_get_path(track))
+		var bone_at := path.find(":bones/")
+		if bone_at >= 0:
+			var bone_value = p_anim.value_track_interpolate(track, t)
+			if bone_value is Quaternion or bone_value is Vector3:
+				out[path.substr(bone_at + 1)] = bone_value
+			continue
 		var at := path.find(":key_weight/")
 		var key := -2
 		if at >= 0:

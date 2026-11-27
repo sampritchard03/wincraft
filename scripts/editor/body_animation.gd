@@ -138,3 +138,27 @@ static func remap_weight_tracks(p_body: Node, p_map: PackedInt32Array) -> void:
 		removed.reverse()
 		for t in removed:
 			anim.remove_track(t)
+
+## After a bone was renamed (p_new: its new name) or removed (p_new ""):
+## each animation's bones/<name>/... tracks follow it, or go.
+static func rename_bone_tracks(p_body: Node, p_old: String, p_new: String) -> void:
+	var player := player_of(p_body)
+	if player == null or not player.has_animation_library(""):
+		return
+	var library := player.get_animation_library("")
+	var prefix := ":bones/%s/" % p_old
+	for anim_name in library.get_animation_list():
+		var anim := library.get_animation(anim_name)
+		var removed := []
+		for t in anim.get_track_count():
+			var path := str(anim.track_get_path(t))
+			var at := path.find(prefix)
+			if at < 0:
+				continue
+			if p_new == "":
+				removed.append(t)
+			else:
+				anim.track_set_path(t, NodePath(path.substr(0, at) + ":bones/%s/" % p_new + path.substr(at + prefix.length())))
+		removed.reverse()
+		for t in removed:
+			anim.remove_track(t)

@@ -454,7 +454,8 @@ const MENU := [
 ]
 ## The object editor's, shown while it's open (object_editor.gd).
 const MENU_EDITOR := [
-	["Key the pose", KEY_I], ["Delete keys", KEY_U], ["Play / stop", KEY_Y],
+	["Key the pose", KEY_I], ["Delete keys", KEY_U], ["Play / stop", KEY_Y], ["Bones: off / edit / pose", KEY_J, false, false, true],
+	["Delete bone", KEY_X], ["Bone to rest", KEY_R], ["All bones to rest", KEY_R, true],
 	["Previous frame", KEY_COMMA, false, false, true], ["Next frame", KEY_PERIOD, false, false, true],
 ]
 

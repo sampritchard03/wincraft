@@ -19,6 +19,7 @@ add_library(wincraft_native SHARED
     src/noise.cpp
     src/density_body.cpp
     src/density_shape.cpp
+    src/skinning.cpp
     src/selection.cpp
 )
 target_link_libraries(wincraft_native PRIVATE godot-cpp Threads::Threads)

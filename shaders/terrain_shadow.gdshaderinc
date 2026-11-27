@@ -34,6 +34,18 @@ uniform vec4 grid_blend[MAX_GRID_BODIES]; // their weights (summing to 1; 0: unu
 uniform float grid_highlight[MAX_GRID_BODIES]; // 1: a selected body (tinted like selected ground)
 uniform vec4 grid_bound[MAX_GRID_BODIES]; // bounding sphere: centre, radius
 uniform int grid_count = 0;
+
+// Posed bodies (bones) are drawn by skinned_bodies.gdshader, not here:
+// their shadows are these capsules, one along each bone, as thick as the
+// body is there (SculptTerrain::bind_bodies()): xyz the ends, w the radius.
+const int MAX_CAPSULES = 64; // SculptTerrain::MAX_CAPSULES
+uniform vec4 capsule_a[MAX_CAPSULES];
+uniform vec4 capsule_b[MAX_CAPSULES];
+uniform int capsule_count = 0;
+
+// Always 1: loop counts are multiplied by it so compilers can't unroll them
+// (see "Mind the size" in skin.gdshaderinc).
+uniform int loop_unit = 1;
 vec3 grid_point(int i, vec3 p) {
 	vec4 p4 = vec4(p, 1.0);
 	return vec3(dot(grid_rows0[i], p4), dot(grid_rows1[i], p4), dot(grid_rows2[i], p4));
@@ -75,9 +87,11 @@ float grid_density(int i, vec3 p) {
 
 vec3 grid_normal(int i, vec3 p) {
 	float e = 0.5 * grid_size[i].w;
-	vec2 k = vec2(1.0, -1.0);
-	vec3 g = k.xyy * grid_density(i, p + k.xyy * e) + k.yyx * grid_density(i, p + k.yyx * e) +
-			k.yxy * grid_density(i, p + k.yxy * e) + k.xxx * grid_density(i, p + k.xxx * e);
+	vec3 g = vec3(0.0);
+	for (int k = 0; k < 4 * loop_unit; k++) { // (a loop: one copy of grid_density, not four)
+		vec3 o = k == 0 ? vec3(1.0, -1.0, -1.0) : (k == 1 ? vec3(-1.0, -1.0, 1.0) : (k == 2 ? vec3(-1.0, 1.0, -1.0) : vec3(1.0)));
+		g += o * grid_density(i, p + o * e);
+	}
 	float len = length(g);
 	return len > 1e-6 ? -g / len : vec3(0.0, 1.0, 0.0);
 }
@@ -163,28 +177,38 @@ int trace_grids(vec3 ro, vec3 rd, inout float r_t) {
 		if (grid_span(i, ro, rd, t, t1) && t < r_t) {
 			t1 = min(t1, r_t);
 			float voxel = grid_size[i].w;
+			float k_step = 0.8;
+			// Marching until inside, then 5 halvings back to the surface
+			// between the last point outside (a) and the first inside (b):
+			// one loop, so one copy of grid_density.
 			float t_prev = t;
-			bool found = false;
-			for (int j = 0; j < 128 && !found && t <= t1; j++) {
-				float d = grid_density(i, ro + rd * t);
-				if (d > 0.0) {
-					// Back to the surface between the last point outside and this one.
-					float a = t_prev, b = t;
-					for (int k = 0; k < 5; k++) {
-						float m = 0.5 * (a + b);
-						if (grid_density(i, ro + rd * m) > 0.0) {
-							b = m;
-						} else {
-							a = m;
-						}
+			float a = 0.0;
+			float b = 0.0;
+			int refining = -1; // halvings done (-1: still marching)
+			bool done = false;
+			for (int j = 0; j < 133 && !done && (refining >= 0 || t <= t1); j++) {
+				float at = refining >= 0 ? 0.5 * (a + b) : t;
+				float d = grid_density(i, ro + rd * at);
+				if (refining >= 0) {
+					if (d > 0.0) {
+						b = at;
+					} else {
+						a = at;
 					}
-					r_t = b;
-					hit = i;
-					found = true;
+					refining++;
+					done = refining >= 5;
+				} else if (d > 0.0) {
+					a = t_prev;
+					b = t;
+					refining = 0;
 				} else {
 					t_prev = t;
-					t += max(-d * 0.8, 0.1 * voxel);
+					t += max(-d * k_step, 0.1 * voxel);
 				}
+			}
+			if (done) {
+				r_t = b;
+				hit = i;
 			}
 		}
 	}
@@ -199,10 +223,13 @@ bool grid_shadow(vec3 p, vec3 sun) {
 		float t, t1;
 		if (grid_span(i, p, sun, t, t1)) {
 			float voxel = grid_size[i].w;
-			for (int j = 0; j < 32 && !shadowed && t <= t1; j++) {
+			// (Enough steps, and big enough, to get past a body's own curve:
+			// a ray grazing it at the terminator must still reach a part of it
+			// hanging over, a posed limb, say.)
+			for (int j = 0; j < 48 && !shadowed && t <= t1; j++) {
 				float d = grid_density(i, p + sun * t);
 				shadowed = d > 0.0;
-				t += max(-d * 0.9, 0.3 * voxel);
+				t += max(-d * 0.9, 0.5 * voxel);
 			}
 		}
 	}
@@ -325,12 +352,37 @@ float sun_map_lookup(int p_map, vec3 p_origin, float p_extent, float p_depth, ve
 	return mix(mix(lit[0], lit[1], f.x), mix(lit[2], lit[3], f.x), f.y);
 }
 
-// The sun shadow from the maps (the bodies' own shadows as sun_shadow()).
-float sun_map_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
-	vec3 start = p + n * 0.5 * scale;
-	if (sphere_shadow(start, sun) || grid_shadow(start, sun)) {
-		return 0.0;
+// Whether the ray from p towards the sun passes through a posed body's
+// capsules. A capsule the ray starts in is left out (the surface it's on).
+bool capsule_shadow(vec3 p, vec3 sun) {
+	bool shadowed = false;
+	int count = min(capsule_count, MAX_CAPSULES);
+	for (int c = 0; c < count; c++) {
+		vec3 a = capsule_a[c].xyz;
+		vec3 v = capsule_b[c].xyz - a;
+		float r = capsule_a[c].w;
+		vec3 w = p - a;
+		float vv = max(dot(v, v), 1e-6);
+		float s0 = clamp(dot(w, v) / vv, 0.0, 1.0);
+		bool outside = length(w - v * s0) > r;
+		// Nearest approach of the ray and the segment (two alternations of
+		// each's nearest point to the other: close enough for a shadow).
+		float t = max(dot(v * s0 - w, sun), 0.0);
+		float s = clamp(dot(w + sun * t, v) / vv, 0.0, 1.0);
+		t = max(dot(v * s - w, sun), 0.0);
+		s = clamp(dot(w + sun * t, v) / vv, 0.0, 1.0);
+		shadowed = shadowed || (outside && t > 0.0 && length(w + sun * t - v * s) < r);
 	}
+	return shadowed;
+}
+
+// What the bodies shade from the sun at p: spheres, grids, posed bodies' capsules.
+bool bodies_shadow(vec3 p, vec3 sun) {
+	return sphere_shadow(p, sun) || grid_shadow(p, sun) || capsule_shadow(p, sun);
+}
+
+// The sun shadow from the maps (the terrain's alone).
+float sun_map_terrain(vec3 p, vec3 n, vec3 sun, float scale) {
 	// A texel's ray sees its whole square as one depth: on a slope, part of
 	// the square is nearer the sun than its middle. Allow for that.
 	float ndl = max(dot(n, sun), 0.05);
@@ -345,6 +397,11 @@ float sun_map_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
 	return sun_map_lookup(1, sun_map_origin1, sun_map_extent1, sun_map_depth1, p, sun, texel1 * (1.0 + slope) + 0.5 * scale, covered);
 }
 
+// The sun shadow from the maps and the bodies.
+float sun_map_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
+	return bodies_shadow(p + n * 0.5 * scale, sun) ? 0.0 : sun_map_terrain(p, n, sun, scale);
+}
+
 // 1 = sunlit, 0 = shadowed: hard shadows. A ray is in shadow only once a
 // sample lands inside solid; passing close to a surface doesn't count
 // (scoring near misses gave soft edges, but they depend on where samples
@@ -357,7 +414,7 @@ float sun_map_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
 // normal) and ignores everything within the first 3 texels.
 float sun_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
 	vec3 start = p + n * 0.5 * scale;
-	if (sphere_shadow(start, sun) || grid_shadow(start, sun)) {
+	if (bodies_shadow(start, sun)) {
 		return 0.0;
 	}
 	float t = 1.5 * scale;

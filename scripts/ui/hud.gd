@@ -353,6 +353,7 @@ const HELP := [
 	["F / G / X", "Throw a ball / drop a frog or chiggin / remove the one aimed at"],
 	["Shift+G", "Frog or chiggin for G"],
 	["M", "Edit the object aimed at"],
+	["J (editing)", "Bones: edit (click the body for a bone, hold a joint to move it) / pose (hold a bone: it follows the crosshair) / off"],
 	["B", "Blocky mode (its size: N)"],
 	["Ctrl+Z / Ctrl+Y", "Undo / redo (Ctrl+Shift+Z too)"],
 	["K / L", "Grow / shrink"],

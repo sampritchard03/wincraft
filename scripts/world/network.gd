@@ -734,9 +734,14 @@ func _describe(p_body: DensityBody3D) -> Dictionary:
 			"position": _wrapped(p_body.global_position), "turn": p_body.global_basis.get_rotation_quaternion(),
 			"velocity": p_body.linear_velocity, "spin": p_body.angular_velocity, "frozen": frozen, "pose": _pose_of(p_body), "animation": BodyAnimation.to_dict(p_body)}
 
-## A body's pose: its `pose`, or [pose, key weights] while it weighs keys in.
+## A body's pose: its `pose`, or [pose, key weights, bone pose] while it
+## weighs keys in or has bones posed (bone pose: DensityBody3D.bone_pose,
+## name -> [rotation, location, scale], only the posed ones).
 func _pose_of(p_body: DensityBody3D) -> Variant:
 	var weights: PackedFloat32Array = p_body.key_weights
+	var bones: Dictionary = p_body.bone_pose
+	if not bones.is_empty():
+		return [p_body.pose, weights, bones]
 	for w in weights:
 		if w != 0.0:
 			return [p_body.pose, weights]
@@ -750,6 +755,9 @@ func _set_pose(p_body: DensityBody3D, p_pose: Variant) -> void:
 		p_body.pose = p_pose
 		if not p_body.key_weights.is_empty():
 			p_body.key_weights = PackedFloat32Array()
+	var bones: Dictionary = p_pose[2] if p_pose is Array and p_pose.size() > 2 else {}
+	if not bones.is_empty() or not p_body.bone_pose.is_empty():
+		p_body.bone_pose = bones
 
 ## A copy's pose a step towards the owner's (key weights eased, so an
 ## animation 20 updates a second still plays smoothly).
@@ -772,6 +780,21 @@ func _glide_pose(p_body: DensityBody3D, p_pose: Variant, p_k: float) -> void:
 		changed = changed or v != have
 	if changed:
 		p_body.key_weights = glided
+	# Bones: rotations turned, locations and scales moved, the same way.
+	var want_bones: Dictionary = p_pose[2] if p_pose is Array and p_pose.size() > 2 else {}
+	var have_bones: Dictionary = p_body.bone_pose
+	if want_bones.is_empty() and have_bones.is_empty():
+		return
+	var rest := [Quaternion(), Vector3.ZERO, Vector3.ONE]
+	var bones := {}
+	for bone_name in have_bones.keys() + want_bones.keys():
+		if bones.has(bone_name):
+			continue
+		var have: Array = have_bones.get(bone_name, rest)
+		var want: Array = want_bones.get(bone_name, rest)
+		var turned: Quaternion = (have[0] as Quaternion).slerp(want[0], k)
+		bones[bone_name] = [turned, (have[1] as Vector3).lerp(want[1], k), (have[2] as Vector3).lerp(want[2], k)]
+	p_body.bone_pose = bones
 
 ## Finds objects made here (thrown, dropped, P, imported, cut off) and gives
 ## them ids, and objects removed here (X, broken, fallen out), and tells

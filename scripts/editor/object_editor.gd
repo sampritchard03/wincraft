@@ -27,6 +27,22 @@ extends Node
 ## The animations live on the body itself, in its AnimationPlayer (made if
 ## it has none), so the frog's AnimationTree, say, can play what you make here.
 ##
+## Bones (J: off -> Edit -> Pose): a skeleton, Blender style, that bends the
+## space round the body rather than moving its voxels (DensityShape's bones,
+## skinning.h). Everything aims with the crosshair:
+##   Edit: click the body to start a bone there; the next click carries the
+##     chain on from its tail. Click a joint (head or tail) and hold to move
+##     it (joints that meet move together). Right click: start a new chain.
+##     X deletes the bone, the wheel sets its reach (Ctrl: its softness, how
+##     wide the bend at its joints is). Shown at rest.
+##   Pose: click a bone and hold: its tail follows the crosshair (Alt on a
+##     root bone: moves the whole of it). The wheel rolls it, R puts it back
+##     (Shift+R: all of them). Let go: keyed, with Auto key; I keys every
+##     posed bone. Keys go on tracks bones/<name>/rotation (and /location),
+##     which the animations play like the key weights.
+##   "Weights" tints the body by the picked bone's share.
+## Shape keys still work under the bones.
+##
 ## Shape keys and animation are for entities only (entity.gd: balls, frogs,
 ## chiggins): a plain physics object (P, Ctrl+O, a piece cut off) is loose
 ## ground, one shape, so for one the editor shows only its sculpting and
@@ -95,6 +111,28 @@ var plain_label: Label  # shown instead, for a plain physics object
 var seen_shape: DensityShape = null
 var seen_keys := -1
 
+# Bones.
+enum BoneMode { OFF, EDIT, POSE }
+const BONE_MODE_NAMES := ["Bones off", "Edit bones", "Pose bones"]
+var bone_mode := BoneMode.OFF
+var bone := -1  # the picked bone (-1: none: the next click in Edit starts a chain)
+var bone_drag := ""  # while held: "head" / "tail" (Edit), "rotate" / "move" (Pose)
+var bone_drag_depth := 0.0  # how far from the camera the dragged point stays
+var bone_drag_connected := []  # [bone, "head" / "tail"]: joints that meet the dragged one
+var bone_before: DensityShape = null  # the shape when an Edit drag began (one undo step)
+var bone_slider_shape: DensityShape = null  # the copy the bone sliders edit (one undo step a pick)
+var rest_pose_saved := {}  # its bone pose while Edit shows it at rest
+var weight_preview := false
+var bone_mode_select: OptionButton
+var bone_list: VBoxContainer
+var bone_name_edit: LineEdit
+var bone_radius_slider: HSlider
+var bone_blend_slider: HSlider
+var bone_soft_slider: HSlider
+var bone_parent_label: Label
+var bone_controls: Array[Control] = []  # shown only with bones on
+var bones_label: Label
+
 
 func _ready() -> void:
 	line_mesh = ImmediateMesh.new()
@@ -115,6 +153,9 @@ func _ready() -> void:
 
 ## Handles an input event first; true if it was the editor's.
 func handle_input(event: InputEvent) -> bool:
+	if active and bone_mode != BoneMode.OFF and event is InputEventMouseButton and world._captured() and is_instance_valid(body):
+		_bone_mouse(event)
+		return true  # (the bone tools have the mouse: no brushes meanwhile)
 	if event is InputEventKey and event.pressed and not event.echo:
 		if get_viewport().gui_get_focus_owner() is LineEdit:
 			return false
@@ -125,6 +166,12 @@ func handle_input(event: InputEvent) -> bool:
 			else:
 				open_aimed()
 			return true
+		if active and _is_entity() and not event.ctrl_pressed and not event.alt_pressed:
+			if key == KEY_J:
+				set_bone_mode(((bone_mode + 1) % 3) as BoneMode)
+				return true
+			if bone_mode != BoneMode.OFF and _bone_key(key, event.shift_pressed):
+				return true
 		if not active or event.ctrl_pressed or event.alt_pressed:
 			return false  # (Ctrl+Z, Ctrl+Y... are the world's)
 		match key:
@@ -204,6 +251,7 @@ func open(p_body: DensityBody3D) -> void:
 func close() -> void:
 	if not active:
 		return
+	set_bone_mode(BoneMode.OFF)
 	active = false
 	ui.visible = false
 	line_mesh.clear_surfaces()
@@ -246,7 +294,10 @@ func _process(_delta: float) -> void:
 		_refresh_ui()
 	if playing:
 		_show_weights()
+	if bone_drag != "":
+		_bone_drag_update()
 	_draw_center_of_mass()
+	_draw_bones()
 	_update_status()
 	timeline.queue_redraw()
 
@@ -299,11 +350,16 @@ func _new_animation(p_name := "anim") -> void:
 ## Keys the body's key weights that are in use (not 0, or already on a
 ## track) at the current time.
 func _insert_keys() -> void:
-	if not _is_entity() or body.shape.get_key_count() < 2:
+	if not _is_entity():
+		return
+	var bones: int = body.shape.get_bone_count()
+	if body.shape.get_key_count() < 2 and bones == 0:
 		return
 	if _anim() == null:
 		_new_animation()
-	for k in body.shape.get_key_count():
+	for b in bones:
+		_key_bone(b, false)
+	for k in body.shape.get_key_count() if body.shape.get_key_count() >= 2 else 0:
 		var path := _weight_path(k)
 		if body.get_key_weight(k) != 0.0 or _anim().find_track(path, Animation.TYPE_VALUE) >= 0:
 			_set_key(_anim(), path, Animation.TYPE_VALUE, body.get_key_weight(k))
@@ -513,6 +569,52 @@ func _make_panels() -> void:
 		key_name_edit.text = ""
 		key_name_edit.release_focus())
 	box.add_child(key_name_edit)
+	# Bones.
+	bones_label = _label("Bones (J)")
+	box.add_child(bones_label)
+	bone_mode_select = OptionButton.new()
+	bone_mode_select.focus_mode = Control.FOCUS_NONE
+	for name in BONE_MODE_NAMES:
+		bone_mode_select.add_item(name)
+	bone_mode_select.item_selected.connect(func(i: int) -> void:
+		if not updating_ui:
+			set_bone_mode(i as BoneMode))
+	box.add_child(bone_mode_select)
+	bone_list = VBoxContainer.new()
+	bone_list.add_theme_constant_override("separation", 0)
+	box.add_child(bone_list)
+	bone_name_edit = LineEdit.new()
+	bone_name_edit.text_submitted.connect(func(t: String) -> void:
+		_rename_bone(t)
+		bone_name_edit.text = ""
+		bone_name_edit.release_focus())
+	box.add_child(bone_name_edit)
+	bone_parent_label = _label("")
+	box.add_child(bone_parent_label)
+	var reach_box := VBoxContainer.new()
+	box.add_child(reach_box)
+	bone_radius_slider = _slider(reach_box, "Reach (wheel): moves what's this near it", 0.25, 40.0, func(v: float) -> void:
+		_bone_shape_copy()
+		body.shape.set_bone_radius(bone, v))
+	bone_blend_slider = _slider(reach_box, "Fade: past that, eases off over this", 0.0, 20.0, func(v: float) -> void:
+		_bone_shape_copy()
+		body.shape.set_bone_blend(bone, v))
+	bone_soft_slider = _slider(reach_box, "Softness (Ctrl+wheel): how wide its joints bend", 0.1, 12.0, func(v: float) -> void:
+		_bone_shape_copy()
+		body.shape.set_bone_softness(bone, v))
+	var bone_row := HBoxContainer.new()
+	box.add_child(bone_row)
+	var preview_check := _check(bone_row, "Weights", func(on: bool) -> void:
+		weight_preview = on
+		_update_preview())
+	preview_check.tooltip_text = "Tints the body by the picked bone's share (orange: all of it)"
+	_button(bone_row, "Delete (X)", _delete_bone)
+	_button(bone_row, "Rest (Shift+R)", func() -> void:
+		if is_instance_valid(body):
+			body.reset_bone_pose()
+			if auto_key and bone_mode == BoneMode.POSE:
+				_insert_keys())
+	bone_controls = [bone_list, bone_name_edit, bone_parent_label, reach_box, bone_row]
 	var sculpt_label := _label("Sculpt")
 	box.add_child(sculpt_label)
 	edit_key_select = OptionButton.new()
@@ -557,7 +659,7 @@ func _make_panels() -> void:
 			body.set_meta(BodyAnimation.META, chosen))
 	box.add_child(plays_select)
 	entity_controls = [keys_label, weights_box, key_row, key_name_edit, sculpt_label, edit_key_select,
-			autokey_check, plays_label, plays_select]
+			autokey_check, plays_label, plays_select, bones_label, bone_mode_select]
 	var files := HBoxContainer.new()
 	box.add_child(files)
 	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); on a frog or chiggin, every one of its kind. Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
@@ -640,7 +742,7 @@ func _make_panels() -> void:
 	rows.add_child(status_label)
 	help_label = Label.new()
 	help_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	help_label.text = "The usual tools sculpt and paint the body.   M: leave   I: key the weights   U: delete key   Y: play   , .: frame (Shift: key)   Tab: mouse for these panels"
+	help_label.text = "The usual tools sculpt and paint the body.   M: leave   J: bones (edit / pose)   I: key   U: delete key   Y: play   , .: frame (Shift: key)   Tab: mouse for these panels"
 	rows.add_child(help_label)
 
 func _label(p_text: String) -> Label:
@@ -792,6 +894,35 @@ func _refresh_ui() -> void:
 		row.add_child(slider)
 		weight_sliders.append(slider)
 	auto_com_check.set_pressed_no_signal(body.auto_center_of_mass)
+	# Bones: the mode, a button a bone (indented under its parent), and the
+	# picked one's settings.
+	bone_mode_select.select(bone_mode)
+	var bones := shape.get_bone_count()
+	if bone >= bones:
+		bone = bones - 1
+	for control in bone_controls:
+		control.visible = entity and bone_mode != BoneMode.OFF
+	for child in bone_list.get_children():
+		child.queue_free()
+	for b in bones:
+		var depth := 0
+		var up := shape.get_bone_parent(b)
+		while up >= 0 and depth < 32:
+			depth += 1
+			up = shape.get_bone_parent(up)
+		var pick := Button.new()
+		pick.text = "  ".repeat(depth) + shape.get_bone_name(b)
+		pick.alignment = HORIZONTAL_ALIGNMENT_LEFT
+		pick.toggle_mode = true
+		pick.button_pressed = b == bone
+		pick.focus_mode = Control.FOCUS_NONE
+		pick.flat = b != bone
+		var which := b
+		pick.pressed.connect(func() -> void: _pick_bone_from_list(which))
+		bone_list.add_child(pick)
+	updating_ui = false
+	_show_bone()
+	updating_ui = true
 	anim_select.clear()
 	var names := player.get_animation_list()
 	for i in names.size():
@@ -933,6 +1064,12 @@ func _update_status() -> void:
 	if Time.get_ticks_msec() < notice_until:
 		status_label.text += "      " + notice
 	world.info_label.text = "Object editor - %d shape keys   %d FPS" % [body.shape.get_key_count(), Engine.get_frames_per_second()]
+	if bone_mode == BoneMode.EDIT:
+		world.info_label.text = ("Edit bones: click the body for a bone (on from the picked one's tail), hold a joint to move it, " +
+				"right click: a new chain, X delete, wheel: reach (Ctrl: softness), J: pose")
+	elif bone_mode == BoneMode.POSE:
+		world.info_label.text = ("Pose bones: hold a bone, its tail follows the crosshair (Alt on a root: move it), " +
+				"wheel: roll, R: rest (Shift: all), I: key, J: off")
 
 
 # --- Files --------------------------------------------------------------------------
@@ -1059,6 +1196,363 @@ func export_scene_to(path: String) -> void:
 		else:
 			push_error("Couldn't pack the scene: %s" % error_string(error))
 		root.free()
+
+
+# --- Bones -----------------------------------------------------------------------
+
+## Bones off, Edit (the skeleton, shown at rest) or Pose.
+func set_bone_mode(p_mode: BoneMode) -> void:
+	if p_mode == bone_mode:
+		return
+	_end_bone_drag()
+	if bone_mode == BoneMode.EDIT and is_instance_valid(body):
+		body.bone_pose = rest_pose_saved  # (its pose back, now the skeleton's set)
+	bone_mode = p_mode
+	if bone_mode == BoneMode.EDIT and is_instance_valid(body):
+		if playing:
+			_toggle_play()
+		rest_pose_saved = body.bone_pose
+		body.bone_pose = {}
+	if bone_mode == BoneMode.OFF:
+		weight_preview = false
+	_update_preview()
+	notice = BONE_MODE_NAMES[bone_mode] + (" (J: next)" if bone_mode != BoneMode.OFF else "")
+	notice_until = Time.get_ticks_msec() + 3000
+	if active:
+		_refresh_ui()
+
+## The bone tools' keys; true if it was one.
+func _bone_key(p_key: Key, p_shift: bool) -> bool:
+	match p_key:
+		KEY_X:
+			if bone_mode == BoneMode.EDIT:
+				_delete_bone()
+				return true
+		KEY_R:
+			if bone_mode == BoneMode.POSE:
+				if p_shift:
+					body.reset_bone_pose()
+				elif bone >= 0:
+					body.set_bone_rotation(bone, Quaternion())
+					body.set_bone_location(bone, Vector3.ZERO)
+					body.set_bone_scale(bone, Vector3.ONE)
+				if auto_key:
+					_insert_keys()
+				return true
+	return false
+
+func _bone_mouse(event: InputEventMouseButton) -> void:
+	var shape: DensityShape = body.shape
+	match event.button_index:
+		MOUSE_BUTTON_LEFT:
+			if not event.pressed:
+				_end_bone_drag()
+			elif bone_mode == BoneMode.EDIT:
+				_edit_press()
+			else:
+				_pose_press(event.alt_pressed)
+		MOUSE_BUTTON_RIGHT:
+			if event.pressed:
+				_end_bone_drag()
+				bone = -1  # (the next click starts a new chain)
+				_refresh_ui()
+		MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN:
+			if not event.pressed or bone < 0 or bone >= shape.get_bone_count():
+				return
+			var up := event.button_index == MOUSE_BUTTON_WHEEL_UP
+			if bone_mode == BoneMode.POSE:
+				# Roll about the bone.
+				var turn := Quaternion(Vector3.UP, deg_to_rad(10.0 if up else -10.0))
+				body.set_bone_rotation(bone, (body.get_bone_rotation(bone) * turn).normalized())
+				if auto_key:
+					_key_bone(bone, true)
+			else:
+				_bone_shape_copy()
+				var step := 1.15 if up else 1.0 / 1.15
+				if event.ctrl_pressed:
+					body.shape.set_bone_softness(bone, clampf(body.shape.get_bone_softness(bone) * step, 0.1, 40.0))
+				else:
+					body.shape.set_bone_radius(bone, clampf(body.shape.get_bone_radius(bone) * step, 0.25, 80.0))
+				_show_bone()
+
+# The crosshair's ray (world space).
+func _ray_from() -> Vector3:
+	return world.camera.global_position
+
+func _ray_dir() -> Vector3:
+	return -world.camera.global_basis.z
+
+func _to_world(p_local: Vector3) -> Vector3:
+	return body.global_transform * p_local
+
+func _to_body(p_world: Vector3) -> Vector3:
+	return body.global_transform.affine_inverse() * p_world
+
+## A bone's head and tail now (body space): at rest in Edit, posed in Pose.
+func _joint(p_bone: int, p_which: String) -> Vector3:
+	if bone_mode == BoneMode.EDIT:
+		return body.shape.get_bone_head(p_bone) if p_which == "head" else body.shape.get_bone_tail(p_bone)
+	return body.get_bone_pose_frame(p_bone).origin if p_which == "head" else body.get_bone_posed_tail(p_bone)
+
+## How near the crosshair's ray passes a world point, and how far along it.
+func _ray_miss(p_point: Vector3) -> Vector2:
+	var along := (p_point - _ray_from()).dot(_ray_dir())
+	return Vector2((_ray_from() + _ray_dir() * along).distance_to(p_point), along)
+
+## How near a picked joint or bone must be to the ray (world), at a distance.
+func _pick_reach(p_distance: float) -> float:
+	return maxf(p_distance * 0.03, body.shape.voxel_size * body.global_basis.x.length() * 1.5)
+
+## The joint nearest the crosshair: [bone, "head" / "tail"], or [].
+func _pick_joint() -> Array:
+	var best := []
+	var best_miss := INF
+	for b in body.shape.get_bone_count():
+		for which in ["tail", "head"]:
+			var m := _ray_miss(_to_world(_joint(b, which)))
+			if m.y > 0.0 and m.x < _pick_reach(m.y) and m.x < best_miss:
+				best_miss = m.x
+				best = [b, which]
+	return best
+
+## The bone whose posed segment passes nearest the crosshair, or -1.
+func _pick_bone() -> int:
+	var best := -1
+	var best_miss := INF
+	for b in body.shape.get_bone_count():
+		var a := _to_world(_joint(b, "head"))
+		var t := _to_world(_joint(b, "tail"))
+		for i in 9:
+			var m := _ray_miss(a.lerp(t, i / 8.0))
+			if m.y > 0.0 and m.x < _pick_reach(m.y) and m.x < best_miss:
+				best_miss = m.x
+				best = b
+	return best
+
+## The shape the bone tools change: a copy of the body's own (one undo step).
+func _begin_bone_edit() -> void:
+	bone_before = body.shape
+	body.shape = body.shape.duplicate_shape()
+	bone_slider_shape = null
+
+func _end_bone_drag() -> void:
+	if bone_drag != "" and is_instance_valid(body):
+		if bone_before != null:
+			world._push_history({"body": body, "before": bone_before, "after": body.shape,
+					"part_shapes": [], "part_transform": body.global_transform, "parts": []})
+		elif bone_drag in ["rotate", "move"] and auto_key and bone >= 0:
+			_key_bone(bone, true)
+	bone_drag = ""
+	bone_before = null
+	bone_drag_connected = []
+
+## Edit: a joint under the crosshair is picked up; else a bone starts on
+## the body there (on from the picked bone's tail, or a chain of its own).
+func _edit_press() -> void:
+	var shape: DensityShape = body.shape
+	var picked := _pick_joint()
+	if not picked.is_empty():
+		_begin_bone_edit()
+		bone = picked[0]
+		bone_drag = picked[1]
+		var at := _to_world(_joint(bone, bone_drag))
+		bone_drag_depth = _ray_miss(at).y
+		# Joints that meet this one move with it (a chain stays joined).
+		bone_drag_connected = []
+		for b in body.shape.get_bone_count():
+			for which in ["head", "tail"]:
+				if (b != bone or which != bone_drag) and _joint(b, which).distance_to(_joint(bone, bone_drag)) < 0.01:
+					bone_drag_connected.append([b, which])
+		_refresh_ui()
+		return
+	var inside = _aimed_inside()
+	if inside == null:
+		return
+	if shape.get_bone_count() >= 32:
+		notice = "At most 32 bones"
+		notice_until = Time.get_ticks_msec() + 3000
+		return
+	_begin_bone_edit()
+	var here := _to_body(inside)
+	var parent := bone if bone >= 0 and bone < body.shape.get_bone_count() else -1
+	var head: Vector3 = body.shape.get_bone_tail(parent) if parent >= 0 else here
+	var tail := here if parent >= 0 else here + Vector3.UP * body.shape.voxel_size * 2.0
+	bone = body.shape.add_bone("Bone", parent, head, tail)
+	bone_drag = "tail"  # (held: drag the new bone's tail where it goes)
+	bone_drag_depth = _ray_miss(inside).y
+	bone_drag_connected = []
+	_refresh_ui()
+
+## Pose: the bone under the crosshair turns (or, Alt on a root, moves) with it.
+func _pose_press(p_move: bool) -> void:
+	var picked := _pick_bone()
+	if picked < 0:
+		return
+	bone = picked
+	bone_before = null
+	var root: bool = body.shape.get_bone_parent(bone) < 0
+	bone_drag = "move" if p_move and root else "rotate"
+	bone_drag_depth = _ray_miss(_to_world(_joint(bone, "head" if bone_drag == "move" else "tail"))).y
+	_refresh_ui()
+
+## While held: what's picked up follows the crosshair (at its distance).
+func _bone_drag_update() -> void:
+	if not is_instance_valid(body) or bone < 0 or bone >= body.shape.get_bone_count():
+		bone_drag = ""
+		return
+	var target := _to_body(_ray_from() + _ray_dir() * bone_drag_depth)
+	match bone_drag:
+		"head", "tail":
+			for joint in [[bone, bone_drag]] + bone_drag_connected:
+				if joint[1] == "head":
+					body.shape.set_bone_head(joint[0], target)
+				else:
+					body.shape.set_bone_tail(joint[0], target)
+		"rotate":
+			var frame: Transform3D = body.get_bone_pose_frame(bone)
+			var want := target - frame.origin
+			var along := frame.basis.y.normalized()
+			if want.length() > 1e-4 and along.angle_to(want.normalized()) > 1e-4:
+				# Turn the posed bone onto the crosshair; in its own axes, that's
+				# its pose before (local) and the turn seen from its frame.
+				var turn := Quaternion(along, want.normalized())
+				var f := frame.basis.get_rotation_quaternion()
+				var local: Quaternion = body.get_bone_rotation(bone)
+				body.set_bone_rotation(bone, (local * f.inverse() * turn * f).normalized())
+		"move":
+			var frame: Transform3D = body.get_bone_pose_frame(bone)
+			var local := Transform3D(Basis(body.get_bone_rotation(bone)).scaled(body.get_bone_scale(bone)), body.get_bone_location(bone))
+			var base := frame * local.affine_inverse()  # (its rest place, for a root)
+			body.set_bone_location(bone, base.affine_inverse() * target)
+
+## Keys a bone's pose at the current time: its rotation (and location and
+## scale when they're used). p_always: even at rest (it was just moved).
+func _key_bone(p_bone: int, p_always: bool) -> void:
+	if not is_instance_valid(body) or p_bone < 0 or p_bone >= body.shape.get_bone_count():
+		return
+	if _anim() == null:
+		_new_animation()
+	var base := "bones/%s/" % body.shape.get_bone_name(p_bone)
+	var values := {"rotation": body.get_bone_rotation(p_bone), "location": body.get_bone_location(p_bone), "scale": body.get_bone_scale(p_bone)}
+	var rest := {"rotation": Quaternion(), "location": Vector3.ZERO, "scale": Vector3.ONE}
+	for what in values:
+		var path := NodePath(".:" + base + what)
+		var used: bool = values[what] != rest[what] or _anim().find_track(path, Animation.TYPE_VALUE) >= 0
+		if used or (p_always and what == "rotation"):
+			_set_key(_anim(), path, Animation.TYPE_VALUE, values[what])
+	timeline.queue_redraw()
+
+func _delete_bone() -> void:
+	if bone < 0 or bone >= body.shape.get_bone_count():
+		return
+	var gone: String = body.shape.get_bone_name(bone)
+	var which := bone
+	_change_shape(func(s: DensityShape) -> void: s.remove_bone(which))
+	BodyAnimation.rename_bone_tracks(body, gone, "")
+	bone = body.shape.get_bone_parent(which) if which < body.shape.get_bone_count() else -1
+	bone = mini(bone, body.shape.get_bone_count() - 1)
+	_refresh_ui()
+
+func _rename_bone(p_name: String) -> void:
+	if bone < 0 or bone >= body.shape.get_bone_count() or p_name.strip_edges() == "":
+		return
+	var old: String = body.shape.get_bone_name(bone)
+	var which := bone
+	_change_shape(func(s: DensityShape) -> void: s.set_bone_name(which, p_name.strip_edges()))
+	var now: String = body.shape.get_bone_name(which)
+	BodyAnimation.rename_bone_tracks(body, old, now)
+	# (Its pose is kept by name: carried over to the new one.)
+	var pose: Dictionary = body.bone_pose
+	if pose.has(old):
+		pose[now] = pose[old]
+		pose.erase(old)
+		body.bone_pose = pose
+	_refresh_ui()
+
+## The sliders edit a copy of the shape, made on the first change after a
+## pick (one undo step).
+func _bone_shape_copy() -> void:
+	if bone_slider_shape != body.shape:
+		_begin_bone_edit()
+		world._push_history({"body": body, "before": bone_before, "after": body.shape,
+				"part_shapes": [], "part_transform": body.global_transform, "parts": []})
+		bone_before = null
+		bone_slider_shape = body.shape
+
+func _update_preview() -> void:
+	var on := active and weight_preview and bone_mode != BoneMode.OFF and is_instance_valid(body) and bone >= 0
+	world.terrain.set_bone_preview(body if on else null, bone if on else -1)
+
+## The picked bone's settings in its panel controls.
+func _show_bone() -> void:
+	if bone_name_edit == null or not is_instance_valid(body):
+		return
+	var shape: DensityShape = body.shape
+	var has := bone >= 0 and bone < shape.get_bone_count()
+	updating_ui = true
+	bone_name_edit.placeholder_text = shape.get_bone_name(bone) + " (rename: Enter)" if has else "(no bone picked)"
+	var parent: int = shape.get_bone_parent(bone) if has else -1
+	bone_parent_label.text = ("Parent: %s" % (shape.get_bone_name(parent) if parent >= 0 else "none (a root)")) if has else ""
+	for slider in [bone_radius_slider, bone_blend_slider, bone_soft_slider]:
+		slider.editable = has
+	if has:
+		bone_radius_slider.value = shape.get_bone_radius(bone)
+		bone_blend_slider.value = shape.get_bone_blend(bone)
+		bone_soft_slider.value = shape.get_bone_softness(bone)
+	updating_ui = false
+	_update_preview()
+
+func _pick_bone_from_list(p_bone: int) -> void:
+	bone = p_bone
+	_refresh_ui()
+
+## The skeleton over the body: each bone an outline (head, a ring a fifth of
+## the way along, tail), the picked one yellow with its reach round its ends.
+func _draw_bones() -> void:
+	if bone_mode == BoneMode.OFF or not is_instance_valid(body) or body.shape.get_bone_count() == 0:
+		return
+	line_mesh.surface_begin(Mesh.PRIMITIVE_LINES)
+	var shape: DensityShape = body.shape
+	var scale_world: float = body.global_basis.x.length()
+	for b in shape.get_bone_count():
+		var head := _to_world(_joint(b, "head"))
+		var tail := _to_world(_joint(b, "tail"))
+		var axis := tail - head
+		var length := axis.length()
+		if length < 1e-4:
+			continue
+		var y := axis / length
+		var u := y.cross(Vector3.UP if absf(y.y) < 0.9 else Vector3.RIGHT).normalized()
+		var v := y.cross(u)
+		var ring_at := head + axis * 0.2
+		var r := length * 0.1
+		var color := Color(1.0, 0.85, 0.2) if b == bone else (Color(0.55, 0.85, 1.0) if bone_mode == BoneMode.POSE else Color(0.85, 0.85, 0.9))
+		var ring := [ring_at + u * r, ring_at + v * r, ring_at - u * r, ring_at - v * r]
+		for i in 4:
+			_line(head, ring[i], color)
+			_line(ring[i], tail, color)
+			_line(ring[i], ring[(i + 1) % 4], color)
+		if b == bone:
+			# Its reach (full, and where it fades out), round its ends, facing you.
+			var cam_basis: Basis = world.camera.global_basis
+			for end in [head, tail]:
+				_circle(end, shape.get_bone_radius(b) * scale_world, cam_basis, Color(1.0, 0.85, 0.2, 0.7))
+				_circle(end, (shape.get_bone_radius(b) + shape.get_bone_blend(b)) * scale_world, cam_basis, Color(1.0, 0.85, 0.2, 0.3))
+	line_mesh.surface_end()
+
+func _line(p_a: Vector3, p_b: Vector3, p_color: Color) -> void:
+	line_mesh.surface_set_color(p_color)
+	line_mesh.surface_add_vertex(p_a)
+	line_mesh.surface_set_color(p_color)
+	line_mesh.surface_add_vertex(p_b)
+
+func _circle(p_center: Vector3, p_radius: float, p_basis: Basis, p_color: Color) -> void:
+	var n := 24
+	for i in n:
+		var a0 := TAU * i / n
+		var a1 := TAU * (i + 1) / n
+		_line(p_center + (p_basis.x * cos(a0) + p_basis.y * sin(a0)) * p_radius,
+				p_center + (p_basis.x * cos(a1) + p_basis.y * sin(a1)) * p_radius, p_color)
 
 
 ## The timeline: a tick per frame, a diamond per key, the current frame's

@@ -468,6 +468,7 @@ func _finish_ready(p_start: int) -> void:
 	editor.world = self
 	add_child(editor)
 	material.set_shader_parameter("block_textures", _load_block_textures())
+	_make_body_view()
 	material.set_shader_parameter("water_texture", _load_water_texture())
 	material.set_shader_parameter("prepass_texture", prepass_viewport.get_texture())
 	material.set_shader_parameter("use_prepass", use_prepass)
@@ -495,6 +496,26 @@ func _finish_ready(p_start: int) -> void:
 	if network.mode == Network.Mode.HOST:
 		network.start_host()
 	network.world_ready()
+
+## Posed bodies (with bones) are drawn by a shader of their own
+## (skinned_bodies.gdshader) on a second screen quad, after the terrain's:
+## the bones' maths in the terrain shader was too much for some drivers.
+## Shown only while there's a posed body, so the game doesn't compile it
+## (or draw it) until bones are used.
+var body_view: MeshInstance3D
+func _make_body_view() -> void:
+	var terrain_view := camera.get_parent().get_node("TerrainView") as MeshInstance3D
+	body_view = MeshInstance3D.new()
+	body_view.name = "BodyView"
+	body_view.mesh = terrain_view.mesh
+	body_view.extra_cull_margin = terrain_view.extra_cull_margin
+	body_view.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var body_material := ShaderMaterial.new()
+	body_material.shader = load("res://shaders/skinned_bodies.gdshader")
+	body_view.material_override = body_material
+	body_view.visible = false
+	camera.get_parent().add_child(body_view)
+	terrain.set_body_material(body_material)
 
 ## The block textures as one texture array (a layer per material, in
 ## material_names order), with mipmaps for distant ground. A missing
@@ -1237,6 +1258,8 @@ func _process(delta: float) -> void:
 	_record_history()
 	t = _time_step("history", t)
 	terrain.update_view(camera.global_position)  # also sends the drawn bodies to the shader
+	var posed = terrain.get_body_material().get_shader_parameter("grid_count")  # (null until first sent)
+	body_view.visible = posed != null and int(posed) > 0
 	t = _time_step("terrain.update_view", t)
 	sun_shadows.update(camera.global_position)
 	t = _time_step("sun_shadows", t)
@@ -1461,7 +1484,8 @@ func _captured() -> bool:
 
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
-	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting
+	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting \
+			and not (editor != null and editor.active and editor.bone_mode != editor.BoneMode.OFF)  # (the bone tools have the mouse)
 	var held := sculpting and _button(MOUSE_BUTTON_LEFT)
 	var pressing := held or (sculpting and _button(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX]:

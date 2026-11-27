@@ -279,7 +279,7 @@ void SculptTerrain::set_extra_materials(const Array &p_materials) {
 
 std::vector<Ref<ShaderMaterial>> SculptTerrain::clip_materials() const {
 	std::vector<Ref<ShaderMaterial>> list;
-	for (const Ref<ShaderMaterial> &m : { material, prepass_material }) {
+	for (const Ref<ShaderMaterial> &m : { material, prepass_material, body_material }) {
 		if (m.is_valid()) {
 			list.push_back(m);
 		}
@@ -1111,70 +1111,169 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		grid_slots.clear();
 		material->set_shader_parameter("body_atlas", body_atlas);
 	}
-	PackedVector4Array rows0, rows1, rows2, sizes, poses, blends, bounds;
-	for (PackedVector4Array *a : { &rows0, &rows1, &rows2, &sizes, &poses, &blends, &bounds }) {
-		a->resize(MAX_GRID_BODIES);
-	}
 	frame_clock = slot_clock;
-	PackedFloat32Array highlights;
-	highlights.resize(MAX_GRID_BODIES);
-	highlights.fill(0.0f);
-	int grid_count = 0;
+	// Unposed grids are the terrain material's; posed ones (with bones) the
+	// posed bodies' material's (skinned_bodies.gdshader, drawn after it), each
+	// a set of the same uniforms, theirs with their bones too. A posed body's
+	// shadow is capsules, one a bone, as thick as it is there (both materials).
+	std::vector<Drawn> plain, posed;
 	for (const Drawn &d : grid_bodies) {
-		if (grid_count >= MAX_GRID_BODIES) {
-			break;
-		}
-		const Ref<DensityShape> shape = d.body->get_shape();
-		if (shape.is_null() || shape->get_key_count() == 0) {
-			continue;
-		}
-		// Its frames (keys, in-betweens, key weight mixes), each in a slot.
-		const DensityShape::Blend &blend = d.body->get_blend();
-		float slots[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
-		float weights[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
-		bool placed = true;
-		for (int f = 0; f < blend.count && placed; f++) {
-			const int slot = grid_slot(d.body, shape, blend.frames[f]);
-			placed = slot >= 0;
-			slots[f] = (float)slot;
-			weights[f] = blend.weights[f];
-		}
-		if (!placed) {
-			break;
-		}
-		// World point -> grid point: (B^-1 (p - T) - origin) / voxel_size, for
-		// any basis B (a transformed selection may be scaled unevenly).
-		const Transform3D t = d.body->get_global_transform();
-		const Basis inverse = t.basis.inverse();
-		const float vs = (float)shape->get_voxel_size();
-		const Vector3 o = shape->get_origin();
-		const float s_min = std::max(std::min({ t.basis.get_column(0).length(), t.basis.get_column(1).length(), t.basis.get_column(2).length() }), 1e-6f);
-		const float s_max = std::max({ t.basis.get_column(0).length(), t.basis.get_column(1).length(), t.basis.get_column(2).length() });
-		const float s_first = std::max(t.basis.get_column(0).length(), 1e-6f);
-		PackedVector4Array *rows[3] = { &rows0, &rows1, &rows2 };
-		for (int a = 0; a < 3; a++) {
-			const Vector3 row = inverse.rows[a] / vs;
-			rows[a]->set(grid_count, Vector4(row.x, row.y, row.z, -row.dot(t.origin) - o[a] / vs));
-		}
-		const Vector3i n = shape->get_size();
-		// Densities times the smallest scale are safe world distances to step.
-		sizes.set(grid_count, Vector4((float)n.x, (float)n.y, (float)n.z, vs * s_min));
-		poses.set(grid_count, Vector4(slots[0], slots[1], slots[2], slots[3]));
-		blends.set(grid_count, Vector4(weights[0], weights[1], weights[2], weights[3]));
-		highlights.set(grid_count, d.body->is_highlighted() ? 1.0f : 0.0f);
-		const Vector3 c = d.body->get_global_center_of_mass();
-		bounds.set(grid_count, Vector4(c.x, c.y, c.z, (float)d.body->get_bound_radius() * s_max / s_first + vs * s_max));
-		grid_count++;
+		(d.body->get_skin().active() && body_material.is_valid() ? posed : plain).push_back(d);
 	}
-	material->set_shader_parameter("grid_rows0", rows0);
-	material->set_shader_parameter("grid_rows1", rows1);
-	material->set_shader_parameter("grid_rows2", rows2);
-	material->set_shader_parameter("grid_size", sizes);
-	material->set_shader_parameter("grid_pose", poses);
-	material->set_shader_parameter("grid_blend", blends);
-	material->set_shader_parameter("grid_highlight", highlights);
-	material->set_shader_parameter("grid_bound", bounds);
-	material->set_shader_parameter("grid_count", grid_count);
+	PackedVector4Array capsules_a, capsules_b;
+	capsules_a.resize(MAX_CAPSULES);
+	capsules_b.resize(MAX_CAPSULES);
+	int capsule_count = 0;
+	auto bind_grids = [&](const std::vector<Drawn> &p_list, const Ref<ShaderMaterial> &p_material, bool p_bones) {
+		PackedVector4Array rows0, rows1, rows2, sizes, poses, blends, bounds;
+		for (PackedVector4Array *a : { &rows0, &rows1, &rows2, &sizes, &poses, &blends, &bounds }) {
+			a->resize(MAX_GRID_BODIES);
+		}
+		PackedFloat32Array highlights;
+		highlights.resize(MAX_GRID_BODIES);
+		highlights.fill(0.0f);
+		// Bones, in each grid's rest voxels (see skin.gdshaderinc).
+		PackedVector4Array grid_bone_ranges, bone_rows0, bone_rows1, bone_rows2, bone_heads, bone_tails, bone_softs;
+		grid_bone_ranges.resize(MAX_GRID_BODIES);
+		for (PackedVector4Array *a : { &bone_rows0, &bone_rows1, &bone_rows2, &bone_heads, &bone_tails, &bone_softs }) {
+			a->resize(MAX_DRAWN_BONES);
+		}
+		int bone_count = 0;
+		int preview = -1;
+		int grid_count = 0;
+		for (const Drawn &d : p_list) {
+			if (grid_count >= MAX_GRID_BODIES) {
+				break;
+			}
+			const Ref<DensityShape> shape = d.body->get_shape();
+			if (shape.is_null() || shape->get_key_count() == 0) {
+				continue;
+			}
+			// Its frames (keys, in-betweens, key weight mixes), each in a slot.
+			const DensityShape::Blend &blend = d.body->get_blend();
+			float slots[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
+			float weights[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
+			bool placed = true;
+			for (int f = 0; f < blend.count && placed; f++) {
+				const int slot = grid_slot(d.body, shape, blend.frames[f]);
+				placed = slot >= 0;
+				slots[f] = (float)slot;
+				weights[f] = blend.weights[f];
+			}
+			if (!placed) {
+				break;
+			}
+			// World point -> grid point: (B^-1 (p - T) - origin) / voxel_size, for
+			// any basis B (a transformed selection may be scaled unevenly).
+			const Transform3D t = d.body->get_global_transform();
+			const Basis inverse = t.basis.inverse();
+			const float vs = (float)shape->get_voxel_size();
+			const Vector3 o = shape->get_origin();
+			const float s_min = std::max(std::min({ t.basis.get_column(0).length(), t.basis.get_column(1).length(), t.basis.get_column(2).length() }), 1e-6f);
+			const float s_max = std::max({ t.basis.get_column(0).length(), t.basis.get_column(1).length(), t.basis.get_column(2).length() });
+			const float s_first = std::max(t.basis.get_column(0).length(), 1e-6f);
+			PackedVector4Array *rows[3] = { &rows0, &rows1, &rows2 };
+			for (int a = 0; a < 3; a++) {
+				const Vector3 row = inverse.rows[a] / vs;
+				rows[a]->set(grid_count, Vector4(row.x, row.y, row.z, -row.dot(t.origin) - o[a] / vs));
+			}
+			const Vector3i n = shape->get_size();
+			// Densities times the smallest scale are safe world distances to step.
+			sizes.set(grid_count, Vector4((float)n.x, (float)n.y, (float)n.z, vs * s_min));
+			poses.set(grid_count, Vector4(slots[0], slots[1], slots[2], slots[3]));
+			blends.set(grid_count, Vector4(weights[0], weights[1], weights[2], weights[3]));
+			highlights.set(grid_count, d.body->is_highlighted() ? 1.0f : 0.0f);
+			const Vector3 c = d.body->get_global_center_of_mass();
+			bounds.set(grid_count, Vector4(c.x, c.y, c.z, (float)d.body->get_bound_radius() * s_max / s_first + vs * s_max));
+			Vector4 range;
+			if (p_bones) {
+				// Its bones, if they all fit: the skin's matrices taken into the rest
+				// grid's voxels (g = (x - origin) / voxel_size).
+				const Skin &skin = d.body->get_skin();
+				if (skin.active() && bone_count + skin.size() <= MAX_DRAWN_BONES) {
+					range = Vector4((float)bone_count, (float)skin.size(), 0.0f, 0.0f);
+					for (int b = 0; b < skin.size(); b++) {
+						const SkinJoint &j = skin.joint(b);
+						const Vector3 t = (j.matrix.xform(o) - o) / vs;
+						bone_rows0.set(bone_count, Vector4(j.matrix.basis.rows[0].x, j.matrix.basis.rows[0].y, j.matrix.basis.rows[0].z, t.x));
+						bone_rows1.set(bone_count, Vector4(j.matrix.basis.rows[1].x, j.matrix.basis.rows[1].y, j.matrix.basis.rows[1].z, t.y));
+						bone_rows2.set(bone_count, Vector4(j.matrix.basis.rows[2].x, j.matrix.basis.rows[2].y, j.matrix.basis.rows[2].z, t.z));
+						const Vector3 head = (j.head - o) / vs, tail = (j.tail - o) / vs;
+						bone_heads.set(bone_count, Vector4(head.x, head.y, head.z, j.radius / vs));
+						bone_tails.set(bone_count, Vector4(tail.x, tail.y, tail.z, j.blend / vs));
+						bone_softs.set(bone_count, Vector4(j.softness / vs, 0.0f, 0.0f, 0.0f));
+						if (d.body->get_instance_id() == preview_body && b == preview_bone) {
+							preview = bone_count;
+						}
+						bone_count++;
+					}
+				}
+
+				// Its shadow: a capsule along each posed bone, as thick as
+				// the body is at the bone's middle (its density there).
+				const Transform3D world = d.body->get_global_transform();
+				for (int b = 0; b < skin.size() && capsule_count < MAX_CAPSULES; b++) {
+					const Transform3D &frame = skin.frame(b);
+					const SkinJoint &j = skin.joint(b);
+					const float length = (j.tail - j.head).length();
+					const Vector3 head = world.xform(frame.origin);
+					const Vector3 tail = world.xform(frame.xform(Vector3(0, length, 0)));
+					const float thick = std::max((float)shape->get_blend_density((j.head + j.tail) * 0.5f, d.body->get_blend()), vs) * s_max;
+					capsules_a.set(capsule_count, Vector4(head.x, head.y, head.z, thick));
+					capsules_b.set(capsule_count, Vector4(tail.x, tail.y, tail.z, 0.0f));
+					capsule_count++;
+				}
+			}
+			grid_bone_ranges.set(grid_count, range);
+			grid_count++;
+		}
+		p_material->set_shader_parameter("grid_rows0", rows0);
+		p_material->set_shader_parameter("grid_rows1", rows1);
+		p_material->set_shader_parameter("grid_rows2", rows2);
+		p_material->set_shader_parameter("grid_size", sizes);
+		p_material->set_shader_parameter("grid_pose", poses);
+		p_material->set_shader_parameter("grid_blend", blends);
+		p_material->set_shader_parameter("grid_highlight", highlights);
+		p_material->set_shader_parameter("grid_bound", bounds);
+		p_material->set_shader_parameter("grid_count", grid_count);
+		if (p_bones) {
+			p_material->set_shader_parameter("grid_bones", grid_bone_ranges);
+			p_material->set_shader_parameter("bone_rows0", bone_rows0);
+			p_material->set_shader_parameter("bone_rows1", bone_rows1);
+			p_material->set_shader_parameter("bone_rows2", bone_rows2);
+			p_material->set_shader_parameter("bone_head", bone_heads);
+			p_material->set_shader_parameter("bone_tail", bone_tails);
+			p_material->set_shader_parameter("bone_soft", bone_softs);
+			p_material->set_shader_parameter("bone_preview", preview);
+		}
+	};
+	bind_grids(plain, material, false);
+	if (body_material.is_valid()) {
+		body_material->set_shader_parameter("body_atlas", body_atlas);
+		bind_grids(posed, body_material, true);
+		// The look and the sun's shadow maps, as the terrain has them.
+		static const char *shared[] = { "sun_direction", "sun_color", "sky_color", "horizon_color", "ambient_strength", "texture_size",
+			"block_textures", "sun_map_on", "sun_map0", "sun_map1", "sun_map_origin0", "sun_map_origin1", "sun_map_extent0",
+			"sun_map_extent1", "sun_map_depth0", "sun_map_depth1", "sun_map_right", "sun_map_up", "sun_map_size" };
+		for (const char *name : shared) {
+			const Variant value = material->get_shader_parameter(name);
+			if (value.get_type() != Variant::NIL) {
+				body_material->set_shader_parameter(name, value);
+			}
+		}
+	}
+	for (const Ref<ShaderMaterial> &m : { material, body_material }) {
+		if (m.is_valid()) {
+			m->set_shader_parameter("capsule_a", capsules_a);
+			m->set_shader_parameter("capsule_b", capsules_b);
+			m->set_shader_parameter("capsule_count", capsule_count);
+		}
+	}
+}
+
+void SculptTerrain::set_bone_preview(Object *p_body, int p_bone) {
+	preview_body = p_body != nullptr ? p_body->get_instance_id() : 0;
+	preview_bone = p_body != nullptr ? p_bone : -1;
 }
 
 Dictionary SculptTerrain::get_stats() const {
@@ -2717,6 +2816,9 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_clip_brick", "level", "texel"), &SculptTerrain::get_clip_brick);
 	ClassDB::bind_method(D_METHOD("get_lod_density", "point", "level"), &SculptTerrain::get_lod_density);
 	ClassDB::bind_method(D_METHOD("get_stats"), &SculptTerrain::get_stats);
+	ClassDB::bind_method(D_METHOD("set_bone_preview", "body", "bone"), &SculptTerrain::set_bone_preview);
+	ClassDB::bind_method(D_METHOD("set_body_material", "material"), &SculptTerrain::set_body_material);
+	ClassDB::bind_method(D_METHOD("get_body_material"), &SculptTerrain::get_body_material);
 	ClassDB::bind_method(D_METHOD("shift_origin", "offset"), &SculptTerrain::shift_origin);
 	ClassDB::bind_method(D_METHOD("set_gravity", "voxels_per_second_squared"), &SculptTerrain::set_gravity);
 	ClassDB::bind_method(D_METHOD("get_gravity"), &SculptTerrain::get_gravity);
