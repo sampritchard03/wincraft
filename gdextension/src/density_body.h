@@ -293,6 +293,9 @@ protected:
 	Transform3D written; // what the last step set, to spot teleports
 	bool has_written = false;
 	double still_time = 0.0;
+	// Within step_all(): this body moves every sub_stride substeps (0: not
+	// at all), and has been moved up to the end of substep sub_last - 1.
+	int sub_stride = 0, sub_last = 0;
 
 	bool dynamic() const { return !freeze; }
 	bool moving() const { return !freeze && !sleeping; }
