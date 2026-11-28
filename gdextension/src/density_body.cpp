@@ -964,7 +964,7 @@ bool DensityBody3D::apply_brush(const Vector3 &p_center, double p_radius, double
 	return any;
 }
 
-bool DensityBody3D::paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness) {
+bool DensityBody3D::paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_scatter, int p_seed) {
 	if (shape.is_null()) {
 		return false;
 	}
@@ -975,7 +975,19 @@ bool DensityBody3D::paint_color(const Vector3 &p_center, double p_radius, const 
 	const Transform3D t = get_global_transform();
 	const double s = std::max((double)t.basis.get_column(0).length(), 1e-6);
 	const Vector3 local = t.affine_inverse().xform(p_center);
-	return shape->paint_color(local, p_radius / s, p_color, p_opacity, p_hardness, pose, key_weights);
+	return shape->paint_color(local, p_radius / s, p_color, p_opacity, p_hardness, pose, key_weights, p_scatter, p_seed);
+}
+
+int DensityBody3D::paint_fill(const Vector3 &p_center, double p_threshold, int p_material, const Color &p_color, double p_opacity, double p_scatter, int p_seed) {
+	if (shape.is_null()) {
+		return 0;
+	}
+	if (!own_shape) {
+		shape = shape->duplicate_shape();
+		own_shape = true;
+	}
+	const Vector3 local = get_global_transform().affine_inverse().xform(p_center);
+	return shape->paint_fill(local, p_threshold, p_material, p_color, p_opacity, p_scatter, p_seed, pose, key_weights);
 }
 
 void DensityBody3D::begin_grab() {
@@ -1166,7 +1178,8 @@ void DensityBody3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material"), &DensityBody3D::apply_brush, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("set_flatten_plane", "point", "normal"), &DensityBody3D::set_flatten_plane);
 	ClassDB::bind_method(D_METHOD("clear_flatten_plane"), &DensityBody3D::clear_flatten_plane);
-	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness"), &DensityBody3D::paint_color);
+	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness", "scatter", "seed"), &DensityBody3D::paint_color, DEFVAL(0.0), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("paint_fill", "center", "threshold", "material", "color", "opacity", "scatter", "seed"), &DensityBody3D::paint_fill);
 	ClassDB::bind_method(D_METHOD("raycast", "from", "direction", "max_distance"), &DensityBody3D::raycast);
 	ClassDB::bind_method(D_METHOD("begin_grab"), &DensityBody3D::begin_grab);
 	ClassDB::bind_method(D_METHOD("warp", "center", "delta", "radius", "grab"), &DensityBody3D::warp);

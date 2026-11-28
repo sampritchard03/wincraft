@@ -78,7 +78,7 @@ var hud: Hud
 ## The tool wheel's ring, from the top clockwise, with each tool's key (the
 ## number of presses for a key with several).
 const WHEEL_TOOLS := [Tool.DRAW, Tool.INFLATE, Tool.CLAY_STRIPS, Tool.LAYER, Tool.SMOOTH, Tool.PINCH, Tool.FLATTEN, Tool.GRAB, Tool.ROTATE,
-		Tool.SCALE, Tool.SNAKE_HOOK, Tool.PAINT, Tool.CLONE, Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.SELECT_BOX,
+		Tool.SCALE, Tool.SNAKE_HOOK, Tool.PAINT, Tool.CLONE, Tool.PAINT_FILL, Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.SELECT_BOX,
 		Tool.EXTRUDE, Tool.TRANSFORM, Tool.PHYSICS_GUN, Tool.GEOMETRY, Tool.BOX]
 ## The number keys: each picks its first tool, then the next on each press.
 ## (The wheel's key hints are worked out from these, so they can't fall out
@@ -89,7 +89,7 @@ const KEY_TOOLS := {
 	KEY_3: [Tool.FLATTEN],
 	KEY_4: [Tool.GRAB, Tool.ROTATE, Tool.SCALE],
 	KEY_5: [Tool.SNAKE_HOOK],
-	KEY_6: [Tool.PAINT, Tool.CLONE],
+	KEY_6: [Tool.PAINT, Tool.CLONE, Tool.PAINT_FILL],
 	KEY_7: [Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.SELECT_GEOMETRY, Tool.SELECT_BOX],
 	KEY_8: [Tool.EXTRUDE, Tool.TRANSFORM],
 	KEY_9: [Tool.PHYSICS_GUN],
@@ -238,20 +238,20 @@ var box_preview_cut := false
 var box_shown := PackedVector3Array()  # the corners the preview was made from
 
 enum Tool { DRAW, SMOOTH, FLATTEN, GRAB, SNAKE_HOOK, PAINT, SELECT_PAINT, SELECT_FILL, PHYSICS_GUN, SELECT_GEOMETRY, EXTRUDE, TRANSFORM, GEOMETRY,
-		INFLATE, PINCH, BOX, ROTATE, SCALE, LAYER, CLAY_STRIPS, CLONE, SELECT_BOX }
+		INFLATE, PINCH, BOX, ROTATE, SCALE, LAYER, CLAY_STRIPS, CLONE, SELECT_BOX, PAINT_FILL }
 const TOOL_NAMES := ["Draw", "Smooth", "Flatten", "Grab", "Snake hook", "Paint", "Select paint", "Select fill", "Physics gun",
 		"Select geometry", "Extrude", "Transform", "Geometry", "Inflate", "Pinch", "Box", "Rotate", "Scale", "Layer", "Clay strips",
-		"Clone", "Select box"]
+		"Clone", "Select box", "Paint fill"]
 ## Tools that never sculpt with the mouse buttons.
 const NON_SCULPT_TOOLS := [Tool.SELECT_PAINT, Tool.SELECT_FILL, Tool.PHYSICS_GUN, Tool.SELECT_GEOMETRY, Tool.EXTRUDE, Tool.TRANSFORM, Tool.GEOMETRY,
-		Tool.BOX, Tool.SELECT_BOX]
+		Tool.BOX, Tool.SELECT_BOX, Tool.PAINT_FILL]
 ## Brushes whose right button does the opposite (deflate, spread, lower,
 ## scrape) rather than carve. (Alt does the opposite with any brush.)
 const INVERTIBLE_TOOLS := [Tool.INFLATE, Tool.PINCH, Tool.LAYER, Tool.CLAY_STRIPS]
 ## The brush each tool applies while held (-1: grab and snake hook drag instead).
 const TOOL_MODES := [SculptTerrain.BRUSH_ADD, SculptTerrain.BRUSH_SMOOTH, SculptTerrain.BRUSH_FLATTEN, -1, -1, SculptTerrain.BRUSH_PAINT, -1, -1, -1, -1, -1, -1, -1,
 		SculptTerrain.BRUSH_INFLATE, SculptTerrain.BRUSH_PINCH, -1, -1, -1, SculptTerrain.BRUSH_LAYER, SculptTerrain.BRUSH_CLAY,
-		SculptTerrain.BRUSH_CLONE, -1]
+		SculptTerrain.BRUSH_CLONE, -1, -1]
 ## Flatten flattens to (brush settings, N): the face under the brush, one
 ## facing the view, or one square to an axis (floors, walls).
 enum FlattenPlane { FACE, VIEW, AXIS_X, AXIS_Y, AXIS_Z }
@@ -302,7 +302,16 @@ var block := 2  # stone; material_names.size() is "Color": paint_color, below
 var paint_color := Color(0.85, 0.25, 0.2)
 var paint_opacity := 1.0
 var paint_hardness := 0.5
+## Scatter (0..1): each voxel's paint varied a little at random, lighter or
+## darker (a new pattern each stroke), for speckled stone, grass, skin.
+var paint_scatter := 0.0
+var paint_seed := 0  # the stroke's pattern
+## Paint fill (6, three presses): a click paints the whole surface connected
+## to it that's colored like it there, within brush_strength / 32 (an RGB
+## distance, as Select fill's RMB: raise the strength to take in more).
+var paint_fill_clicked := false
 var color_panel: PanelContainer
+var scatter_slider: HSlider
 var color_picker: ColorPicker
 var opacity_slider: HSlider
 var hardness_slider: HSlider
@@ -1348,6 +1357,7 @@ func _make_color_panel() -> void:
 	box.add_child(color_picker)
 	opacity_slider = _add_slider(box, "Opacity", paint_opacity, func(v: float) -> void: paint_opacity = v)
 	hardness_slider = _add_slider(box, "Hardness", paint_hardness, func(v: float) -> void: paint_hardness = v)
+	scatter_slider = _add_slider(box, "Scatter", paint_scatter, func(v: float) -> void: paint_scatter = v)
 	hud.add_child(color_panel)
 
 func _add_slider(p_box: VBoxContainer, p_name: String, p_value: float, p_changed: Callable) -> HSlider:
@@ -1401,6 +1411,7 @@ func _sculpt(delta: float) -> void:
 		pressing = false  # these don't sculpt
 	if pressing and not stroking:
 		terrain.begin_stroke()
+		paint_seed += 1
 	elif stroking and not pressing:
 		terrain.end_stroke()
 		_release_held_body()
@@ -1427,7 +1438,7 @@ func _sculpt(delta: float) -> void:
 		if not aimed.is_empty():
 			target_body = aimed.body
 			hit = aimed.position
-		if target_body != null and pressing and held_body == null and (TOOL_MODES[tool] >= 0 or tool in [Tool.GRAB, Tool.SNAKE_HOOK, Tool.ROTATE, Tool.SCALE]):
+		if target_body != null and pressing and held_body == null and (TOOL_MODES[tool] >= 0 or tool in [Tool.GRAB, Tool.SNAKE_HOOK, Tool.ROTATE, Tool.SCALE, Tool.PAINT_FILL]):
 			_hold_body(target_body)
 		if hit != null and held and (tool == Tool.GRAB or tool == Tool.SNAKE_HOOK):
 			_begin_drag(hit)
@@ -1444,6 +1455,7 @@ func _sculpt(delta: float) -> void:
 	if drag_body != null:
 		network.use(drag_body)
 	_select(hit, sculpting)
+	_paint_fill(hit, held)
 	_extrude(hit, held)
 	var mode := -1
 	var inverted := false
@@ -1511,12 +1523,12 @@ func _dab(p_hit: Vector3, p_body: DensityBody3D, p_strength: float, p_mode: int)
 			if planed and flatten_plane != FlattenPlane.FACE:
 				p_body.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
 			if p_mode == SculptTerrain.BRUSH_PAINT and coloring:
-				p_body.paint_color(at, brush_radius * k, paint_color, paint_opacity, paint_hardness)
+				p_body.paint_color(at, brush_radius * k, paint_color, paint_opacity, paint_hardness, paint_scatter, paint_seed)
 			else:
 				p_body.apply_brush(at, brush_radius * k, p_strength * k, p_mode, material)
 			p_body.clear_flatten_plane()
 		elif p_mode == SculptTerrain.BRUSH_PAINT and coloring:
-			terrain.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness)
+			terrain.paint_color(at, brush_radius, paint_color, paint_opacity, paint_hardness, paint_scatter, paint_seed)
 		else:
 			if planed:
 				terrain.set_flatten_plane(copies[i] * flatten_point, copies[i].basis * flatten_normal)
@@ -2083,6 +2095,28 @@ func _select(p_hit, p_sculpting: bool) -> void:
 		else:
 			terrain.select_similar(p_hit, radius, brush_strength / 32.0, true)
 
+## Paint fill, once per click: at p_hit and its symmetry copies, on the
+## aimed object (the copies that land on it) or the ground, with the block
+## or color Draw builds with (a color at paint_opacity, scattered).
+func _paint_fill(p_hit, p_held: bool) -> void:
+	if tool != Tool.PAINT_FILL or not p_held:
+		paint_fill_clicked = false
+		return
+	if p_hit == null or paint_fill_clicked:
+		return
+	paint_fill_clicked = true
+	var coloring := block == material_names.size()
+	var material: int = -1 if coloring else block
+	var threshold := brush_strength / 32.0
+	var copies := _symmetry_copies()
+	var indices := _body_copies(target_body, copies, p_hit) if target_body != null else _distinct_copies(copies, p_hit)
+	for i in indices:
+		var at: Vector3 = copies[i] * p_hit
+		if target_body != null:
+			target_body.paint_fill(at, threshold, material, paint_color, paint_opacity, paint_scatter, paint_seed)
+		else:
+			terrain.paint_fill(at, minf(brush_radius * FILL_RADII, FILL_MAX), threshold, material, paint_color, paint_opacity, paint_scatter, paint_seed)
+
 func _select_body(p_body: DensityBody3D, p_on: bool) -> void:
 	if p_on:
 		terrain.clear_selection()
@@ -2286,7 +2320,9 @@ func _tool_hint() -> String:
 		Tool.SMOOTH:
 			return "Smooth (Alt: sharpen; Shift + click: a straight stroke from the last)"
 		Tool.PAINT:
-			return "Paint (Shift + click: a straight stroke from the last)"
+			return "Paint (Shift + click: a straight stroke from the last; C: color, scatter)"
+		Tool.PAINT_FILL:
+			return "Paint fill: click paints the surface colored like where you click (strength %.0f: how alike; C: color, scatter)" % brush_strength
 		Tool.GRAB:
 			return "Grab: drag the ground (Shift + click: pulls where the last grab ended to here)"
 		Tool.TRANSFORM:

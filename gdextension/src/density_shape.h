@@ -124,6 +124,11 @@ public:
 	void bake_meshes(const Array &p_poses, const Array &p_colors, double p_voxel_size, double p_margin);
 	// Copy with its own data, to sculpt one body without changing others.
 	Ref<DensityShape> duplicate_shape() const;
+	// A copy sampled again at p_voxel_size (finer or coarser), its keys too,
+	// on a grid trimmed to what it holds. Coarser than asked (twice, again...)
+	// if that wouldn't fit in MAX_SIZE points a side: get_voxel_size() of the
+	// result says what it got.
+	Ref<DensityShape> resampled(double p_voxel_size) const;
 	// Compact form for save files (zstd).
 	Dictionary to_dict() const;
 	static Ref<DensityShape> from_dict(const Dictionary &p_dict);
@@ -145,7 +150,11 @@ public:
 	// the edge grows the grid (coarser past MAX_SIZE). Returns whether
 	// anything changed.
 	bool apply_brush(const Vector3 &p_center, double p_radius, double p_strength, int p_mode, int p_material, int p_key = -1, double p_pose = 0.0, const PackedFloat32Array &p_weights = PackedFloat32Array());
-	bool paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_pose = 0.0, const PackedFloat32Array &p_weights = PackedFloat32Array());
+	bool paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_pose = 0.0, const PackedFloat32Array &p_weights = PackedFloat32Array(), double p_scatter = 0.0, int p_seed = 0);
+	// As SculptTerrain.paint_fill(): the surface connected to p_center
+	// colored like it there (the whole shape: no radius). Returns how many
+	// points it painted.
+	int paint_fill(const Vector3 &p_center, double p_threshold, int p_material, const Color &p_color, double p_opacity, double p_scatter, int p_seed, double p_pose = 0.0, const PackedFloat32Array &p_weights = PackedFloat32Array());
 	// Grab and snake hook, as SculptTerrain.warp() (a centre per symmetry
 	// copy, body space): begin_grab() keeps the shape as it is; each warp()
 	// with p_grab moves it by p_deltas (the whole move since then) from that;

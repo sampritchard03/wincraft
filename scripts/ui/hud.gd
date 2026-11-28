@@ -286,7 +286,7 @@ func _icon(p_texture: Texture2D, p_size: float) -> TextureRect:
 const HELP := [
 	["Tools", ""],
 	["Tab (hold)", "Tool wheel: point at a tool, let go to pick it (holding with the physics gun: turn it with the mouse)"],
-	["1 - 0", "Draw / Inflate / Clay strips / Layer, Smooth / Pinch, Flatten, Grab / Rotate / Scale, Snake hook, Paint / Clone, Select (paint / fill / geometry / box), Extrude / Transform, Physics gun, Geometry / Box (Shift: cut)"],
+	["1 - 0", "Draw / Inflate / Clay strips / Layer, Smooth / Pinch, Flatten, Grab / Rotate / Scale, Snake hook, Paint / Clone / Paint fill, Select (paint / fill / geometry / box), Extrude / Transform, Physics gun, Geometry / Box (Shift: cut)"],
 	["LMB / RMB", "Sculpt / carve (Inflate, Pinch, Layer, Clay strips: the opposite)"],
 	["Alt + LMB", "Any brush the other way (Draw carves, Smooth sharpens, Flatten pushes away...)"],
 	["Shift + click", "A straight stroke from where the last ended (Grab: pulls that spot to here)"],
@@ -298,7 +298,8 @@ const HELP := [
 	["Material", ""],
 	["[  ]", "Previous / next material (the last is Color)"],
 	["Middle click", "Pick the material or color under the crosshair (the ground or an object)"],
-	["C", "Color picker, opacity and hardness"],
+	["C", "Color picker, opacity, hardness and scatter (speckles the paint)"],
+	["Paint fill (6 x3)", "Click: paints the surface colored like it there (strength: how alike the colors it takes in)"],
 	["Symmetry", ""],
 	["E / Q", "Symmetry axis along the view (on an object: fixed to it, along where a creature faces) / remove it"],
 	["Z,  + / -", "Mirror or radial, radial count"],

@@ -189,7 +189,18 @@ public:
 	// began, at the most coverage the brush has given it. Whatever it was
 	// (a color, or a block, whose color is its texture's average: see
 	// set_material_colors()) becomes a color material.
-	void paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness);
+	// p_scatter (0..1): each point's color varied a little at random (light
+	// and shade, a touch of hue), the same for a point all stroke (p_seed:
+	// a new pattern each stroke).
+	void paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_scatter = 0.0, int p_seed = 0);
+	// Paint fill: the surface connected to p_from (within p_radius) whose
+	// color is within p_threshold (RGB distance, 0..1.7) of the color there,
+	// all painted at once: with block p_material, or (p_material < 0)
+	// p_color over it at p_opacity, scattered as paint_color(). Keeps to the
+	// selection, if any. Returns how many points it painted.
+	int paint_fill(const Vector3 &p_from, double p_radius, double p_threshold, int p_material, const Color &p_color, double p_opacity, double p_scatter, int p_seed);
+	// p_color varied for the point (x, y, z), as p_scatter above.
+	static Color scatter_color(const Color &p_color, double p_scatter, int x, int y, int z, int p_seed);
 	// The blocks' average colors (get_material_names() order), which color
 	// painting starts from on them. world.gd sets them from the textures.
 	void set_material_colors(const PackedColorArray &p_colors);
