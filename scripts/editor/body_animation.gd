@@ -1,7 +1,7 @@
 extends RefCounted
 ## A body's own animations (in its AnimationPlayer, as the object editor
 ## makes them) and the one it plays by itself, as plain data: for saving
-## the world's objects (bouncy_balls.gd) and sending them to other players
+## the world's objects (physics_objects.gd) and sending them to other players
 ## (network.gd).
 ##
 ## The animation a body plays by itself is its "plays" (meta "plays_animation"):

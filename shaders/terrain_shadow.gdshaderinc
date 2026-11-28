@@ -153,40 +153,39 @@ bool grid_span(int i, vec3 ro, vec3 rd, out float r_t0, out float r_t1) {
 // The nearest grid body the ray hits before r_t: its index (or -1), and
 // r_t set to where.
 int trace_grids(vec3 ro, vec3 rd, inout float r_t) {
+	// (The loops over the bodies here and below take their count in the
+	// condition and use no continue / early break: Mali's compiler got
+	// those wrong, drawing no bodies and darkening everything.)
 	int hit = -1;
-	for (int i = 0; i < MAX_GRID_BODIES; i++) {
-		if (i >= grid_count) {
-			break;
-		}
+	int count = min(grid_count, MAX_GRID_BODIES);
+	for (int i = 0; i < count; i++) {
 		float t, t1;
-		if (!grid_span(i, ro, rd, t, t1) || t >= r_t) {
-			continue;
-		}
-		t1 = min(t1, r_t);
-		float voxel = grid_size[i].w;
-		float t_prev = t;
-		for (int j = 0; j < 128; j++) {
-			if (t > t1) {
-				break;
-			}
-			float d = grid_density(i, ro + rd * t);
-			if (d > 0.0) {
-				// Back to the surface between the last point outside and this one.
-				float a = t_prev, b = t;
-				for (int k = 0; k < 5; k++) {
-					float m = 0.5 * (a + b);
-					if (grid_density(i, ro + rd * m) > 0.0) {
-						b = m;
-					} else {
-						a = m;
+		if (grid_span(i, ro, rd, t, t1) && t < r_t) {
+			t1 = min(t1, r_t);
+			float voxel = grid_size[i].w;
+			float t_prev = t;
+			bool found = false;
+			for (int j = 0; j < 128 && !found && t <= t1; j++) {
+				float d = grid_density(i, ro + rd * t);
+				if (d > 0.0) {
+					// Back to the surface between the last point outside and this one.
+					float a = t_prev, b = t;
+					for (int k = 0; k < 5; k++) {
+						float m = 0.5 * (a + b);
+						if (grid_density(i, ro + rd * m) > 0.0) {
+							b = m;
+						} else {
+							a = m;
+						}
 					}
+					r_t = b;
+					hit = i;
+					found = true;
+				} else {
+					t_prev = t;
+					t += max(-d * 0.8, 0.1 * voxel);
 				}
-				r_t = b;
-				hit = i;
-				break;
 			}
-			t_prev = t;
-			t += max(-d * 0.8, 0.1 * voxel);
 		}
 	}
 	return hit;
@@ -194,46 +193,36 @@ int trace_grids(vec3 ro, vec3 rd, inout float r_t) {
 
 // Whether the ray from p towards the sun passes through a grid body.
 bool grid_shadow(vec3 p, vec3 sun) {
-	for (int i = 0; i < MAX_GRID_BODIES; i++) {
-		if (i >= grid_count) {
-			break;
-		}
+	bool shadowed = false;
+	int count = min(grid_count, MAX_GRID_BODIES);
+	for (int i = 0; i < count && !shadowed; i++) {
 		float t, t1;
-		if (!grid_span(i, p, sun, t, t1)) {
-			continue;
-		}
-		float voxel = grid_size[i].w;
-		for (int j = 0; j < 32; j++) {
-			if (t > t1) {
-				break;
+		if (grid_span(i, p, sun, t, t1)) {
+			float voxel = grid_size[i].w;
+			for (int j = 0; j < 32 && !shadowed && t <= t1; j++) {
+				float d = grid_density(i, p + sun * t);
+				shadowed = d > 0.0;
+				t += max(-d * 0.9, 0.3 * voxel);
 			}
-			float d = grid_density(i, p + sun * t);
-			if (d > 0.0) {
-				return true;
-			}
-			t += max(-d * 0.9, 0.3 * voxel);
 		}
 	}
-	return false;
+	return shadowed;
 }
 
 // Whether the ray from p towards the sun passes through a sphere. A point
 // on a sphere's own lit side starts outside it heading away, so a sphere
 // doesn't shadow itself.
 bool sphere_shadow(vec3 p, vec3 sun) {
-	for (int i = 0; i < MAX_BODY_SPHERES; i++) {
-		if (i >= body_sphere_count) {
-			break;
-		}
+	bool shadowed = false;
+	int count = min(body_sphere_count, MAX_BODY_SPHERES);
+	for (int i = 0; i < count; i++) {
 		vec3 oc = p - body_spheres[i].xyz;
 		float r = body_spheres[i].w;
 		float b = dot(oc, sun);
 		float c = dot(oc, oc) - r * r;
-		if (c > 0.0 && b < 0.0 && b * b > c) {
-			return true;
-		}
+		shadowed = shadowed || (c > 0.0 && b < 0.0 && b * b > c);
 	}
-	return false;
+	return shadowed;
 }
 
 // How much sky light reaches p (normal n) past the bodies, 1 = all: each
@@ -242,29 +231,23 @@ bool sphere_shadow(vec3 p, vec3 sun) {
 // p_skip_sphere / p_skip_grid: the body p is on (-1 for none).
 float body_occlusion(vec3 p, vec3 n, int p_skip_sphere, int p_skip_grid) {
 	float occlusion = 0.0;
-	for (int i = 0; i < MAX_BODY_SPHERES; i++) {
-		if (i >= body_sphere_count) {
-			break;
+	int spheres = min(body_sphere_count, MAX_BODY_SPHERES);
+	for (int i = 0; i < spheres; i++) {
+		if (i != p_skip_sphere) {
+			vec3 to = body_spheres[i].xyz - p;
+			float l2 = max(dot(to, to), 1e-4);
+			float r = body_spheres[i].w;
+			occlusion += clamp(dot(n, to) * inversesqrt(l2), 0.0, 1.0) * r * r / l2;
 		}
-		if (i == p_skip_sphere) {
-			continue;
-		}
-		vec3 to = body_spheres[i].xyz - p;
-		float l2 = max(dot(to, to), 1e-4);
-		float r = body_spheres[i].w;
-		occlusion += clamp(dot(n, to) * inversesqrt(l2), 0.0, 1.0) * r * r / l2;
 	}
-	for (int i = 0; i < MAX_GRID_BODIES; i++) {
-		if (i >= grid_count) {
-			break;
-		}
+	int grids = min(grid_count, MAX_GRID_BODIES);
+	for (int i = 0; i < grids; i++) {
 		vec3 to = grid_bound[i].xyz - p;
 		float l2 = max(dot(to, to), 1e-4);
 		float r = grid_bound[i].w * 0.6;
-		if (i == p_skip_grid || l2 < r * r) {
-			continue;
+		if (i != p_skip_grid && l2 >= r * r) {
+			occlusion += clamp(dot(n, to) * inversesqrt(l2), 0.0, 1.0) * r * r / l2;
 		}
-		occlusion += clamp(dot(n, to) * inversesqrt(l2), 0.0, 1.0) * r * r / l2;
 	}
 	return clamp(1.0 - occlusion, 0.0, 1.0);
 }
@@ -274,21 +257,18 @@ float body_occlusion(vec3 p, vec3 n, int p_skip_sphere, int p_skip_grid) {
 int trace_spheres(vec3 ro, vec3 rd, out float r_t) {
 	int hit = -1;
 	r_t = 1e30;
-	for (int i = 0; i < MAX_BODY_SPHERES; i++) {
-		if (i >= body_sphere_count) {
-			break;
-		}
+	int count = min(body_sphere_count, MAX_BODY_SPHERES);
+	for (int i = 0; i < count; i++) {
 		vec3 oc = ro - body_spheres[i].xyz;
 		float r = body_spheres[i].w;
 		float b = dot(oc, rd);
 		float h = b * b - (dot(oc, oc) - r * r);
-		if (h < 0.0) {
-			continue;
-		}
-		float t = -b - sqrt(h);
-		if (t > 0.0 && t < r_t) {
-			r_t = t;
-			hit = i;
+		if (h >= 0.0) {
+			float t = -b - sqrt(h);
+			if (t > 0.0 && t < r_t) {
+				r_t = t;
+				hit = i;
+			}
 		}
 	}
 	return hit;
@@ -311,10 +291,19 @@ uniform vec3 sun_map_right;
 uniform vec3 sun_map_up;
 uniform float sun_map_size = 512.0;
 
+// A map texel's depth (0..1 of its map's depth): 16 bits, the high byte in
+// red and the low in green (terrain_sun_map.gdshader).
+float sun_map_depth(vec4 p_texel) {
+	return (floor(p_texel.r * 255.0 + 0.5) * 256.0 + floor(p_texel.g * 255.0 + 0.5)) / 65535.0;
+}
+
 // One map's verdict at p (1 lit, 0 shadow, between at an edge): four texels
 // around it compared and blended (so edges are smooth, not texel squares).
 // r_covered: whether p is inside the map at all.
-float sun_map_lookup(sampler2D p_map, vec3 p_origin, float p_extent, float p_depth, vec3 p, vec3 sun, float p_bias, out bool r_covered) {
+// (p_map picks sun_map0 or sun_map1 here, rather than the sampler being
+// passed in: Mali's compiler got the sampler argument wrong, darkening
+// everything.)
+float sun_map_lookup(int p_map, vec3 p_origin, float p_extent, float p_depth, vec3 p, vec3 sun, float p_bias, out bool r_covered) {
 	vec3 rel = p - p_origin;
 	vec2 uv = vec2(dot(rel, sun_map_right), dot(rel, sun_map_up)) / p_extent + 0.5;
 	float t = -dot(rel, sun); // how far along its texel's ray p is
@@ -330,7 +319,8 @@ float sun_map_lookup(sampler2D p_map, vec3 p_origin, float p_extent, float p_dep
 	float lit[4];
 	for (int k = 0; k < 4; k++) {
 		ivec2 q = clamp(c + ivec2(k & 1, k >> 1), ivec2(0), ivec2(last));
-		lit[k] = t - p_bias <= texelFetch(p_map, q, 0).r * p_depth ? 1.0 : 0.0;
+		vec4 texel = p_map == 0 ? texelFetch(sun_map0, q, 0) : texelFetch(sun_map1, q, 0);
+		lit[k] = t - p_bias <= sun_map_depth(texel) * p_depth ? 1.0 : 0.0;
 	}
 	return mix(mix(lit[0], lit[1], f.x), mix(lit[2], lit[3], f.x), f.y);
 }
@@ -347,12 +337,12 @@ float sun_map_shadow(vec3 p, vec3 n, vec3 sun, float scale) {
 	float slope = min(sqrt(1.0 - ndl * ndl) / ndl, 4.0);
 	bool covered;
 	float texel0 = sun_map_extent0 / sun_map_size;
-	float lit = sun_map_lookup(sun_map0, sun_map_origin0, sun_map_extent0, sun_map_depth0, p, sun, texel0 * (1.0 + slope) + 0.5 * scale, covered);
+	float lit = sun_map_lookup(0, sun_map_origin0, sun_map_extent0, sun_map_depth0, p, sun, texel0 * (1.0 + slope) + 0.5 * scale, covered);
 	if (covered) {
 		return lit;
 	}
 	float texel1 = sun_map_extent1 / sun_map_size;
-	return sun_map_lookup(sun_map1, sun_map_origin1, sun_map_extent1, sun_map_depth1, p, sun, texel1 * (1.0 + slope) + 0.5 * scale, covered);
+	return sun_map_lookup(1, sun_map_origin1, sun_map_extent1, sun_map_depth1, p, sun, texel1 * (1.0 + slope) + 0.5 * scale, covered);
 }
 
 // 1 = sunlit, 0 = shadowed: hard shadows. A ray is in shadow only once a

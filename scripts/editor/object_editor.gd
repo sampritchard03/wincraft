@@ -26,8 +26,15 @@ extends Node
 ##
 ## The animations live on the body itself, in its AnimationPlayer (made if
 ## it has none), so the frog's AnimationTree, say, can play what you make here.
+##
+## Shape keys and animation are for entities only (entity.gd: balls, frogs,
+## chiggins): a plain physics object (P, Ctrl+O, a piece cut off) is loose
+## ground, one shape, so for one the editor shows only its sculpting and
+## physics settings.
 
 const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
+const PhysicsObject := preload("res://scripts/objects/physics_object.gd")
+const Entity := preload("res://scripts/objects/entities/entity.gd")
 
 var world: Node  # world.gd
 var active := false
@@ -88,6 +95,8 @@ var file_dialog: FileDialog
 var facing_row: HBoxContainer
 var facing_spin: SpinBox
 var updating_ui := false  # filling the panels in: their signals are ignored
+var entity_controls: Array[Control] = []  # shown only for an entity (shape keys, animation)
+var plain_label: Label  # shown instead, for a plain physics object
 var seen_shape: DensityShape = null
 var seen_keys := -1
 
@@ -127,11 +136,15 @@ func handle_input(event: InputEvent) -> bool:
 			KEY_TAB:
 				Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED else Input.MOUSE_MODE_CAPTURED
 				get_viewport().gui_release_focus()
-			KEY_I: _insert_keys()
-			KEY_U: _delete_keys()
-			KEY_Y: _toggle_play()
-			KEY_COMMA: _step(-1, event.shift_pressed)
-			KEY_PERIOD: _step(1, event.shift_pressed)
+			KEY_I, KEY_U, KEY_Y, KEY_COMMA, KEY_PERIOD:
+				if not _is_entity():
+					return false  # (no animation for a plain object)
+				match key:
+					KEY_I: _insert_keys()
+					KEY_U: _delete_keys()
+					KEY_Y: _toggle_play()
+					KEY_COMMA: _step(-1, event.shift_pressed)
+					KEY_PERIOD: _step(1, event.shift_pressed)
 			_:
 				return false
 		return true
@@ -139,7 +152,13 @@ func handle_input(event: InputEvent) -> bool:
 
 ## Whether a screen point is on one of the panels.
 func has_point(p_position: Vector2) -> bool:
-	return active and (side_panel.get_global_rect().has_point(p_position) or timeline_panel.get_global_rect().has_point(p_position))
+	return active and (side_panel.get_global_rect().has_point(p_position)
+			or (timeline_panel.visible and timeline_panel.get_global_rect().has_point(p_position)))
+
+
+## Whether the body being edited may have shape keys and animations.
+func _is_entity() -> bool:
+	return is_instance_valid(body) and PhysicsObject.body_is_entity(body)
 
 
 # --- Opening and closing ----------------------------------------------------
@@ -289,7 +308,7 @@ func _new_animation(p_name := "anim") -> void:
 ## Keys the body's key weights that are in use (not 0, or already on a
 ## track) at the current time.
 func _insert_keys() -> void:
-	if not is_instance_valid(body) or body.shape.get_key_count() < 2:
+	if not _is_entity() or body.shape.get_key_count() < 2:
 		return
 	if _anim() == null:
 		_new_animation()
@@ -482,7 +501,11 @@ func _make_panels() -> void:
 	scroll.add_child(box)
 	title_label = Label.new()
 	box.add_child(title_label)
-	box.add_child(_label("Shape keys (click a name: current key; weights add up)"))
+	plain_label = _label("A plain physics object: one shape, no shape keys or animation (those are for entities: balls, frogs, chiggins)")
+	plain_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	box.add_child(plain_label)
+	var keys_label := _label("Shape keys (click a name: current key; weights add up)")
+	box.add_child(keys_label)
 	weights_box = VBoxContainer.new()
 	box.add_child(weights_box)
 	var key_row := HBoxContainer.new()
@@ -499,7 +522,8 @@ func _make_panels() -> void:
 		key_name_edit.text = ""
 		key_name_edit.release_focus())
 	box.add_child(key_name_edit)
-	box.add_child(_label("Sculpt"))
+	var sculpt_label := _label("Sculpt")
+	box.add_child(sculpt_label)
 	edit_key_select = OptionButton.new()
 	edit_key_select.focus_mode = Control.FOCUS_NONE
 	edit_key_select.item_selected.connect(func(i: int) -> void:
@@ -524,7 +548,8 @@ func _make_panels() -> void:
 	autokey_check = _check(box, "Auto key the weight sliders", func(on: bool) -> void: auto_key = on)
 	autokey_check.set_pressed_no_signal(true)
 	# (Here, not along the bottom: that row is full.)
-	box.add_child(_label("Plays by itself (when not editing)"))
+	var plays_label := _label("Plays by itself (when not editing)")
+	box.add_child(plays_label)
 	plays_select = OptionButton.new()
 	plays_select.focus_mode = Control.FOCUS_NONE
 	plays_select.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -540,6 +565,8 @@ func _make_panels() -> void:
 		else:
 			body.set_meta(BodyAnimation.META, chosen))
 	box.add_child(plays_select)
+	entity_controls = [keys_label, weights_box, key_row, key_name_edit, sculpt_label, edit_key_select,
+			autokey_check, plays_label, plays_select]
 	var voxel_row := HBoxContainer.new()
 	box.add_child(voxel_row)
 	var voxel_label := Label.new()
@@ -553,6 +580,14 @@ func _make_panels() -> void:
 		if not updating_ui:
 			set_voxel_size(voxel_select.get_item_metadata(i)))
 	voxel_row.add_child(voxel_select)
+	var mirror_row := HBoxContainer.new()
+	box.add_child(mirror_row)
+	var mirror_label := Label.new()
+	mirror_label.text = "Mirror"
+	mirror_row.add_child(mirror_label)
+	for keep_right in [false, true]:
+		var mirror_button := _button(mirror_row, "Left onto right" if not keep_right else "Right onto left", func() -> void: _mirror(keep_right))
+		mirror_button.tooltip_text = "Once: cuts it in half at the mirror symmetry's plane (E on it; a creature's runs down its middle) and makes the other half this half's mirror image, shape keys too, so symmetry lines up. Ctrl+Z undoes. (Shift+E in the world: the side you're looking from)"
 	var files := HBoxContainer.new()
 	box.add_child(files)
 	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); on a frog or chiggin, every one of its kind. Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
@@ -727,7 +762,14 @@ func _refresh_ui() -> void:
 	current_key = clampi(current_key, 0, maxi(keys - 1, 0))
 	if sculpt_target >= keys:
 		sculpt_target = -1
-	title_label.text = "Object editor: %s   (%d shape keys)" % [body.name, keys]
+	var entity := _is_entity()
+	title_label.text = "Object editor: %s   (%s)" % [body.name, "%d shape keys" % keys if entity else "plain object"]
+	plain_label.visible = not entity
+	for control in entity_controls:
+		control.visible = entity
+	timeline_panel.visible = entity
+	if not entity:
+		sculpt_target = -1
 	facing_row.visible = body.get("facing_offset") != null
 	if facing_row.visible:
 		facing_spin.set_value_no_signal(body.facing_offset)
@@ -865,7 +907,7 @@ func _change_shape(p_change: Callable) -> void:
 ## A new last key, as the body looks now (pose and key weights), picked for
 ## sculpting and shown.
 func _add_key() -> void:
-	if not is_instance_valid(body):
+	if not _is_entity():
 		return
 	var added := body.shape.get_key_count()
 	if added == 0:
@@ -986,8 +1028,10 @@ func import_model_from(path: String) -> void:
 		return
 	var before: DensityShape = body.shape
 	var after: DensityShape = loaded.duplicate_shape()
+	if not _is_entity():
+		after = PhysicsObject.conform_shape(after)  # (one shape: no shape keys; its voxel size kept)
 	var own := after.get_key_count()
-	var old := before.get_key_count() if before != null else 0
+	var old := before.get_key_count() if before != null and _is_entity() else 0
 	if own > 0:
 		for k in mini(own, old):
 			if after.get_key_name(k) == "" and before.get_key_name(k) != "":
@@ -1011,6 +1055,17 @@ static func _voxel_text(p_size: float) -> String:
 
 ## Samples the body's shape again at p_size (its keys too), as one undo
 ## step. A shape too big for that many voxels gets the finest that fits.
+## The mirror buttons: the symmetry put on it first if it isn't (mirror,
+## along where a creature faces, or the view).
+func _mirror(p_keep_right: bool) -> void:
+	if not is_instance_valid(body) or body.shape == null:
+		return
+	if world.symmetry_body != body or not world.symmetry_attached:
+		world.attach_symmetry_to(body)
+	world.symmetry = 0  # (world.gd Symmetry.MIRROR)
+	world.mirror_half(body, p_keep_right)
+	_refresh_ui()
+
 func set_voxel_size(p_size: float) -> void:
 	if not is_instance_valid(body) or body.shape == null:
 		return
@@ -1058,7 +1113,7 @@ func _export_scene() -> void:
 	_open_dialog(FileDialog.FILE_MODE_SAVE_FILE, "*.tscn ; Scene", export_scene_to)
 
 func export_scene_to(path: String) -> void:
-		var root := DensityBody3D.new()
+		var root: DensityBody3D = Entity.new()  # (dropped from its scene, it's a creature: an entity)
 		root.name = path.get_file().get_basename().validate_node_name()
 		root.shape = body.shape.duplicate_shape()
 		for property in ["mass", "bounce", "friction", "gravity_scale", "linear_damp", "angular_damp", "rolling_resistance",

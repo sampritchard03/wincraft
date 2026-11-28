@@ -129,6 +129,11 @@ public:
 	// if that wouldn't fit in MAX_SIZE points a side: get_voxel_size() of the
 	// result says what it got.
 	Ref<DensityShape> resampled(double p_voxel_size) const;
+	// A copy with the side of the plane through p_point facing p_normal (body
+	// space) kept and the other side made its mirror image (rest shape,
+	// materials and every key, motions mirrored too): symmetric across it.
+	// The grid grows to hold the mirrored half (coarser past MAX_SIZE).
+	Ref<DensityShape> mirrored(const Vector3 &p_point, const Vector3 &p_normal) const;
 	// Compact form for save files (zstd).
 	Dictionary to_dict() const;
 	static Ref<DensityShape> from_dict(const Dictionary &p_dict);
@@ -180,6 +185,13 @@ public:
 	// A convex solid round some points (the hull of them, at least a voxel
 	// or so thick), in their own space, of p_material.
 	static Ref<DensityShape> make_hull(const PackedVector3Array &p_points, int p_material, double p_voxel_size = 1.0);
+	// A shape of simple solids unioned (the most solid wins, with its
+	// material), for shapes built by scripts (ShapeBuilder). Each a
+	// Dictionary: {"type": 0, "a": centre, "r": Vector3 half-sizes,
+	// "material"} an ellipsoid, or {"type": 1, "a", "b", "ra", "rb",
+	// "material"} a capsule from a (ra thick) to b (rb thick). Coarser
+	// voxels than p_voxel_size if they don't fit in MAX_SIZE points a side.
+	static Ref<DensityShape> make_solids(const Array &p_solids, double p_voxel_size = 1.0);
 	// Changes with every edit (the drawing atlas re-uploads).
 	int64_t get_version() const { return version; }
 

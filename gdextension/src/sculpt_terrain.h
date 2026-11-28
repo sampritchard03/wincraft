@@ -60,7 +60,7 @@ public:
 		WORLD_ISLANDS = godot::WORLD_ISLANDS,
 		WORLD_TERRAIN = godot::WORLD_TERRAIN,
 	};
-	static constexpr int MAX_CLIP_LEVELS = 8; // samplers in terrain.gdshader
+	static constexpr int MAX_CLIP_LEVELS = 8; // MATERIAL_LEVEL / LEVEL_SAMPLER uses in terrain_common.gdshaderinc
 
 	// Size of a new world (a saved one keeps its own): x and z wrap every
 	// world_size voxels (a power of 2); world_height voxels tall, centred on 0.
@@ -323,7 +323,7 @@ public:
 	// square, GRID_SLOTS * GRID_SLOT deep.
 	static constexpr int MAX_GRID_BODIES = 48; // terrain_shadow.gdshaderinc
 	static constexpr int GRID_SLOT = DensityShape::MAX_SIZE;
-	static constexpr int GRID_SLOTS = 24;
+	static constexpr int GRID_SLOTS = 31; // (31 x 64 layers: under the 2048 a texture array may have)
 
 	// Selection (selection.cpp): a set of points of the terrain, shown
 	// tinted. While anything is selected, brushes change only selected
@@ -358,6 +358,23 @@ public:
 	// p_material >= 0 paints it all that material (else the shape's own).
 	// p_select: what it adds becomes selected.
 	void stamp_shape(const Ref<DensityShape> &p_shape, const Transform3D &p_transform, int p_material = -1, bool p_select = true, double p_pose = 0.0);
+	// World features (trees, mushrooms...): shapes the generator grows on
+	// the ground, part of the generated world like its noise (so saved only
+	// where their chunks are edited). Each a Dictionary:
+	//   shapes        Array of DensityShape (one picked per placement; its
+	//                 key 0, its local origin where it meets the ground)
+	//   id            String: seeds where it goes
+	//   per_region    float: placements tried per 64 x 64 voxels of ground
+	//   grows_on      PackedInt32Array of materials (empty: any ground)
+	//   max_slope     degrees
+	//   sink          voxels into the ground (times its size)
+	//   follow_slope  0 (upright) .. 1 (square to the ground)
+	//   random_turn   bool
+	//   scale_min, scale_max
+	//   spacing       voxels from the other features of its region
+	//   world_types   PackedInt32Array of WorldType (empty: all)
+	// Call before open_world() (every player must give the same ones).
+	void set_features(const Array &p_features);
 	// Selects (or with p_add false deselects) the terrain inside a shape
 	// placed by p_transform: the geometry tool's selection.
 	int select_inside_shape(const Ref<DensityShape> &p_shape, const Transform3D &p_transform, bool p_add);
@@ -504,15 +521,24 @@ private:
 	uint64_t frame_clock = 0; // slot_clock when this frame's binding began
 	// The first atlas layer holding p_body's p_shape's key p_key, uploading
 	// it if it isn't there or is out of date; -1 if there's no room (what
-	// this frame already uses stays).
-	int grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key);
+	// this frame already uses stays), or (unless p_force) this frame has
+	// uploaded as much as it may (upload_budget).
+	int grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key, bool p_force = false);
+	// Atlas layers a frame may still upload: animated creatures' new frames
+	// beyond it wait a frame or two (each shows the frames it has), so many
+	// at once don't stall the frame.
+	int upload_budget = 0;
+	static constexpr int UPLOAD_LAYERS = 4 * DensityShape::MAX_SIZE;
 	// Milliseconds a frame may spend loading chunks around the camera.
 	static constexpr double LOAD_BUDGET_MS = 3.0;
 
 	VoxelWorld world;
 	bool opened = false;
 	Clipmap clipmap;
-	Ref<Texture2DArray> clip_textures[MAX_CLIP_LEVELS];
+	// Every level's texels in one texture: layer l * clip_size + z holds slice z
+	// of level l. (One sampler, not one a level: a phone's GPU may have only 16
+	// texture units, and Godot binds its own textures to the top ones.)
+	Ref<Texture2DArray> clip_texture;
 	Ref<Texture2DArray> brick_texture; // all levels' brick distances (see Clipmap)
 	int64_t upload_bytes = 0;
 	// Time spent uploading texture layers (z slices) a frame, roughly: at

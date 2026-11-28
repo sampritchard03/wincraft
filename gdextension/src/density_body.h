@@ -392,6 +392,11 @@ private:
 	// p_bodies: other bodies count only from above (to stand on): those in
 	// near_bodies, gathered once per move_and_slide().
 	double gap(SculptTerrain *p_terrain, const Vector3 &p_center, double p_radius, bool p_bodies, Vector3 &r_normal) const;
+	// How far a sphere (p_center, p_radius) is from body p_body (negative:
+	// that deep in), and the way out. A body's density only tells distances
+	// up to about 8 of its voxels: a sphere wider than that (a fine-voxel
+	// object) is tried as smaller spheres round its inside instead.
+	static double body_gap(DensityBody3D *p_body, const Vector3 &p_center, double p_radius, Vector3 &r_normal);
 	// The spheres it collides with (offset from the feet, radius); the
 	// lowest first. See rebuild_spheres().
 	std::vector<Vector4> samples;

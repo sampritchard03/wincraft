@@ -173,6 +173,8 @@ void VoxelWorld::configure(const IslandSettings &p_settings) {
 	perlin.set_seed((uint64_t)s.seed);
 	perlin_caves.set_seed((uint64_t)s.seed * 0x2545F4914F6CDD1Dull + 7);
 	settings_version++;
+	std::unique_lock<std::shared_mutex> lock(feature_lock);
+	feature_regions.clear(); // (planned from the old settings)
 }
 
 bool VoxelWorld::island_in_cell(const Vector3i &p_cell, Island &r_island) const {
@@ -207,6 +209,16 @@ bool VoxelWorld::island_in_cell(const Vector3i &p_cell, Island &r_island) const 
 float VoxelWorld::generate(int x, int y, int z, int p_octaves, float p_accuracy, int p_spacing, MaterialId *r_material) const {
 	x = wrap_xz(x);
 	z = wrap_xz(z);
+	const float d = generate_ground(x, y, z, p_octaves, p_accuracy, p_spacing, r_material);
+	if (feature_defs.empty() || p_spacing > FEATURE_MAX_SPACING) {
+		return d;
+	}
+	return add_features(x, y, z, d, std::min(p_accuracy, DENSITY_CLAMP * (float)p_spacing), r_material);
+}
+
+float VoxelWorld::generate_ground(int x, int y, int z, int p_octaves, float p_accuracy, int p_spacing, MaterialId *r_material) const {
+	x = wrap_xz(x);
+	z = wrap_xz(z);
 	if (y < y_min() || y >= y_max()) {
 		// Beyond the limits, continue from the edge of the world, so the
 		// field stays a distance there: past the top, open air (whatever
@@ -215,10 +227,10 @@ float VoxelWorld::generate(int x, int y, int z, int p_octaves, float p_accuracy,
 		// would put a sheet of near-surface values right at it, which rays
 		// draw.)
 		if (y >= y_max()) {
-			const float edge = generate(x, y_max() - 1, z, p_octaves, p_accuracy, p_spacing, r_material);
+			const float edge = generate_ground(x, y_max() - 1, z, p_octaves, p_accuracy, p_spacing, r_material);
 			return std::min(edge, 0.5f) - (float)(y - (y_max() - 1));
 		}
-		const float edge = generate(x, y_min(), z, p_octaves, p_accuracy, p_spacing, r_material);
+		const float edge = generate_ground(x, y_min(), z, p_octaves, p_accuracy, p_spacing, r_material);
 		const float beyond = (float)(y_min() - y);
 		return edge > 0.0f ? edge + beyond : edge - beyond;
 	}
@@ -596,8 +608,8 @@ bool VoxelWorld::uniform_chunk(const Vector3i &p_chunk, int8_t &r_density, Mater
 	// chunk's centre is farther than half its diagonal plus the clamp, with
 	// room to spare, from any island, every point is clamped air.
 	const Vector3i centre = p_chunk * CHUNK + Vector3i(CHUNK / 2, CHUNK / 2, CHUNK / 2);
-	const float d = generate(centre.x, centre.y, centre.z, settings.octaves, 1e6f, 1, nullptr);
-	if (d < -(CHUNK * 0.87f + DENSITY_CLAMP + 1.0f + settings.detail)) {
+	const float d = generate_ground(centre.x, centre.y, centre.z, settings.octaves, 1e6f, 1, nullptr);
+	if (d < -(CHUNK * 0.87f + DENSITY_CLAMP + 1.0f + settings.detail) && !features_touch_chunk(p_chunk, DENSITY_CLAMP + 1.0f)) {
 		r_density = -DENSITY_LIMIT;
 		r_material = MAT_STONE;
 		return true;
@@ -699,8 +711,12 @@ const VoxelWorld::ColumnInfo &VoxelWorld::cached_column_info(int p_cx, int p_cz)
 }
 
 int8_t VoxelWorld::terrain_point(int x, int y, int z, float h, float slope, MaterialId *r_material) const {
-	// As generate() for a point of the world (x and z wrapped, y within the
-	// limits) whose column's height is known, quantized.
+	return quantize_density(terrain_value(x, y, z, h, slope, r_material));
+}
+
+float VoxelWorld::terrain_value(int x, int y, int z, float h, float slope, MaterialId *r_material) const {
+	// As generate_ground() for a point of the world (x and z wrapped, y
+	// within the limits) whose column's height is known.
 	const float fy = (float)y;
 	const float top = terrain_top(), floor_y = terrain_bottom() - CAVE_DEPTH;
 	float d;
@@ -713,7 +729,7 @@ int8_t VoxelWorld::terrain_point(int x, int y, int z, float h, float slope, Mate
 	} else {
 		d = generate_terrain_at(x, y, z, h, slope, DENSITY_CLAMP, 1, r_material);
 	}
-	return quantize_density(d);
+	return d;
 }
 
 void VoxelWorld::generate_terrain_chunk(const Vector3i &p_chunk, const ColumnInfo &p_info, Chunk &r_chunk) const {
@@ -724,7 +740,16 @@ void VoxelWorld::generate_terrain_chunk(const Vector3i &p_chunk, const ColumnInf
 	const float clamped = (DENSITY_CLAMP * OVERHANG_LIPSCHITZ + OVERHANG) * std::sqrt(1.0f + p_info.steepest * p_info.steepest) + 1.0f;
 	const float deep = std::max(clamped + 4.0f, settings.caves ? CAVE_DEPTH + 1.0f : 0.0f);
 	const float y0 = (float)(p_chunk.y * CHUNK), y1 = y0 + CHUNK - 1;
-	if (y0 > p_info.high + clamped) {
+	// Features reaching into it: unioned in at each point (as generate()).
+	thread_local std::vector<std::pair<const FeatureInstance *, Vector3>> near;
+	near.clear();
+	if (!feature_defs.empty()) {
+		const Vector3 lo = Vector3(wrap_chunk(p_chunk) * CHUNK) - Vector3(1, 1, 1) * DENSITY_CLAMP;
+		for_each_feature(lo, lo + Vector3(1, 1, 1) * (CHUNK - 1 + 2 * DENSITY_CLAMP), [&](const FeatureInstance &p_instance, const Vector3 &p_shift) {
+			near.emplace_back(&p_instance, p_shift);
+		});
+	}
+	if (y0 > p_info.high + clamped && near.empty()) {
 		r_chunk.uniform_density = -DENSITY_LIMIT; // sky
 		r_chunk.uniform_material = MAT_STONE; // (as store_chunk() makes far air)
 		return;
@@ -744,11 +769,365 @@ void VoxelWorld::generate_terrain_chunk(const Vector3i &p_chunk, const ColumnInf
 		for (int y = 0; y < CHUNK; y++) {
 			for (int x = 0; x < CHUNK; x++, n++) {
 				const size_t c = (size_t)z * CHUNK + x;
-				density[n] = terrain_point(o.x + x, o.y + y, o.z + z, p_info.heights[c], p_info.slopes[c], &materials[n]);
+				float d = terrain_value(o.x + x, o.y + y, o.z + z, p_info.heights[c], p_info.slopes[c], &materials[n]);
+				if (!near.empty() && d < DENSITY_CLAMP) {
+					const Vector3 p((float)(o.x + x), (float)(o.y + y), (float)(o.z + z));
+					for (const auto &[instance, shift] : near) {
+						MaterialId m;
+						const float v = feature_value(*instance, p - shift, &m);
+						if (v > d) {
+							d = v;
+							materials[n] = m;
+						}
+					}
+				}
+				density[n] = quantize_density(d);
 			}
 		}
 	}
 	store_chunk(density, materials, r_chunk);
+}
+
+// --- Features ---------------------------------------------------------------------
+//
+// Each terrain region (FEATURE_REGION voxels square) or island (its cell)
+// gets its features planned once, from the seed: every feature's tries pick
+// spots, find the generated ground there (features don't grow on features),
+// and keep the ones the feature grows on. generate() then unions the
+// planned shapes into the ground wherever they reach.
+
+namespace {
+
+inline int wrap_index(int p_value, int p_count) {
+	const int m = p_value % p_count;
+	return m < 0 ? m + p_count : m;
+}
+
+inline bool boxes_meet(const Vector3 &a_lo, const Vector3 &a_hi, const Vector3 &b_lo, const Vector3 &b_hi) {
+	return a_lo.x <= b_hi.x && a_hi.x >= b_lo.x && a_lo.y <= b_hi.y && a_hi.y >= b_lo.y && a_lo.z <= b_hi.z && a_hi.z >= b_lo.z;
+}
+
+} // namespace
+
+void VoxelWorld::set_features(std::vector<FeatureShape> &&p_shapes, std::vector<FeatureDef> &&p_defs) {
+	std::unique_lock<std::shared_mutex> lock(feature_lock);
+	feature_shapes = std::move(p_shapes);
+	feature_defs = std::move(p_defs);
+	feature_regions.clear();
+	feature_reach = 0.0f;
+	feature_reach_xz = 0.0f;
+	for (const FeatureDef &def : feature_defs) {
+		for (int k : def.shapes) {
+			const FeatureShape &shape = feature_shapes[k];
+			const float reach = (shape.reach + def.sink) * def.scale_max + 1.0f;
+			feature_reach = std::max(feature_reach, reach);
+			// (Leaning with the ground, its height swings sideways.)
+			feature_reach_xz = std::max(feature_reach_xz, def.follow_slope > 0.0f ? reach : shape.reach_xz * def.scale_max + 1.0f);
+		}
+	}
+	settings_version++;
+}
+
+const VoxelWorld::FeatureRegion &VoxelWorld::feature_region(const Vector3i &p_key) const {
+	// Points next to each other ask for the same few regions: a small
+	// per-thread cache in front of the shared map.
+	struct Slot {
+		const VoxelWorld *world = nullptr;
+		uint32_t version = 0;
+		Vector3i key;
+		const FeatureRegion *region = nullptr;
+	};
+	constexpr int SLOTS = 256;
+	thread_local Slot cache[SLOTS];
+	Slot &slot = cache[((uint32_t)p_key.x * 73856093u ^ (uint32_t)p_key.y * 19349663u ^ (uint32_t)p_key.z * 83492791u) & (SLOTS - 1)];
+	if (slot.world == this && slot.version == settings_version && slot.key == p_key) {
+		return *slot.region;
+	}
+	const FeatureRegion *found = nullptr;
+	{
+		std::shared_lock<std::shared_mutex> lock(feature_lock);
+		auto it = feature_regions.find(p_key);
+		if (it != feature_regions.end()) {
+			found = it->second.get();
+		}
+	}
+	if (found == nullptr) {
+		// Planned outside the lock (another thread may plan it too: the
+		// same, as it's all from the seed; the first one kept).
+		std::unique_ptr<FeatureRegion> planned = std::make_unique<FeatureRegion>();
+		plan_features(p_key, *planned);
+		std::unique_lock<std::shared_mutex> lock(feature_lock);
+		std::unique_ptr<FeatureRegion> &entry = feature_regions[p_key];
+		if (entry == nullptr) {
+			entry = std::move(planned);
+		}
+		found = entry.get();
+	}
+	slot.world = this;
+	slot.version = settings_version;
+	slot.key = p_key;
+	slot.region = found;
+	return *found;
+}
+
+void VoxelWorld::plan_features(const Vector3i &p_key, FeatureRegion &r_region) const {
+	const bool terrain = settings.world_type == WORLD_TERRAIN;
+	Island island;
+	if (!terrain && !island_in_cell(p_key, island)) {
+		return;
+	}
+	const float G = (float)FEATURE_REGION;
+	const float area = terrain ? G * G : (float)Math_PI * island.radius * island.radius;
+	std::vector<Vector3> taken; // where this region's features stand
+	for (const FeatureDef &def : feature_defs) {
+		if (!(def.world_types & (1u << settings.world_type)) || def.shapes.empty()) {
+			continue;
+		}
+		uint64_t state = (uint64_t)settings.seed * 0x9E3779B97F4A7C15ull ^ def.id_hash ^ (uint64_t)(uint32_t)p_key.x * 0xD6E8FEB86659FD93ull ^
+				(uint64_t)(uint32_t)p_key.y * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)(uint32_t)p_key.z * 0x165667B19E3779F9ull;
+		auto random = [&state]() { return (float)(mix64(state) >> 40) / (float)(1 << 24); };
+		const float expected = def.per_region * area / (G * G);
+		const int tries = (int)expected + (random() < expected - std::floor(expected) ? 1 : 0);
+		for (int t = 0; t < tries; t++) {
+			// (All drawn every time, so one spot failing leaves the rest where they were.)
+			const float u = random(), v = random(), turn = random(), size = random(), pick = random();
+			float x, z, top, bottom;
+			if (terrain) {
+				x = (p_key.x + u) * G;
+				z = (p_key.z + v) * G;
+				top = terrain_top();
+				bottom = terrain_bottom();
+			} else {
+				const float r = island.radius * 0.95f * std::sqrt(u), a = v * (float)Math_TAU;
+				x = island.centre.x + r * std::cos(a);
+				z = island.centre.z + r * std::sin(a);
+				top = island.centre.y + settings.detail + 3.0f;
+				bottom = island.centre.y - island.depth;
+			}
+			Vector3 ground, normal;
+			MaterialId material;
+			if (!find_ground(x, z, top, bottom, ground, normal, material) || normal.y < def.min_up) {
+				continue;
+			}
+			if (!def.grows_on.empty() && std::find(def.grows_on.begin(), def.grows_on.end(), material) == def.grows_on.end()) {
+				continue;
+			}
+			if (terrain && ground.y < settings.sea_level + 1.0f) {
+				continue; // (under the sea)
+			}
+			bool crowded = false;
+			for (const Vector3 &other : taken) {
+				crowded = crowded || other.distance_to(ground) < def.spacing;
+			}
+			if (crowded) {
+				continue;
+			}
+			FeatureInstance instance;
+			instance.shape = def.shapes[std::min((int)(pick * def.shapes.size()), (int)def.shapes.size() - 1)];
+			const FeatureShape &shape = feature_shapes[instance.shape];
+			instance.scale = def.scale_min + (def.scale_max - def.scale_min) * size;
+			const Vector3 up = Vector3(0, 1, 0).slerp(normal, std::clamp(def.follow_slope, 0.0f, 1.0f)).normalized();
+			Basis basis = up.is_equal_approx(Vector3(0, 1, 0)) ? Basis() : Basis(Quaternion(Vector3(0, 1, 0), up));
+			if (def.random_turn) {
+				basis = basis * Basis(Vector3(0, 1, 0), turn * (float)Math_TAU);
+			}
+			basis = basis * Basis::from_scale(Vector3(1, 1, 1) * instance.scale);
+			instance.origin = ground - up * def.sink * instance.scale;
+			instance.to_local = basis.inverse();
+			instance.lo = Vector3(1e30f, 1e30f, 1e30f);
+			instance.hi = -instance.lo;
+			const Vector3 extent = Vector3(shape.size - Vector3i(1, 1, 1)) * shape.voxel_size;
+			for (int k = 0; k < 8; k++) {
+				const Vector3 corner = shape.origin + Vector3(k & 1 ? extent.x : 0.0f, k & 2 ? extent.y : 0.0f, k & 4 ? extent.z : 0.0f);
+				const Vector3 at = instance.origin + basis.xform(corner);
+				instance.lo = instance.lo.min(at);
+				instance.hi = instance.hi.max(at);
+			}
+			r_region.lo = r_region.lo.min(instance.lo);
+			r_region.hi = r_region.hi.max(instance.hi);
+			r_region.instances.push_back(instance);
+			taken.push_back(ground);
+		}
+	}
+}
+
+bool VoxelWorld::find_ground(float p_x, float p_z, float p_top, float p_bottom, Vector3 &r_point, Vector3 &r_normal, MaterialId &r_material) const {
+	const int x = wrap_xz((int)std::floor(p_x)), z = wrap_xz((int)std::floor(p_z));
+	if (settings.world_type == WORLD_TERRAIN) {
+		// The surface is within the overhang noise's reach of the column's height.
+		float h, slope;
+		terrain_height(x, z, h, slope);
+		const float reach = OVERHANG * std::sqrt(1.0f + slope * slope) + 3.0f;
+		p_top = std::min(p_top, h + reach);
+		p_bottom = std::max(p_bottom, h - reach);
+	}
+	auto density = [&](int px, int py, int pz, MaterialId *r_m) {
+		return generate_ground(px, py, pz, settings.octaves, DENSITY_CLAMP, 1, r_m);
+	};
+	int y = (int)std::ceil(p_top);
+	float above = density(x, y, z, nullptr);
+	if (above > 0.0f) {
+		return false; // (buried: no top in range)
+	}
+	while (y > p_bottom) {
+		const int step = std::max((int)(-above * 0.9f), 1);
+		const int below_y = y - step;
+		MaterialId m;
+		const float below = density(x, below_y, z, &m);
+		if (below > 0.0f) {
+			// Solid: back to one voxel steps for the crossing.
+			if (step > 1) {
+				for (int yy = y - 1; yy >= below_y; yy--) {
+					const float d = density(x, yy, z, &m);
+					if (d > 0.0f) {
+						const float upper = density(x, yy + 1, z, nullptr);
+						r_point = Vector3(p_x, (float)yy + d / (d - upper), p_z);
+						y = yy;
+						break;
+					}
+				}
+			} else {
+				r_point = Vector3(p_x, (float)below_y + below / (below - above), p_z);
+				y = below_y;
+			}
+			r_material = m;
+			const Vector3 grad(density(x + 1, y, z, nullptr) - density(x - 1, y, z, nullptr),
+					density(x, y + 1, z, nullptr) - density(x, y - 1, z, nullptr),
+					density(x, y, z + 1, nullptr) - density(x, y, z - 1, nullptr));
+			r_normal = grad.length_squared() > 1e-8f ? -grad.normalized() : Vector3(0, 1, 0);
+			return true;
+		}
+		y = below_y;
+		above = below;
+	}
+	return false;
+}
+
+template <typename F>
+void VoxelWorld::for_each_feature(const Vector3 &p_lo, const Vector3 &p_hi, F p_visit) const {
+	if (feature_defs.empty()) {
+		return;
+	}
+	const bool terrain = settings.world_type == WORLD_TERRAIN;
+	const int G = terrain ? FEATURE_REGION : settings.cell_size;
+	const int n = std::max(settings.world_size / G, 1);
+	const float r = terrain ? feature_reach_xz : feature_reach;
+	const int x0 = floor_div((int)std::floor(p_lo.x - r), G), x1 = floor_div((int)std::floor(p_hi.x + r), G);
+	const int z0 = floor_div((int)std::floor(p_lo.z - r), G), z1 = floor_div((int)std::floor(p_hi.z + r), G);
+	const int y0 = terrain ? 0 : floor_div((int)std::floor(p_lo.y - r), G), y1 = terrain ? 0 : floor_div((int)std::floor(p_hi.y + r), G);
+	for (int cz = z0; cz <= z1; cz++) {
+		for (int cy = y0; cy <= y1; cy++) {
+			for (int cx = x0; cx <= x1; cx++) {
+				const Vector3i key(wrap_index(cx, n), cy, wrap_index(cz, n));
+				const FeatureRegion &region = feature_region(key);
+				if (region.instances.empty()) {
+					continue;
+				}
+				const Vector3 shift((float)((cx - key.x) * G), 0.0f, (float)((cz - key.z) * G));
+				const Vector3 lo = p_lo - shift, hi = p_hi - shift;
+				if (!boxes_meet(lo, hi, region.lo, region.hi)) {
+					continue;
+				}
+				for (const FeatureInstance &instance : region.instances) {
+					if (boxes_meet(lo, hi, instance.lo, instance.hi)) {
+						p_visit(instance, shift);
+					}
+				}
+			}
+		}
+	}
+}
+
+float VoxelWorld::feature_value(const FeatureInstance &p_instance, const Vector3 &p, MaterialId *r_material) const {
+	const FeatureShape &shape = feature_shapes[p_instance.shape];
+	const Vector3 g = (p_instance.to_local.xform(p - p_instance.origin) - shape.origin) / shape.voxel_size;
+	const Vector3 last = Vector3(shape.size - Vector3i(1, 1, 1));
+	const Vector3 c = g.clamp(Vector3(), last);
+	const int x0 = std::min((int)c.x, shape.size.x - 2), y0 = std::min((int)c.y, shape.size.y - 2), z0 = std::min((int)c.z, shape.size.z - 2);
+	const float tx = c.x - x0, ty = c.y - y0, tz = c.z - z0;
+	const int sx = shape.size.x, sxy = shape.size.x * shape.size.y;
+	const float *d = shape.density.data() + ((size_t)z0 * shape.size.y + y0) * sx + x0;
+	auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+	const float v = lerp(lerp(lerp(d[0], d[1], tx), lerp(d[sx], d[sx + 1], tx), ty),
+			lerp(lerp(d[sxy], d[sxy + 1], tx), lerp(d[sxy + sx], d[sxy + sx + 1], tx), ty), tz);
+	if (r_material != nullptr) {
+		*r_material = shape.materials[((size_t)std::lround(c.z) * shape.size.y + std::lround(c.y)) * sx + std::lround(c.x)];
+	}
+	const float k = shape.voxel_size * p_instance.scale;
+	const float inside = v * k;
+	const float out = (g - c).length() * k;
+	if (out <= 0.0f) {
+		return inside;
+	}
+	// Outside its grid: no nearer than the grid's edge, nor than the
+	// surface is from that edge point (the solid is all inside the box).
+	return inside > 0.0f ? -out : -std::sqrt(out * out + inside * inside);
+}
+
+float VoxelWorld::add_features(int x, int y, int z, float p_density, float p_accuracy, MaterialId *r_material) const {
+	if (p_density >= p_accuracy) {
+		return p_density; // (solid past what's stored: nothing to add)
+	}
+	// The features near a block of points (16 apart, at the points' spacing)
+	// are found once and kept (per thread): nearly every point's block has
+	// none, and the points around it come next.
+	struct Block {
+		const VoxelWorld *world = nullptr;
+		uint32_t version = 0;
+		Vector3i key;
+		float accuracy = -1.0f;
+		std::vector<std::pair<const FeatureInstance *, Vector3>> near;
+	};
+	constexpr int SLOTS = 64;
+	thread_local Block blocks[SLOTS];
+	const int B = std::max((int)std::ceil(p_accuracy / DENSITY_CLAMP), 1) * 16;
+	const Vector3i key(floor_div(x, B), floor_div(y, B), floor_div(z, B));
+	Block &block = blocks[((uint32_t)key.x * 73856093u ^ (uint32_t)key.y * 19349663u ^ (uint32_t)key.z * 83492791u ^ (uint32_t)B * 2654435761u) & (SLOTS - 1)];
+	if (block.world != this || block.version != settings_version || block.key != key || block.accuracy != p_accuracy) {
+		block.world = this;
+		block.version = settings_version;
+		block.key = key;
+		block.accuracy = p_accuracy;
+		block.near.clear();
+		const Vector3 lo = Vector3(key * B) - Vector3(1, 1, 1) * p_accuracy;
+		for_each_feature(lo, lo + Vector3(1, 1, 1) * (B + 2.0f * p_accuracy), [&](const FeatureInstance &p_instance, const Vector3 &p_shift) {
+			block.near.emplace_back(&p_instance, p_shift);
+		});
+	}
+	if (block.near.empty()) {
+		return p_density;
+	}
+	const Vector3 p((float)x, (float)y, (float)z);
+	float best = p_density;
+	MaterialId material = MAT_STONE;
+	bool won = false;
+	for (const auto &[instance, shift] : block.near) {
+		const Vector3 q = p - shift;
+		if (q.x < instance->lo.x - p_accuracy || q.x > instance->hi.x + p_accuracy || q.y < instance->lo.y - p_accuracy ||
+				q.y > instance->hi.y + p_accuracy || q.z < instance->lo.z - p_accuracy || q.z > instance->hi.z + p_accuracy) {
+			continue;
+		}
+		MaterialId m;
+		const float v = feature_value(*instance, q, &m);
+		if (v > best) {
+			best = v;
+			material = m;
+			won = true;
+		}
+	}
+	if (won && r_material != nullptr) {
+		*r_material = material;
+	}
+	return best;
+}
+
+bool VoxelWorld::features_touch_chunk(const Vector3i &p_chunk, float p_margin) const {
+	const Vector3 lo = Vector3(p_chunk * CHUNK) - Vector3(1, 1, 1) * p_margin;
+	bool touched = false;
+	for_each_feature(lo, lo + Vector3(1, 1, 1) * (CHUNK - 1 + 2.0f * p_margin), [&](const FeatureInstance &, const Vector3 &) {
+		touched = true;
+	});
+	return touched;
 }
 
 // --- Loading -------------------------------------------------------------------

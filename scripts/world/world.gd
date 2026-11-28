@@ -53,13 +53,17 @@ var notice_until := 0
 ## density field (DensityCharacter3D, no collision meshes), its feet at its
 ## origin. Balls and frogs bounce off it; it can stand on them.
 var player: DensityCharacter3D
-## Balls thrown with F (bouncy_balls.gd), saved with the world.
-const BouncyBalls := preload("res://scripts/objects/physics_objects.gd")
-var balls: BouncyBalls
+## Physics objects (physics_objects.gd): balls thrown with F, and loose
+## pieces (P, Ctrl+O, cut off), saved with the world.
+const PhysicsObjects := preload("res://scripts/objects/physics_objects.gd")
+var objects: PhysicsObjects
 ## Frogs and chiggins (creatures.gd): saved with the world, and every one
 ## of a kind shares its shape and animations.
 const Creatures := preload("res://scripts/objects/entities/creatures.gd")
 var creatures: Creatures
+## World features (features.gd): trees, mushrooms... given to the terrain's
+## generator before the world opens.
+const Features := preload("res://scripts/features/features.gd")
 ## The object editor (M on a body: sculpt it, animate its pose keys; object_editor.gd).
 const ObjectEditor := preload("res://scripts/editor/object_editor.gd")
 var editor: ObjectEditor
@@ -69,6 +73,10 @@ var network: Network
 ## VR (vr.gd): a headset, if one is running (Meta Quest through OpenXR).
 const VR := preload("res://scripts/vr/vr.gd")
 var vr: VR
+## Touch screen controls (touch_controls.gd): a phone or tablet without a
+## headset (or --touch on the command line, to try them with the mouse).
+const TouchControls := preload("res://scripts/ui/touch_controls.gd")
+var touch: TouchControls
 ## The HUD (hud.gd): the bar of tool / material / brush slots, the status
 ## panel, the help list (H) and the tool wheel (hold Tab), all skinned from
 ## res://assets/ui/.
@@ -196,6 +204,11 @@ enum Gizmo { MOVE, ROTATE, SCALE }
 const GIZMO_NAMES := ["Move", "Rotate", "Scale"]
 var gizmo_mode := Gizmo.MOVE
 var floating: DensityBody3D = null
+## Transform on an object or creature (clicked with Transform, no selection
+## needed): the gizmo moves and turns it (held still while dragged). One undo
+## step per drag: {"moved": body, "before", "after"} (transforms).
+var gizmo_body: DensityBody3D = null
+var gizmo_body_frozen := false  # its freeze before the drag
 var gizmo_handles: Array[MeshInstance3D] = []  # x, y, z
 var gizmo_axis := -1  # the handle being dragged (3: free), -1 none
 var gizmo_hover := -1
@@ -400,6 +413,7 @@ func _ready() -> void:
 	network.world = self
 	add_child(network)
 	network.configure_from_args()
+	Features.register(terrain)  # (part of the world's generation: before it opens)
 	if network.is_joining() and await _join():
 		pass  # the host's world is open, and we stand next to the host
 	else:
@@ -409,12 +423,12 @@ func _ready() -> void:
 	pitch = camera.rotation.x
 	terrain.gravity = gravity  # what the physics bodies fall with
 	_make_player()
-	balls = BouncyBalls.new(terrain)
-	camera.get_parent().add_child(balls)
+	objects = PhysicsObjects.new(terrain)
+	camera.get_parent().add_child(objects)
 	creatures = Creatures.new(self)
 	add_child(creatures)
 	if not terrain.save_path.is_empty():
-		balls.load_from(_objects_path())
+		objects.load_from(_objects_path())
 		var saved := ConfigFile.new()
 		if saved.load(_objects_path()) == OK:
 			creatures.load_from(saved)
@@ -486,6 +500,12 @@ func _finish_ready(p_start: int) -> void:
 	vr.world = self
 	add_child(vr)
 	vr.start()
+	if not vr.active and TouchControls.wanted():
+		assume_captured = true  # no mouse to capture: the on-screen buttons sculpt
+		touch = TouchControls.new(self)
+		hud.add_child(touch)
+		hud.set_touch_mode(true)
+		_fit_screen()
 	if network.mode == Network.Mode.HOST:
 		network.start_host()
 	network.world_ready()
@@ -604,10 +624,23 @@ func _notification(what: int) -> void:
 	if what == NOTIFICATION_WM_CLOSE_REQUEST:
 		_save_player()
 		_save_objects()
+	elif what == NOTIFICATION_APPLICATION_PAUSED and terrain != null and terrain.is_world_open():
+		# A phone: the app may be killed in the background without a close request.
+		_save_player()
+		_save_objects()
+		terrain.save_world()
+		if touch != null:
+			touch.release_all()
+	elif what == NOTIFICATION_WM_GO_BACK_REQUEST:
+		# Android's back: closes what's open (application/config/quit_on_go_back is off), else quits.
+		if touch == null or not touch.go_back():
+			_save_player()
+			_save_objects()
+			get_tree().quit()
 
 func _save_objects() -> void:
 	if not terrain.save_path.is_empty():
-		balls.save(_objects_path(), creatures.to_save())
+		objects.save(_objects_path(), creatures.to_save())
 
 func _sync_prepass_camera() -> void:
 	if not use_prepass:
@@ -615,11 +648,23 @@ func _sync_prepass_camera() -> void:
 	prepass_camera.global_transform = camera.global_transform
 	prepass_camera.fov = camera.fov
 
-## Scales the low-resolution view up as far as it fits, centred, and fits
-## the HUD to the window; the color panel (bottom left, above the HUD's
-## bar) shrinks if it wouldn't fit.
+## Scales the low-resolution view up to fill the window, and fits the HUD
+## to the window; the color panel (bottom left, above the HUD's bar) shrinks
+## if it wouldn't fit. The view keeps its height in pixels (world.tscn's)
+## and is as wide as the window's shape needs (a 16:10 tablet, a 20:9
+## phone), so it fills the screen without bars or stretched pixels.
+var _view_height := 0
 func _fit_screen() -> void:
 	var window := get_viewport().get_visible_rect().size
+	var sub := camera.get_viewport() as SubViewport
+	if _view_height == 0:
+		_view_height = sub.size.y
+	if window.y > 0.0 and (vr == null or not vr.active):
+		var width := maxi(roundi(_view_height * window.x / window.y), 1)
+		if sub.size.x != width:
+			sub.size = Vector2i(width, _view_height)
+			screen.size = Vector2(sub.size)
+			prepass_viewport.size = sub.size / 2
 	var view := Vector2(screen.size)
 	var fit := minf(window.x / view.x, window.y / view.y)
 	screen.scale = Vector2(fit, fit)
@@ -638,21 +683,16 @@ func _fit_screen() -> void:
 ## Mouse look. The camera's rotation is rebuilt from these angles each time, so
 ## pitch always tilts around the camera's own right axis whichever way you face.
 func _input(event: InputEvent) -> void:
+	if touch != null and event is InputEventMouse and not touch.sending:
+		return  # touch screen: fingers act through touch_controls.gd (a tap's emulated mouse is the GUI's)
 	if editor != null and editor.handle_input(event):
 		get_viewport().set_input_as_handled()
 		return
 	if hud.radial.visible and _radial_input(event):
 		get_viewport().set_input_as_handled()
 		return
-	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and twisting:
-		_twist_input(event.relative, event.shift_pressed)
-	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED and gun_body != null \
-			and Input.is_physical_key_pressed(KEY_TAB):
-		_turn_gun_body(event.relative)
-	elif event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
-		yaw -= event.relative.x * mouse_sensitivity
-		pitch = clampf(pitch - event.relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
-		camera.rotation = Vector3(pitch, yaw, 0.0)
+	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		look_input(event.relative, event.shift_pressed, Input.is_physical_key_pressed(KEY_TAB))
 	elif event is InputEventMouseButton and event.pressed:
 		if not _captured():
 			if hud.has_point(event.position):
@@ -691,8 +731,8 @@ func _input(event: InputEvent) -> void:
 			_geometry_click(event.button_index == MOUSE_BUTTON_LEFT)
 		elif tool == Tool.SNAKE_HOOK and event.button_index == MOUSE_BUTTON_LEFT and event.shift_pressed and snake_last != null:
 			_snake_line()
-		elif tool == Tool.TRANSFORM and event.button_index == MOUSE_BUTTON_LEFT and floating != null:
-			_gizmo_press()
+		elif tool == Tool.TRANSFORM and event.button_index == MOUSE_BUTTON_LEFT:
+			_transform_press()
 		elif event.button_index == MOUSE_BUTTON_MIDDLE:
 			var picked := _material_under_crosshair()
 			if picked != -1:
@@ -793,7 +833,7 @@ func _input(event: InputEvent) -> void:
 			KEY_F:
 				# Made of the selected block, or a random colour when "Color" is.
 				var ball_material := block if block < material_names.size() else -1
-				balls.throw(camera.global_position, -camera.global_basis.z, player.velocity, ball_material)
+				objects.throw(camera.global_position, -camera.global_basis.z, player.velocity, ball_material)
 			KEY_G:
 				if event.shift_pressed:
 					creature = (creature + 1) % CREATURE_NAMES.size()
@@ -804,9 +844,12 @@ func _input(event: InputEvent) -> void:
 				# Removes the ball or frog under the crosshair.
 				var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
 				if not aimed.is_empty():
-					balls.remove(aimed.body)
+					_delete_bodies([aimed.body])  # (Ctrl+Z brings it back)
 			KEY_BRACKETLEFT: block = posmod(block - 1, material_names.size() + 1)
 			KEY_BRACKETRIGHT: block = posmod(block + 1, material_names.size() + 1)
+			KEY_E when event.shift_pressed:
+				if not dragging:
+					mirror_half_from_view()
 			KEY_E:
 				if not dragging:
 					symmetry_on = true
@@ -838,7 +881,7 @@ func _input(event: InputEvent) -> void:
 				_set_player_height(player_height + 1)
 			KEY_L:
 				_set_player_height(player_height - 1)
-			KEY_ALT, KEY_CTRL, KEY_META:
+			KEY_ALT, KEY_CTRL, KEY_META, KEY_SHIFT:
 				pass  # (modifiers: held with the mouse)
 			_:
 				if not _is_action(event):
@@ -846,12 +889,44 @@ func _input(event: InputEvent) -> void:
 						OS.get_keycode_string(event.physical_keycode), OS.get_keycode_string(event.keycode),
 						OS.get_keycode_string(event.key_label), event.unicode])
 
+## Mouse movement (or a touch screen's drag, in mouse pixels): turns what's
+## being rotated / scaled, the physics gun's body while p_turn (Tab, or the
+## touch screen's Turn button), or else the view. p_roll: Shift (rotating
+## rolls about the view).
+func look_input(p_relative: Vector2, p_roll: bool, p_turn: bool) -> void:
+	if twisting:
+		_twist_input(p_relative, p_roll)
+	elif gun_body != null and p_turn:
+		_turn_gun_body(p_relative)
+	else:
+		yaw -= p_relative.x * mouse_sensitivity
+		pitch = clampf(pitch - p_relative.y * mouse_sensitivity, deg_to_rad(-89.0), deg_to_rad(89.0))
+		camera.rotation = Vector3(pitch, yaw, 0.0)
+
+## Mouse buttons and modifier keys as the tools see them: the mouse and
+## keyboard's, or on a touch screen the on-screen buttons' (touch_controls.gd).
+func _button(p_button: MouseButton) -> bool:
+	if touch != null:
+		return touch.is_held(p_button)
+	return Input.is_mouse_button_pressed(p_button)
+
+func _shift_held() -> bool:
+	return Input.is_key_pressed(KEY_SHIFT) or (touch != null and touch.shift)
+
+func _alt_held() -> bool:
+	return Input.is_key_pressed(KEY_ALT) or (touch != null and touch.alt)
+
+## Whether opening a panel frees the mouse (not in a headset or on a touch
+## screen, where there's no captured mouse to free).
+func _frees_mouse() -> bool:
+	return (vr == null or not vr.active) and touch == null
+
 ## The color picker (C, or the HUD's material slot): on or off, freeing
 ## the mouse for it on a screen.
 func toggle_color_panel() -> void:
 	color_panel.visible = not color_panel.visible
 	_fit_screen()
-	if vr == null or not vr.active:
+	if _frees_mouse():
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if color_panel.visible else Input.MOUSE_MODE_CAPTURED
 	get_viewport().gui_release_focus()
 
@@ -907,9 +982,12 @@ func _set_tool(p_tool: Tool) -> void:
 	_end_drag()
 	if tool == Tool.TRANSFORM and p_tool != Tool.TRANSFORM:
 		_apply_floating()
+		_drop_gizmo_body()
 	tool = p_tool
 	if tool == Tool.TRANSFORM:
 		_lift_selection()
+		if floating == null and not selected_bodies.is_empty() and is_instance_valid(selected_bodies[0]):
+			_set_gizmo_body(selected_bodies[0])  # (a selected object: that one)
 
 ## A key with several tools: the first, or the next if one of them is on.
 func _cycle_tool(p_tools: Array) -> void:
@@ -946,7 +1024,13 @@ func _attach_symmetry() -> void:
 	var hit = terrain.raycast(from, dir, reach)
 	if hit != null and from.distance_to(hit) < from.distance_to(aimed.position):
 		return
-	var body: DensityBody3D = aimed.body
+	attach_symmetry_to(aimed.body)
+
+## Fixes the symmetry axis to p_body (see symmetry_body): along where a
+## creature faces, or the view.
+func attach_symmetry_to(p_body: DensityBody3D) -> void:
+	var body := p_body
+	symmetry_on = true
 	var forward := -camera.global_basis.z
 	var up := camera.global_basis.y
 	if body.has_method("_forward"):
@@ -961,6 +1045,37 @@ func _attach_symmetry() -> void:
 	symmetry_local = Transform3D(Basis(inverse.basis * forward, inverse.basis * side, Vector3.ZERO), body.to_local(body.get_global_center_of_mass()))
 	_follow_symmetry_body()
 	_notify("Symmetry on the %s (E elsewhere: by the view again, Q: off)" % (body.scene_file_path.get_file().get_basename() if body.scene_file_path != "" else "object"))
+
+## Shift+E: the half of the symmetry's object the camera is on, mirrored
+## onto the other half (once; Ctrl+Z undoes it).
+func mirror_half_from_view() -> void:
+	if not symmetry_on or not symmetry_attached or symmetry != Symmetry.MIRROR:
+		_notify("Shift+E mirrors an object: put mirror symmetry on it first (E aiming at it)")
+		return
+	_follow_symmetry_body()
+	var right := (camera.global_position - axis_origin).dot(mirror_normal) >= 0.0
+	mirror_half(symmetry_body, right)
+
+## Mirrors p_body across its attached mirror plane, keeping the side the
+## plane's normal faces (p_keep_positive; for a creature, its right) or the
+## other, as one undo step. Returns whether it did.
+func mirror_half(p_body: DensityBody3D, p_keep_positive: bool) -> bool:
+	if not is_instance_valid(p_body) or p_body.shape == null or p_body != symmetry_body or not symmetry_attached:
+		return false
+	network.use(p_body)
+	var normal := symmetry_local.basis.y * (1.0 if p_keep_positive else -1.0)
+	var before: DensityShape = p_body.shape
+	var after: DensityShape = before.mirrored(symmetry_local.origin, normal)
+	p_body.shape = after
+	p_body.sleeping = false
+	_push_history({"body": p_body, "before": before, "after": after,
+			"part_shapes": [], "part_transform": p_body.global_transform, "parts": []})
+	var kept := "right" if p_keep_positive else "left"
+	if p_body.has_method("_forward"):
+		_notify("Mirrored: its %s side onto its %s (Ctrl+Z undoes)" % [kept, "left" if p_keep_positive else "right"])
+	else:
+		_notify("Mirrored: the side you're on onto the other (Ctrl+Z undoes)")
+	return true
 
 ## The axis of an attached symmetry where its object is now.
 func _follow_symmetry_body() -> void:
@@ -1144,9 +1259,9 @@ func take_step_times() -> String:
 
 func _process(delta: float) -> void:
 	_follow_symmetry_body()
-	if Input.is_action_pressed("ui_cancel"):
+	if Input.is_action_pressed("ui_cancel") and touch == null:
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+	if not _button(MOUSE_BUTTON_LEFT):
 		capture_click = false
 
 	# The camera rides on top of the player (moved in _physics_process).
@@ -1200,7 +1315,7 @@ func _physics_process(delta: float) -> void:
 	_wrap_player()
 	# Online, every object stays loaded (each is simulated by one player's
 	# computer; see network.gd); only ones that fell out of the world go.
-	balls.stream(player.global_position, not network.is_online())
+	objects.stream(player.global_position, not network.is_online())
 
 	if move_mode == MoveMode.WALK:
 		_walk(delta)
@@ -1209,7 +1324,7 @@ func _physics_process(delta: float) -> void:
 ## The player's move this physics frame, walking (or hoisting).
 func _walk(delta: float) -> void:
 	var size_scale := player_height / BASE_PLAYER_HEIGHT
-	if hoisting and not Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
+	if hoisting and not _button(MOUSE_BUTTON_RIGHT):
 		hoisting = false  # let go: falls from there, keeping the speed it had
 	if hoisting:
 		# Drawn to hoist_distance back along the line of sight to the hold
@@ -1405,8 +1520,8 @@ func _captured() -> bool:
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
 	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting
-	var held := sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
-	var pressing := held or (sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT))
+	var held := sculpting and _button(MOUSE_BUTTON_LEFT)
+	var pressing := held or (sculpting and _button(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX]:
 		pressing = false  # these don't sculpt
 	if pressing and not stroking:
@@ -1462,14 +1577,14 @@ func _sculpt(delta: float) -> void:
 	if tool in NON_SCULPT_TOOLS:
 		pass  # not a sculpting tool
 	elif hit != null and sculpting and not dragging and not twisting:
-		if Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
+		if _button(MOUSE_BUTTON_RIGHT):
 			mode = TOOL_MODES[tool] if tool in INVERTIBLE_TOOLS else SculptTerrain.BRUSH_SUBTRACT
 			inverted = tool in INVERTIBLE_TOOLS
 		elif held and TOOL_MODES[tool] >= 0:
 			mode = TOOL_MODES[tool]
 		# Alt: the opposite, with any brush (Draw carves, Carve draws, Smooth
 		# sharpens, Flatten pushes away from its plane, Layer lowers...).
-		if mode >= 0 and Input.is_key_pressed(KEY_ALT):
+		if mode >= 0 and _alt_held():
 			if mode == SculptTerrain.BRUSH_ADD:
 				mode = SculptTerrain.BRUSH_SUBTRACT
 			elif mode == SculptTerrain.BRUSH_SUBTRACT:
@@ -1544,7 +1659,7 @@ func _pick_flatten_plane(p_hit: Vector3, p_body: DensityBody3D) -> void:
 	var here := _surface_normal(p_hit, p_body)
 	match flatten_plane:
 		FlattenPlane.FACE:
-			if not flatten_locked or (not Input.is_key_pressed(KEY_SHIFT) and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
+			if not flatten_locked or (not _shift_held() and here.angle_to(flatten_normal) > deg_to_rad(FLATTEN_NEW_FACE)):
 				flatten_locked = true
 				flatten_point = p_hit
 				flatten_normal = here
@@ -1610,7 +1725,7 @@ func _brush_line(p_from: Vector3) -> void:
 		return
 	capture_click = true  # (the click isn't a stroke of its own too)
 	var mode: int = TOOL_MODES[tool]
-	var inverted := Input.is_key_pressed(KEY_ALT)
+	var inverted := _alt_held()
 	if inverted and mode == SculptTerrain.BRUSH_ADD:
 		mode = SculptTerrain.BRUSH_SUBTRACT
 		inverted = false
@@ -1710,29 +1825,86 @@ func _ease_brush(delta: float) -> void:
 ## Removes every object in the world: balls, creatures, cut-off pieces,
 ## imports, near or put away far off (not the floating piece, which is still
 ## part of the ground). Other players see them go too (network.gd notices).
-## There's no undo for it. Returns how many went.
+## Ctrl+Z brings them all back. Returns how many went.
 func delete_all_objects() -> int:
-	var count := balls.unloaded.size()
-	balls.unloaded.clear()
-	if editor != null and editor.active:
-		editor.close()
-	gun_body = null
-	_clear_body_selection()
-	for parent in [balls, camera.get_parent()]:
+	var count := objects.unloaded.size()
+	var unloaded := objects.unloaded.duplicate()
+	objects.unloaded.clear()
+	var list: Array = []
+	for parent in [objects, camera.get_parent()]:
 		for b in parent.get_children():
 			if b is DensityBody3D and not b is DensityCharacter3D and b.pickable and b != floating \
 					and not b.has_meta("net_avatar") and not b.is_queued_for_deletion():
-				if b == held_body:
-					_release_held_body()
-				balls.remove(b)
-				count += 1
+				list.append(b)
+	count += list.size()
+	_delete_bodies(list, unloaded)
 	return count
+
+## Takes bodies out of the world as one undo step (X, Delete all objects):
+## kept out of the tree, not freed, so Ctrl+Z puts them back as they were
+## (p_unloaded: put-away objects' entries that went with them). They're
+## freed once the step falls out of the history.
+func _delete_bodies(p_bodies: Array, p_unloaded: Array = []) -> void:
+	var entry := {"deleted": [], "unloaded": p_unloaded}
+	for b in p_bodies:
+		if not is_instance_valid(b) or not b.is_inside_tree() or b.is_queued_for_deletion():
+			continue
+		_take_out(b)
+		entry.deleted.append({"body": b, "parent": b.get_parent()})
+	for r in entry.deleted:
+		r.parent.remove_child(r.body)
+	if not entry.deleted.is_empty() or not p_unloaded.is_empty():
+		_push_history(entry)
+
+## Lets go of a body about to leave the world (editor, physics gun, brush,
+## selection, transform).
+func _take_out(p_body: DensityBody3D) -> void:
+	if editor != null and editor.active and editor.body == p_body:
+		editor.close()
+	if p_body == held_body:
+		_release_held_body()
+	if p_body == gun_body:
+		gun_body = null
+	if p_body == gizmo_body:
+		_drop_gizmo_body()
+	if p_body in selected_bodies:
+		_select_body(p_body, false)
+	p_body.highlighted = false
+	objects.bodies.erase(p_body)
+
+func _undelete(p_entry: Dictionary) -> void:
+	for r in p_entry.deleted:
+		if not is_instance_valid(r.body) or r.body.is_inside_tree():
+			continue
+		var b: DensityBody3D = r.body
+		var parent: Node = r.parent if is_instance_valid(r.parent) else objects
+		# (A new object to the other players: network.gd gives it a new id.)
+		for meta in ["net_id", "net_owner", "net_sim", "net_shape"]:
+			b.remove_meta(meta)
+		parent.add_child(b)
+		if parent == objects:
+			objects.bodies.append(b)
+		b.sleeping = false
+	objects.unloaded.append_array(p_entry.unloaded)
+
+## Frees what an undo step kept that nothing can bring back now (out of
+## the world, and no step left in the history deleted it).
+func _forget_entry(p_entry: Dictionary) -> void:
+	for r in p_entry.get("deleted", []):
+		if not is_instance_valid(r.body) or r.body.is_inside_tree():
+			continue
+		var held := false
+		for e in history:
+			for other in e.get("deleted", []):
+				held = held or other.body == r.body
+		if not held:
+			r.body.free()
 
 func toggle_brush_panel() -> void:
 	brush_panel.visible = not brush_panel.visible
 	if brush_panel.visible:
 		brush_panel.refresh()
-	if vr == null or not vr.active:
+	if _frees_mouse():
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE if brush_panel.visible else Input.MOUSE_MODE_CAPTURED
 	get_viewport().gui_release_focus()
 
@@ -1939,7 +2111,7 @@ func _spawn_parts(p_entry: Dictionary) -> void:
 	var parts: Array = []
 	var from: DensityBody3D = p_entry.body
 	for part_shape in p_entry.part_shapes:
-		var part := balls.add_shape_body(part_shape, Vector3.ZERO)
+		var part := objects.add_shape_body(part_shape, Vector3.ZERO)
 		part.global_transform = p_entry.part_transform
 		if is_instance_valid(from):
 			part.linear_velocity = from.linear_velocity
@@ -1948,9 +2120,12 @@ func _spawn_parts(p_entry: Dictionary) -> void:
 
 func _push_history(p_entry: Dictionary) -> void:
 	history.append(p_entry)
+	var dropped: Array = future.duplicate()
 	future.clear()
 	if history.size() > MAX_HISTORY:
-		history.pop_front()
+		dropped.append(history.pop_front())
+	for e in dropped:
+		_forget_entry(e)
 
 ## Terrain strokes and selection changes since last time join the history.
 ## A selection change that came with a terrain stroke (placing a piece,
@@ -1965,7 +2140,7 @@ func _record_history(p_force := false) -> void:
 	var serial: int = terrain.get_selection_serial()
 	if serial == sel_serial or floating != null:
 		return
-	if not p_force and (Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)):
+	if not p_force and (_button(MOUSE_BUTTON_LEFT) or _button(MOUSE_BUTTON_RIGHT)):
 		return
 	var state: Array = terrain.get_selection_state()
 	if history.size() > before_count:
@@ -2016,8 +2191,14 @@ func _undo() -> void:
 		entry.body.sleeping = false
 		for part in entry.parts:
 			if is_instance_valid(part):
-				balls.remove(part)
+				objects.remove(part)
 		entry.parts = []
+	elif entry.has("deleted"):
+		_undelete(entry)
+	elif entry.has("moved"):
+		if is_instance_valid(entry.moved):
+			entry.moved.global_transform = entry.before
+			entry.moved.sleeping = false
 	if entry.has("sel_before"):
 		_set_selection(entry.sel_before)
 	future.append(entry)
@@ -2039,6 +2220,20 @@ func _redo() -> void:
 		entry.body.shape = entry.after
 		entry.body.sleeping = false
 		_spawn_parts(entry)
+	elif entry.has("deleted"):
+		var gone: Array = []
+		for r in entry.deleted:
+			if is_instance_valid(r.body) and r.body.is_inside_tree():
+				_take_out(r.body)
+				gone.append(r.body)
+		for b in gone:
+			b.get_parent().remove_child(b)
+		for e in entry.unloaded:
+			objects.unloaded.erase(e)
+	elif entry.has("moved"):
+		if is_instance_valid(entry.moved):
+			entry.moved.global_transform = entry.after
+			entry.moved.sleeping = false
 	if entry.has("sel_after"):
 		_set_selection(entry.sel_after)
 	history.append(entry)
@@ -2070,8 +2265,8 @@ func _cancel_lift() -> void:
 ## where you click, or (right button) just what's coloured like it, within
 ## brush_strength / 32 (an RGB distance: raise the strength to take more).
 func _select(p_hit, p_sculpting: bool) -> void:
-	var left := p_sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
-	var right := p_sculpting and Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
+	var left := p_sculpting and _button(MOUSE_BUTTON_LEFT)
+	var right := p_sculpting and _button(MOUSE_BUTTON_RIGHT)
 	if not (left or right):
 		fill_clicked = false
 	if not (left or right):
@@ -2155,7 +2350,7 @@ func _bodies_to_terrain() -> void:
 		network.use(body)
 		terrain.stamp_shape(body.shape, _snapped_transform(body), -1, true, body.pose)
 		body.highlighted = false
-		balls.remove(body)
+		objects.remove(body)
 	terrain.end_stroke()
 	selected_bodies.clear()
 
@@ -2195,7 +2390,7 @@ func _selection_to_body() -> void:
 	var shape: DensityShape = terrain.selection_to_shape(true)
 	terrain.clear_selection()
 	if shape != null:
-		balls.add_shape_body(shape, terrain.get_selection_center())
+		objects.add_shape_body(shape, terrain.get_selection_center())
 
 ## The physics gun (tool 9): the held body is pulled towards the point
 ## gun_distance in front of the camera (the wheel moves it), spinning down;
@@ -2203,7 +2398,7 @@ func _selection_to_body() -> void:
 func _update_physics_gun(p_delta: float) -> void:
 	if gun_body == null:
 		return
-	if not is_instance_valid(gun_body) or tool != Tool.PHYSICS_GUN or not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+	if not is_instance_valid(gun_body) or tool != Tool.PHYSICS_GUN or not _button(MOUSE_BUTTON_LEFT):
 		gun_body = null
 		return
 	network.use(gun_body)  # (multiplayer: stays with us while held)
@@ -2226,8 +2421,13 @@ func _update_physics_gun(p_delta: float) -> void:
 		else:
 			gun_body.angular_velocity *= 0.85
 
+## Where Ctrl+P and Ctrl+O start: handmade features' shapes
+## (handmade_feature.gd) are kept there.
+const FEATURE_SHAPES_DIR := "res://assets/features/"
+
 ## Ctrl+P: saves the selection (shape, colours and materials) as a
-## DensityShape file, which a body's `shape` can use (a frog's, say).
+## DensityShape file, which a body's `shape` can use (a frog's, say), or a
+## handmade feature (scripts/features/handmade/).
 func _export_selection() -> void:
 	var shape: DensityShape = null
 	if not selected_bodies.is_empty() and is_instance_valid(selected_bodies[0]):
@@ -2248,7 +2448,7 @@ func _import_shape() -> void:
 		if shape == null:
 			push_error("%s isn't a density shape" % path)
 			return
-		balls.add_shape_body(shape.duplicate_shape(), camera.global_position - camera.global_basis.z * 30.0))
+		objects.add_shape_body(shape.duplicate_shape(), camera.global_position - camera.global_basis.z * 30.0))
 
 func _open_file_dialog(p_mode: FileDialog.FileMode, p_chosen: Callable) -> void:
 	if file_dialog != null:
@@ -2257,7 +2457,7 @@ func _open_file_dialog(p_mode: FileDialog.FileMode, p_chosen: Callable) -> void:
 	file_dialog.file_mode = p_mode
 	file_dialog.access = FileDialog.ACCESS_FILESYSTEM
 	file_dialog.filters = PackedStringArray(["*.res, *.tres ; Density shapes"])
-	file_dialog.current_dir = ProjectSettings.globalize_path("res://")
+	file_dialog.current_dir = ProjectSettings.globalize_path(FEATURE_SHAPES_DIR)
 	file_dialog.use_native_dialog = true
 	file_dialog.file_selected.connect(p_chosen)
 	hud.add_child(file_dialog)
@@ -2275,6 +2475,10 @@ func _set_player_height(p_height: float) -> void:
 	player.step_height = STEP_HEIGHT * size_scale
 
 func _tool_hint() -> String:
+	var hint := _key_hint()
+	return touch.reword(hint) if touch != null else hint
+
+func _key_hint() -> String:
 	if Time.get_ticks_msec() < notice_until:
 		return notice
 	match tool:
@@ -2299,7 +2503,7 @@ func _tool_hint() -> String:
 			if box_dragging:
 				var size := _box_size()
 				return "Box %d x %d x %d: let go to %s (wheel: far corner nearer / farther, RMB: give up)" % [size.x, size.y, size.z,
-					"cut it out" if Input.is_key_pressed(KEY_SHIFT) else "build it (Shift: cut it out)"]
+					"cut it out" if _shift_held() else "build it (Shift: cut it out)"]
 			return "Box: drag from one corner to the other (Shift when you let go: cut it out)"
 		Tool.SELECT_BOX:
 			if box_dragging:
@@ -2326,8 +2530,10 @@ func _tool_hint() -> String:
 		Tool.GRAB:
 			return "Grab: drag the ground (Shift + click: pulls where the last grab ended to here)"
 		Tool.TRANSFORM:
+			if floating == null and _gizmo_target() != null:
+				return "Transform (%s, T switches; objects move and turn): drag a handle, or the object freely; click another to switch" % GIZMO_NAMES[gizmo_mode]
 			if floating == null:
-				return "Transform: select something first"
+				return "Transform: click an object to move it, or select ground first"
 			return "Transform (%s, T switches): drag a handle (or anywhere, freely); Enter places it, Shift+Enter cuts its shape out" % GIZMO_NAMES[gizmo_mode]
 		Tool.GEOMETRY, Tool.SELECT_GEOMETRY:
 			return "%d points (LMB place on the ground / drag, RMB remove, wheel: drag distance %.0f, Backspace clears): Enter %s" % [
@@ -2482,16 +2688,71 @@ func _update_gizmo() -> void:
 			handle.global_transform = Transform3D(_basis_along(axes[i]), origin + axes[i] * length * 0.5)
 	# Dragging.
 	if gizmo_axis >= 0:
-		if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		if not _button(MOUSE_BUTTON_LEFT):
 			gizmo_axis = -1
 			if target == floating and not floating.global_transform.is_equal_approx(gizmo_start):
 				_push_history({"floating": floating, "before": gizmo_start, "after": floating.global_transform})
+			elif target == gizmo_body:
+				_end_body_drag()
 		else:
 			_gizmo_drag()
 
-## What the gizmo moves: the transform tool's floating piece.
+## What the gizmo moves: the transform tool's floating piece, or the
+## object clicked with it.
 func _gizmo_target() -> Node3D:
-	return floating if floating != null and tool == Tool.TRANSFORM else null
+	if tool != Tool.TRANSFORM:
+		return null
+	if floating != null:
+		return floating
+	if gizmo_body != null and (not is_instance_valid(gizmo_body) or not gizmo_body.is_inside_tree()):
+		gizmo_body = null
+	return gizmo_body
+
+## Transform, left click: a handle of what the gizmo has, or an object
+## (which it takes, dragged freely from there), or nothing (lets it go).
+func _transform_press() -> void:
+	if floating != null:
+		_gizmo_press()
+		return
+	if _gizmo_target() != null and _gizmo_pick() >= 0:
+		_gizmo_press()
+		return
+	var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
+	var body: DensityBody3D = aimed.get("body") as DensityBody3D if not aimed.is_empty() else null
+	if body == null or not body.pickable or body is DensityCharacter3D or body.has_meta("net_avatar"):
+		_drop_gizmo_body()
+		return
+	_set_gizmo_body(body)
+	_gizmo_press()
+
+func _set_gizmo_body(p_body: DensityBody3D) -> void:
+	if p_body == gizmo_body:
+		return
+	_drop_gizmo_body()
+	gizmo_body = p_body
+	p_body.highlighted = true
+
+func _drop_gizmo_body() -> void:
+	if gizmo_body == null:
+		return
+	if is_instance_valid(gizmo_body):
+		if gizmo_axis >= 0:
+			_end_body_drag()
+		gizmo_body.highlighted = gizmo_body in selected_bodies
+	gizmo_body = null
+	gizmo_axis = -1
+
+## A drag of gizmo_body ended: let go where it is (one undo step).
+func _end_body_drag() -> void:
+	gizmo_axis = -1
+	if not is_instance_valid(gizmo_body):
+		return
+	gizmo_body.freeze = gizmo_body_frozen
+	gizmo_body.linear_velocity = Vector3.ZERO
+	gizmo_body.angular_velocity = Vector3.ZERO
+	gizmo_body.sleeping = false
+	if not gizmo_body.global_transform.is_equal_approx(gizmo_start):
+		_push_history({"moved": gizmo_body, "before": gizmo_start, "after": gizmo_body.global_transform})
 
 func _gizmo_length() -> float:
 	return maxf(camera.global_position.distance_to(_gizmo_target().global_position) * 0.18, 2.0)
@@ -2541,11 +2802,20 @@ func _line_param(p_origin: Vector3, p_axis: Vector3, p_from: Vector3, p_dir: Vec
 	return (b * p_dir.dot(w) - p_axis.dot(w)) / denominator
 
 func _gizmo_press() -> void:
+	var target := _gizmo_target()
+	if target == null:
+		return
+	if target == gizmo_body and gizmo_mode == Gizmo.SCALE:
+		_notify("Objects move and turn (T switches); scaling is for a lifted selection")
+		return
 	gizmo_axis = _gizmo_pick()
 	if gizmo_axis < 0:
 		gizmo_axis = 3  # free: in the plane facing the camera
-	var target := _gizmo_target()
 	gizmo_start = target.global_transform
+	if target == gizmo_body:
+		network.use(gizmo_body)  # (multiplayer: moved here, so simulated here)
+		gizmo_body_frozen = gizmo_body.freeze
+		gizmo_body.freeze = true
 	var from := camera.global_position
 	var dir := -camera.global_basis.z
 	var origin := target.global_position
@@ -2621,7 +2891,7 @@ func _extrude(p_hit, p_held: bool) -> void:
 		extruding = true
 		extrude_origin = p_hit
 		extrude_dir = terrain.get_normal(p_hit, 2.0)
-		extrude_whole = Input.is_key_pressed(KEY_SHIFT)
+		extrude_whole = _shift_held()
 		extrude_last = -1.0
 	# Out along the normal, or (dragging back) in.
 	var distance := _line_param(extrude_origin, extrude_dir, from, dir)
@@ -2670,7 +2940,7 @@ func _update_geometry() -> void:
 	if geo_preview != null:
 		geo_preview.visible = on
 	if geo_drag >= 0:
-		if not on or not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or geo_drag >= geo_points.size():
+		if not on or not _button(MOUSE_BUTTON_LEFT) or geo_drag >= geo_points.size():
 			geo_drag = -1
 		else:
 			var to := camera.global_position - camera.global_basis.z * geo_drag_distance
@@ -2848,12 +3118,12 @@ func _update_box() -> void:
 	if box_dragging and (not tool in [Tool.BOX, Tool.SELECT_BOX] or not _captured()):
 		box_dragging = false
 	var box_button := MOUSE_BUTTON_LEFT if tool != Tool.SELECT_BOX or box_select_add else MOUSE_BUTTON_RIGHT
-	if box_dragging and not Input.is_mouse_button_pressed(box_button):
+	if box_dragging and not _button(box_button):
 		box_dragging = false
 		if tool == Tool.SELECT_BOX:
 			_apply_box_select(box_select_add)
 		else:
-			_apply_box(Input.is_key_pressed(KEY_SHIFT))
+			_apply_box(_shift_held())
 	if not box_dragging:
 		if box_preview != null:
 			box_preview.queue_free()
@@ -2862,7 +3132,7 @@ func _update_box() -> void:
 		return
 	var corners := _box_corners()
 	# (Select box: shown as a selection would be, or red taking away.)
-	var cut := Input.is_key_pressed(KEY_SHIFT) if tool == Tool.BOX else not box_select_add
+	var cut := _shift_held() if tool == Tool.BOX else not box_select_add
 	var changed := corners.size() != box_shown.size() or cut != box_preview_cut
 	for i in mini(corners.size(), box_shown.size()):
 		changed = changed or corners[i].distance_to(box_shown[i]) > 0.05

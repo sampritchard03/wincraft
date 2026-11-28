@@ -18,6 +18,12 @@ extends Node
 ## when it's changed here (network.gd, send_kind_shape()).
 
 const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
+## Where kinds' scenes were before the project's files were tidied into
+## folders: saves made then name them so.
+const MOVED_SCENES := {
+	"res://forg.tscn": "res://scenes/entities/forg.tscn",
+	"res://chiggin.tscn": "res://scenes/entities/chiggin.tscn",
+}
 const META_SEEN := "creature_shape"  # the shape the creature had when last looked at
 const META_VERSION := "creature_version"  # and its version (edits in place)
 
@@ -37,6 +43,12 @@ var kind_facing: Dictionary = {}
 var loaded_kinds: Dictionary = {}
 ## Loaded creatures waiting for the world (made in restore_loaded()).
 var loaded_creatures: Array = []
+## Scene path -> _fingerprint() of the kind as the game makes it (its
+## scene's shape, animations and facing). A save keeps a kind's shape and
+## animations with the fingerprint they were made from; once the game's
+## own changes ("Make game default", a new build), the save's old copy is
+## dropped and every world gets the new one.
+var kind_defaults: Dictionary = {}
 
 
 func _init(p_world: Node) -> void:
@@ -107,8 +119,13 @@ func _process(_delta: float) -> void:
 func _meet(p_body: DensityBody3D) -> void:
 	var path := p_body.scene_file_path
 	if not kind_shapes.has(path):
+		var player := BodyAnimation.player_of(p_body)
+		var library: AnimationLibrary = player.get_animation_library("") if player != null and player.has_animation_library("") else null
+		kind_defaults[path] = _fingerprint(p_body.shape, library, p_body.get("facing_offset"))
 		var saved: Dictionary = loaded_kinds.get(path, {})
 		loaded_kinds.erase(path)
+		if saved.get("default", "") != kind_defaults[path]:
+			saved = {}  # (saved from an older game default, or a save from before they were told apart)
 		if saved.get("shape") is Dictionary:
 			kind_shapes[path] = DensityShape.from_dict(saved.shape)
 		else:
@@ -116,7 +133,6 @@ func _meet(p_body: DensityBody3D) -> void:
 		kind_facing[path] = float(saved.get("facing", p_body.get("facing_offset") if p_body.get("facing_offset") != null else 0.0))
 		if saved.get("animation") is Dictionary:
 			BodyAnimation.apply(p_body, saved.animation)  # (into the library every one of its kind shares)
-		var player := BodyAnimation.player_of(p_body)
 		if player != null and player.has_animation_library(""):
 			kind_libraries[path] = player.get_animation_library("")
 	if p_body.get_meta("net_sim", true) and p_body.shape != kind_shapes[path]:
@@ -171,7 +187,8 @@ func to_save() -> Dictionary:
 	list.append_array(loaded_creatures)  # (not made yet: kept)
 	var kinds := loaded_kinds.duplicate()  # (kinds not met this time: kept as they were)
 	for path in kind_shapes:
-		var kind := {"shape": (kind_shapes[path] as DensityShape).to_dict(), "facing": kind_facing.get(path, 0.0)}
+		var kind := {"shape": (kind_shapes[path] as DensityShape).to_dict(), "facing": kind_facing.get(path, 0.0),
+				"default": kind_defaults.get(path, "")}
 		var library: AnimationLibrary = kind_libraries.get(path)
 		if library != null:
 			var animations := {}
@@ -183,8 +200,15 @@ func to_save() -> Dictionary:
 
 
 func load_from(p_config: ConfigFile) -> void:
-	loaded_kinds = p_config.get_value("creatures", "kinds", {})
+	loaded_kinds = {}
+	var kinds = p_config.get_value("creatures", "kinds", {})
+	if kinds is Dictionary:
+		for path in kinds:
+			loaded_kinds[MOVED_SCENES.get(path, path)] = kinds[path]
 	loaded_creatures = p_config.get_value("creatures", "list", [])
+	for entry in loaded_creatures:
+		if entry is Dictionary and MOVED_SCENES.has(entry.get("scene", "")):
+			entry.scene = MOVED_SCENES[entry.scene]
 
 
 ## Makes the loaded creatures, each at the repeat of the wrapping world
@@ -199,7 +223,7 @@ func restore_loaded(p_player: Vector3) -> void:
 		if scene == null:
 			continue
 		var at: Vector3 = entry.get("position", Vector3.ZERO)
-		var body := spawn(scene, p_player + world.balls._offset_from(p_player, at))
+		var body := spawn(scene, p_player + world.objects._offset_from(p_player, at))
 		if entry.get("shape") is Dictionary:
 			body.shape = DensityShape.from_dict(entry.shape)
 			body.set_meta(META_SEEN, body.shape)
@@ -215,8 +239,8 @@ func restore_loaded(p_player: Vector3) -> void:
 
 ## Makes p_body's kind (its scene) start out as it is now, for every world:
 ## its shape (and shape keys) into the scene's shape file, its animations
-## into their files (res://<scene name>/<animation>.tres, where the scene
-## keeps them there), or into the scene itself. Returns what it did, or
+## into their files (the folder the scene's animation files are in, where
+## it keeps them in files), or into the scene itself. Returns what it did, or
 ## what went wrong. (Only while running from the project: an exported
 ## game's files can't be written.)
 ## Every one of a kind faces p_degrees off (creature.gd, facing_offset): here,
@@ -254,8 +278,14 @@ func save_as_default(p_body: DensityBody3D) -> String:
 	var player := BodyAnimation.player_of(root)
 	var files := 0
 	if library != null and player != null:
-		var folder := path.get_basename()  # res://scenes/entities/chiggin.tscn -> res://chiggin/
-		var in_files := DirAccess.dir_exists_absolute(folder)
+		# (New animations go beside the ones already in files, if any are.)
+		var folder := ""
+		for anim_name in library.get_animation_list():
+			var file := library.get_animation(anim_name).resource_path
+			if file != "" and not file.contains("::"):
+				folder = file.get_base_dir()
+				break
+		var in_files := folder != ""
 		for anim_name in library.get_animation_list():
 			var anim := library.get_animation(anim_name)
 			var file := anim.resource_path
@@ -289,6 +319,25 @@ func save_as_default(p_body: DensityBody3D) -> String:
 		failed.append(path)
 	if not failed.is_empty():
 		return "Couldn't write %s" % ", ".join(failed)
+	# (This world's copy is the game's own now: saved as made from it.)
+	kind_defaults[path] = _fingerprint(shape, library, kind_facing.get(path, p_body.get("facing_offset")))
 	return "Saved as the game's own %s: shape (%d keys) in %s, %d animations%s" % [path.get_file().get_basename(),
 			shape.get_key_count(), shape_path.get_file(), library.get_animation_list().size() if library != null else 0,
 			" (%d in files)" % files if files > 0 else " (in the scene)"]
+
+
+## A kind as the game makes it, told apart from any other: a hash of its
+## shape, its animations and its facing.
+static func _fingerprint(p_shape: DensityShape, p_library: AnimationLibrary, p_facing) -> String:
+	var hashing := HashingContext.new()
+	hashing.start(HashingContext.HASH_MD5)
+	if p_shape != null:
+		hashing.update(var_to_bytes(p_shape.to_dict()))
+	if p_library != null:
+		var names := p_library.get_animation_list()
+		names.sort()
+		for anim_name in names:
+			hashing.update(str(anim_name).to_utf8_buffer())
+			hashing.update(var_to_bytes(BodyAnimation.animation_to_dict(p_library.get_animation(anim_name))))
+	hashing.update(var_to_bytes(snappedf(float(p_facing) if p_facing != null else 0.0, 0.01)))
+	return hashing.finish().hex_encode()

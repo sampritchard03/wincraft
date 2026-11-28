@@ -340,20 +340,19 @@ bool SculptTerrain::open_world() {
 	island_settings = world.get_settings(); // a saved world keeps its own
 	const int64_t opened_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 	clipmap.configure(clip_size, clip_levels);
-	for (Ref<Texture2DArray> &texture : clip_textures) {
-		texture.unref();
-	}
-	// Create every texture now (empty), while the game is loading: creating
-	// one later means uploading all of it in one frame.
-	for (int l = 0; l < clip_levels; l++) {
+	clip_texture.unref();
+	// Create the texture now (empty), while the game is loading: creating it
+	// later means uploading all of it in one frame. Layer l * clip_size + z
+	// is slice z of level l.
+	{
 		TypedArray<Image> layers;
-		layers.resize(clip_size);
+		layers.resize(clip_size * clip_levels);
 		const Ref<Image> blank = Image::create_empty(clip_size, clip_size, false, Image::FORMAT_RGBA8); // see upload_level()
-		for (int z = 0; z < clip_size; z++) {
-			layers[z] = blank;
+		for (int i = 0; i < clip_size * clip_levels; i++) {
+			layers[i] = blank;
 		}
-		clip_textures[l].instantiate();
-		clip_textures[l]->create_from_images(layers);
+		clip_texture.instantiate();
+		clip_texture->create_from_images(layers);
 	}
 	// Brick distances of all levels: layer l * bricks + z holds slice z of level l.
 	const int nb = clipmap.get_brick_count();
@@ -507,7 +506,8 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 	}
 	const int n = clipmap.get_size();
 	const int64_t layer_texels = (int64_t)n * n;
-	Ref<Texture2DArray> &texture = clip_textures[p_level];
+	Ref<Texture2DArray> &texture = clip_texture;
+	const int first_layer = p_level * n; // (this level's slices in it)
 	bool changed = false;
 	// Brick distances are tiny, but a layer is a call of its own: only the
 	// changed ones go up.
@@ -596,7 +596,7 @@ bool SculptTerrain::upload_level(int p_level, std::chrono::steady_clock::time_po
 		});
 		lap(upload_ms[UPLOAD_PACK]);
 		for (int i = 0; i < count; i++) {
-			texture->update_layer(Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, buffers[i]), batch[i]);
+			texture->update_layer(Image::create_from_data(n, n, false, Image::FORMAT_RGBA8, buffers[i]), first_layer + batch[i]);
 			level.layer_dirty[batch[i]] = 0;
 		}
 		lap(upload_ms[UPLOAD_GPU]);
@@ -649,13 +649,11 @@ void SculptTerrain::bind_material() {
 		extents.push_back(Vector3((hi - lo).maxi(0)));
 	}
 	int count = 0;
-	while (count < clipmap.get_level_count() && clipmap.level(count).published && clip_textures[count].is_valid()) {
+	while (count < clipmap.get_level_count() && clipmap.level(count).published && clip_texture.is_valid()) {
 		count++;
 	}
 	for (const Ref<ShaderMaterial> &m : clip_materials()) {
-		for (int l = 0; l < MAX_CLIP_LEVELS; l++) {
-			m->set_shader_parameter(vformat("clip_texture%d", l), clip_textures[l]);
-		}
+		m->set_shader_parameter("clip_texture", clip_texture);
 		m->set_shader_parameter("clip_bricks", brick_texture);
 		m->set_shader_parameter("clip_brick_count", (float)clipmap.get_brick_count());
 		m->set_shader_parameter("clip_count", count);
@@ -977,7 +975,7 @@ void SculptTerrain::mark_edited(const Vector3i &p_min, const Vector3i &p_max) {
 	DensityBody3D::wake_near(Vector3(p_min), Vector3(p_max + Vector3i(1, 1, 1)), world.world_size());
 }
 
-int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key) {
+int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key, bool p_force) {
 	// Shared by every body drawing this shape in this frame (frogs share one).
 	const uint64_t id = p_shape->get_instance_id();
 	const int layers = std::clamp(p_shape->get_size().z, 1, GRID_SLOT);
@@ -992,6 +990,10 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 	if (found >= 0 && grid_slots[found].count != layers) {
 		grid_slots.erase(grid_slots.begin() + found); // grown: somewhere new
 		found = -1;
+	}
+	const bool upload = found < 0 || grid_slots[found].version != p_shape->get_version();
+	if (upload && !p_force && upload_budget < layers) {
+		return -1; // (next frame)
 	}
 	if (found < 0) {
 		// A run of free layers (first fit), making room by dropping what
@@ -1036,11 +1038,18 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 	if (s.version != p_shape->get_version()) {
 		PackedByteArray bytes;
 		bytes.resize(GRID_SLOT * GRID_SLOT * 3);
+		Ref<Image> image;
 		for (int z = 0; z < layers; z++) {
 			p_shape->fill_slice(p_key, z, bytes.ptrw());
-			body_atlas->update_layer(Image::create_from_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes), s.base + z);
+			if (image.is_null()) {
+				image = Image::create_from_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes);
+			} else {
+				image->set_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes);
+			}
+			body_atlas->update_layer(image, s.base + z);
 		}
 		s.version = p_shape->get_version();
+		upload_budget -= layers;
 	}
 	s.used = ++slot_clock;
 	return s.base;
@@ -1119,6 +1128,7 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		a->resize(MAX_GRID_BODIES);
 	}
 	frame_clock = slot_clock;
+	upload_budget = UPLOAD_LAYERS;
 	PackedFloat32Array highlights;
 	highlights.resize(MAX_GRID_BODIES);
 	highlights.fill(0.0f);
@@ -1135,15 +1145,29 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		const DensityShape::Blend &blend = d.body->get_blend();
 		float slots[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
 		float weights[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
-		bool placed = true;
-		for (int f = 0; f < blend.count && placed; f++) {
-			const int slot = grid_slot(d.body, shape, blend.frames[f]);
-			placed = slot >= 0;
-			slots[f] = (float)slot;
-			weights[f] = blend.weights[f];
+		// (The heaviest first: if the atlas is full, or this frame's uploads
+		// are spent, it's drawn with the frames that are there, the heaviest
+		// at least; one that can't be is left out, not every one after it.)
+		int placed = 0;
+		float total = 0.0f;
+		for (int f = 0; f < blend.count; f++) {
+			const int slot = grid_slot(d.body, shape, blend.frames[f], f == 0);
+			if (slot < 0) {
+				if (f == 0) {
+					break;
+				}
+				continue;
+			}
+			slots[placed] = (float)slot;
+			weights[placed] = blend.weights[f];
+			total += blend.weights[f];
+			placed++;
 		}
-		if (!placed) {
-			break;
+		if (placed == 0) {
+			continue;
+		}
+		for (int f = 0; f < placed; f++) {
+			weights[f] = total > 1e-6f ? weights[f] / total : (f == 0 ? 1.0f : 0.0f);
 		}
 		// World point -> grid point: (B^-1 (p - T) - origin) / voxel_size, for
 		// any basis B (a transformed selection may be scaled unevenly).
@@ -2710,6 +2734,77 @@ Variant SculptTerrain::raycast(const Vector3 &p_from, const Vector3 &p_dir, doub
 	return Variant();
 }
 
+void SculptTerrain::set_features(const Array &p_features) {
+	if (opened) {
+		WARN_PRINT("SculptTerrain.set_features(): the world is already open; ground generated so far keeps the old features.");
+	}
+	std::vector<FeatureShape> shapes;
+	std::vector<FeatureDef> defs;
+	for (int64_t i = 0; i < p_features.size(); i++) {
+		const Dictionary d = p_features[i];
+		FeatureDef def;
+		const CharString id = String(d.get("id", vformat("feature%d", i))).utf8();
+		def.id_hash = 1469598103934665603ull; // (FNV-1a: the same on every computer)
+		for (int64_t k = 0; k < id.length(); k++) {
+			def.id_hash = (def.id_hash ^ (uint8_t)id[k]) * 1099511628211ull;
+		}
+		def.per_region = std::max((float)(double)d.get("per_region", 1.0), 0.0f);
+		const PackedInt32Array grows_on = d.get("grows_on", PackedInt32Array());
+		for (int64_t k = 0; k < grows_on.size(); k++) {
+			def.grows_on.push_back((MaterialId)grows_on[k]);
+		}
+		def.min_up = std::cos((float)Math::deg_to_rad((double)d.get("max_slope", 90.0)));
+		def.sink = (float)(double)d.get("sink", 1.0);
+		def.follow_slope = (float)(double)d.get("follow_slope", 0.0);
+		def.random_turn = d.get("random_turn", true);
+		def.scale_min = std::max((float)(double)d.get("scale_min", 1.0), 0.05f);
+		def.scale_max = std::max((float)(double)d.get("scale_max", def.scale_min), def.scale_min);
+		def.spacing = (float)(double)d.get("spacing", 0.0);
+		const PackedInt32Array types = d.get("world_types", PackedInt32Array());
+		if (!types.is_empty()) {
+			def.world_types = 0;
+			for (int64_t k = 0; k < types.size(); k++) {
+				def.world_types |= 1u << types[k];
+			}
+		}
+		const Array list = d.get("shapes", Array());
+		for (int64_t k = 0; k < list.size(); k++) {
+			const Ref<DensityShape> source = list[k];
+			if (source.is_null() || source->get_key_count() == 0) {
+				continue;
+			}
+			FeatureShape shape;
+			shape.size = source->get_size().max(Vector3i(2, 2, 2));
+			if (shape.size != source->get_size()) {
+				continue; // (too thin to sample)
+			}
+			shape.origin = source->get_origin();
+			shape.voxel_size = (float)source->get_voxel_size();
+			const PackedByteArray rest = source->get_rest();
+			const PackedByteArray materials = source->get_materials();
+			const size_t n = (size_t)shape.size.x * shape.size.y * shape.size.z;
+			shape.density.resize(n);
+			shape.materials.resize(n);
+			for (size_t j = 0; j < n; j++) {
+				shape.density[j] = (int64_t)j < rest.size() ? (int8_t)rest[j] * DENSITY_STEP : -DENSITY_CLAMP;
+				shape.materials[j] = 2 * (int64_t)j + 1 < materials.size() ? (MaterialId)(materials[2 * j] | materials[2 * j + 1] << 8) : MAT_STONE;
+			}
+			const Vector3 extent = Vector3(shape.size - Vector3i(1, 1, 1)) * shape.voxel_size;
+			for (int c = 0; c < 8; c++) {
+				const Vector3 corner = shape.origin + Vector3(c & 1 ? extent.x : 0.0f, c & 2 ? extent.y : 0.0f, c & 4 ? extent.z : 0.0f);
+				shape.reach = std::max(shape.reach, corner.length());
+				shape.reach_xz = std::max(shape.reach_xz, Vector2(corner.x, corner.z).length());
+			}
+			def.shapes.push_back((int)shapes.size());
+			shapes.push_back(std::move(shape));
+		}
+		if (!def.shapes.empty()) {
+			defs.push_back(std::move(def));
+		}
+	}
+	world.set_features(std::move(shapes), std::move(defs));
+}
+
 // --- Bindings ----------------------------------------------------------------
 
 void SculptTerrain::_bind_methods() {
@@ -2834,6 +2929,7 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_selection_state", "state"), &SculptTerrain::set_selection_state);
 	ClassDB::bind_method(D_METHOD("get_selection_serial"), &SculptTerrain::get_selection_serial);
 	ClassDB::bind_method(D_METHOD("stamp_shape", "shape", "transform", "material", "select", "pose"), &SculptTerrain::stamp_shape, DEFVAL(-1), DEFVAL(true), DEFVAL(0.0));
+	ClassDB::bind_method(D_METHOD("set_features", "features"), &SculptTerrain::set_features);
 	ClassDB::bind_method(D_METHOD("select_inside_shape", "shape", "transform", "add"), &SculptTerrain::select_inside_shape);
 	ClassDB::bind_method(D_METHOD("carve_shape", "shape", "transform", "pose"), &SculptTerrain::carve_shape, DEFVAL(0.0));
 	ClassDB::bind_method(D_METHOD("begin_extrude"), &SculptTerrain::begin_extrude);

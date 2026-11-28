@@ -5,7 +5,8 @@ render_mode unshaded;
 // map_extent voxels across, centred on map_origin (which sits above the
 // area it covers, towards the sun). Each texel marches a ray from there in
 // the sun's light direction through the clipmap and stores how far it got
-// before meeting solid ground (map_depth if it didn't), over map_depth. A
+// before meeting solid ground (map_depth if it didn't), over map_depth, as
+// 16 bits in red and green. A
 // surface point is in shadow if it lies farther along its texel's ray than
 // that (terrain_shadow.gdshaderinc, sun_map_shadow()).
 //
@@ -51,5 +52,9 @@ void fragment() {
 		d_prev = d;
 		t += max(step_length(d, far, s), 0.05 * s);
 	}
-	COLOR = vec4(hit / map_depth, 0.0, 0.0, 1.0);
+	// 16 bits over red (high byte) and green (low byte): exact in an 8-bit
+	// target, so it's the same on every GPU (sun_map_depth() reads it back).
+	float x = floor(clamp(hit / map_depth, 0.0, 1.0) * 65535.0 + 0.5);
+	float high = floor(x / 256.0);
+	COLOR = vec4(high / 255.0, (x - high * 256.0) / 255.0, 0.0, 1.0);
 }

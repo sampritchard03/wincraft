@@ -2,6 +2,7 @@
 
 #include "noise.h"
 
+#include <godot_cpp/variant/basis.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 #include <godot_cpp/variant/vector3i.hpp>
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -121,6 +123,33 @@ struct IslandSettings {
 	int terrain_version = 2;
 };
 
+// World features (trees, mushrooms...): small shapes the generator puts on
+// the ground, as much a part of the generated world as its noise (so not
+// saved unless their chunk is edited). The game's scripts define them
+// (SculptTerrain.set_features()); where each goes follows from the seed.
+struct FeatureShape {
+	Vector3i size;
+	Vector3 origin; // of the first grid point, in the shape's space (its foot at 0)
+	float voxel_size = 1.0f;
+	std::vector<float> density; // in the grid's voxels, positive inside (x fastest, then y, z)
+	std::vector<MaterialId> materials;
+	float reach = 0.0f; // farthest grid corner from the foot
+	float reach_xz = 0.0f; // and sideways (in x and z)
+};
+struct FeatureDef {
+	uint64_t id_hash = 0; // seeds its placements
+	std::vector<int> shapes; // into the world's feature shapes: one is picked per placement
+	float per_region = 1.0f; // placements tried per 64 x 64 voxels of ground, on average
+	std::vector<MaterialId> grows_on; // empty: any ground
+	float min_up = 0.0f; // cos of the steepest slope it grows on
+	float sink = 1.0f; // voxels into the ground (times its size)
+	float follow_slope = 0.0f; // 0 upright .. 1 square to the ground
+	bool random_turn = true;
+	float scale_min = 1.0f, scale_max = 1.0f;
+	float spacing = 0.0f; // from other features of its region
+	uint32_t world_types = ~0u; // bit per WorldType
+};
+
 // A world of fixed size that wraps around in x and z (a torus: walking
 // world_size voxels east brings you back) and stops at hard limits in y
 // (world_height voxels, centred on 0). Coordinates outside it are fine
@@ -186,6 +215,11 @@ public:
 	// points within about a spacing of the surface get the surface's
 	// material, so far-away terrain shows what's on top.
 	float generate(int x, int y, int z, int p_octaves, float p_accuracy, int p_spacing = 1, MaterialId *r_material = nullptr) const;
+	// The generated ground alone, without features (as generate() was).
+	float generate_ground(int x, int y, int z, int p_octaves, float p_accuracy, int p_spacing = 1, MaterialId *r_material = nullptr) const;
+	// Replaces the features (call before generating anything: open()).
+	void set_features(std::vector<FeatureShape> &&p_shapes, std::vector<FeatureDef> &&p_defs);
+	bool has_features() const { return !feature_defs.empty(); }
 	// Noise octaves worth computing when points are p_scale voxels apart
 	// (finer octaves would be smaller than the spacing).
 	int octaves_for_scale(int p_scale) const;
@@ -316,7 +350,48 @@ private:
 	};
 
 	IslandSettings settings;
-	uint32_t settings_version = 0; // changes with every configure() (see generate's cache)
+	uint32_t settings_version = 0; // changes with every configure() and set_features() (see generate's cache)
+
+	// --- Features (see FeatureDef) ---
+	// Terrain worlds plan them per FEATURE_REGION x FEATURE_REGION column of
+	// ground, island worlds per island (its cell). Coarser clipmap levels
+	// than FEATURE_MAX_SPACING leave them out.
+	static constexpr int FEATURE_REGION = 64;
+	static constexpr int FEATURE_MAX_SPACING = 8;
+	struct FeatureInstance {
+		int shape = 0;
+		Vector3 origin; // the shape's foot, in the world (its region's wrapped frame)
+		Basis to_local; // world offsets to the shape's space (turn and size undone)
+		float scale = 1.0f;
+		Vector3 lo, hi; // its grid's box in the world
+	};
+	struct FeatureRegion {
+		std::vector<FeatureInstance> instances;
+		Vector3 lo = Vector3(1e30f, 1e30f, 1e30f), hi = Vector3(-1e30f, -1e30f, -1e30f);
+	};
+	std::vector<FeatureShape> feature_shapes;
+	std::vector<FeatureDef> feature_defs;
+	float feature_reach = 0.0f; // farthest any instance's box reaches from where it stands
+	float feature_reach_xz = 0.0f; // and sideways
+	mutable std::shared_mutex feature_lock;
+	mutable std::unordered_map<Vector3i, std::unique_ptr<FeatureRegion>, Vector3iHash> feature_regions;
+	// A region's features, planned the first time it's asked for (any thread).
+	const FeatureRegion &feature_region(const Vector3i &p_key) const;
+	void plan_features(const Vector3i &p_key, FeatureRegion &r_region) const;
+	// Where the ground is at a column (x, z wrapped), the highest within
+	// [p_bottom, p_top]: its point, normal and material. False if none.
+	bool find_ground(float p_x, float p_z, float p_top, float p_bottom, Vector3 &r_point, Vector3 &r_normal, MaterialId &r_material) const;
+	// Calls p_visit(instance, shift) for each feature whose box meets [p_lo,
+	// p_hi] (world coordinates; shift: what to take off a point there to
+	// put it in the instance's frame).
+	template <typename F>
+	void for_each_feature(const Vector3 &p_lo, const Vector3 &p_hi, F p_visit) const;
+	// An instance's density at p (in its frame), in world voxels, and its material there.
+	float feature_value(const FeatureInstance &p_instance, const Vector3 &p, MaterialId *r_material) const;
+	// p_density (the ground's at a point) with the features unioned in.
+	float add_features(int x, int y, int z, float p_density, float p_accuracy, MaterialId *r_material) const;
+	// Whether any feature comes within p_margin of a chunk.
+	bool features_touch_chunk(const Vector3i &p_chunk, float p_margin) const;
 	SimplexNoise noise;
 	PerlinNoise perlin;
 	PerlinNoise perlin_caves; // a second, independent field (caves need two)
@@ -365,6 +440,7 @@ private:
 	const ColumnInfo &cached_column_info(int p_cx, int p_cz) const;
 	void generate_terrain_chunk(const Vector3i &p_chunk, const ColumnInfo &p_info, Chunk &r_chunk) const;
 	int8_t terrain_point(int x, int y, int z, float p_height, float p_slope, MaterialId *r_material) const;
+	float terrain_value(int x, int y, int z, float p_height, float p_slope, MaterialId *r_material) const; // (not quantized)
 	// A point as generated, quantized as stored (far air's material folded).
 	int8_t generated_point(int x, int y, int z, MaterialId *r_material) const;
 	// Fills a chunk's points: from the save if edited, else generated.
