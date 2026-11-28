@@ -1483,10 +1483,53 @@ double DensityCharacter3D::gap(SculptTerrain *p_terrain, const Vector3 &p_center
 			continue;
 		}
 		Vector3 n;
-		const double g = -b->distance_at(p_center, n) - p_radius;
+		const double g = body_gap(b, p_center, p_radius, n);
 		// Only from above: something to stand on. From the side the player
 		// walks into it and it gets pushed (it bounces off us).
 		if (g < best && n.y >= floor_cos) {
+			best = g;
+			r_normal = n;
+		}
+	}
+	return best;
+}
+
+double DensityCharacter3D::body_gap(DensityBody3D *p_body, const Vector3 &p_center, double p_radius, Vector3 &r_normal) {
+	const double d = -p_body->distance_at(p_center, r_normal); // from the centre
+	if (p_body->shape.is_null()) {
+		return d - p_radius;
+	}
+	// The farthest its density tells reliably (DENSITY_CLAMP voxels, less a margin).
+	const double reach = 0.75 * DENSITY_CLAMP * p_body->shape->get_voxel_size() * p_body->scale;
+	if (p_radius <= reach || d < reach) {
+		return d - p_radius; // (told, or near enough that the centre's reading is right)
+	}
+	// Smaller spheres, each as wide as it tells, inside this one and
+	// touching its surface: the middle and 26 ways out (faces, edges, corners).
+	static const std::vector<Vector3> ways = [] {
+		std::vector<Vector3> list;
+		for (int x = -1; x <= 1; x++) {
+			for (int y = -1; y <= 1; y++) {
+				for (int z = -1; z <= 1; z++) {
+					if (x != 0 || y != 0 || z != 0) {
+						list.push_back(Vector3((float)x, (float)y, (float)z).normalized());
+					}
+				}
+			}
+		}
+		return list;
+	}();
+	const double out = p_radius - reach;
+	const double far = 0.95 * DENSITY_CLAMP * p_body->shape->get_voxel_size() * p_body->scale; // (a reading this far: farther than it tells)
+	double best = d; // (none near: clear by more than any of them tells)
+	for (const Vector3 &w : ways) {
+		Vector3 n;
+		const double distance = -p_body->distance_at(p_center + w * (float)out, n);
+		if (distance >= far) {
+			continue;
+		}
+		const double g = distance - reach;
+		if (g < best) {
 			best = g;
 			r_normal = n;
 		}
@@ -1519,7 +1562,7 @@ void DensityCharacter3D::push_bodies(const Vector3 &p_feet, double p_dt, double 
 				continue;
 			}
 			Vector3 n;
-			const double depth = b->distance_at(c, n) + r;
+			const double depth = -body_gap(b, c, r, n);
 			if (depth > deepest && n.length_squared() > 1e-12) {
 				deepest = depth;
 				normal = n.normalized();

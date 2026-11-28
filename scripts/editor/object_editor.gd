@@ -580,6 +580,14 @@ func _make_panels() -> void:
 		if not updating_ui:
 			set_voxel_size(voxel_select.get_item_metadata(i)))
 	voxel_row.add_child(voxel_select)
+	var mirror_row := HBoxContainer.new()
+	box.add_child(mirror_row)
+	var mirror_label := Label.new()
+	mirror_label.text = "Mirror"
+	mirror_row.add_child(mirror_label)
+	for keep_right in [false, true]:
+		var mirror_button := _button(mirror_row, "Left onto right" if not keep_right else "Right onto left", func() -> void: _mirror(keep_right))
+		mirror_button.tooltip_text = "Once: cuts it in half at the mirror symmetry's plane (E on it; a creature's runs down its middle) and makes the other half this half's mirror image, shape keys too, so symmetry lines up. Ctrl+Z undoes. (Shift+E in the world: the side you're looking from)"
 	var files := HBoxContainer.new()
 	box.add_child(files)
 	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); on a frog or chiggin, every one of its kind. Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
@@ -1047,6 +1055,17 @@ static func _voxel_text(p_size: float) -> String:
 
 ## Samples the body's shape again at p_size (its keys too), as one undo
 ## step. A shape too big for that many voxels gets the finest that fits.
+## The mirror buttons: the symmetry put on it first if it isn't (mirror,
+## along where a creature faces, or the view).
+func _mirror(p_keep_right: bool) -> void:
+	if not is_instance_valid(body) or body.shape == null:
+		return
+	if world.symmetry_body != body or not world.symmetry_attached:
+		world.attach_symmetry_to(body)
+	world.symmetry = 0  # (world.gd Symmetry.MIRROR)
+	world.mirror_half(body, p_keep_right)
+	_refresh_ui()
+
 func set_voxel_size(p_size: float) -> void:
 	if not is_instance_valid(body) or body.shape == null:
 		return

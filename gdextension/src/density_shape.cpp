@@ -711,6 +711,130 @@ Ref<DensityShape> DensityShape::resampled(double p_voxel_size) const {
 	return copy;
 }
 
+Ref<DensityShape> DensityShape::mirrored(const Vector3 &p_point, const Vector3 &p_normal) const {
+	if (keys.empty() || rest.empty() || p_normal.length_squared() < 1e-12f) {
+		return duplicate_shape();
+	}
+	const Vector3 N = p_normal.normalized();
+	const float C = DENSITY_CLAMP;
+	const float old_vs = (float)voxel_size;
+	auto side = [&](const Vector3 &p_body) { return (p_body - p_point).dot(N); };
+	auto reflect = [&](const Vector3 &p_body) { return p_body - N * (2.0f * side(p_body)); };
+	// What it holds on the kept side (as resampled() measures it), and that mirrored.
+	Vector3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+	auto hold = [&](const Vector3 &p_body) {
+		if (side(p_body) >= -old_vs) {
+			lo = lo.min(p_body).min(reflect(p_body));
+			hi = hi.max(p_body).max(reflect(p_body));
+		}
+	};
+	for (int z = 0; z < size.z; z++) {
+		for (int y = 0; y < size.y; y++) {
+			for (int x = 0; x < size.x; x++) {
+				const size_t i = index(x, y, z);
+				float most = rest[i];
+				for (const Key &k : keys) {
+					if (!k.residual.empty()) {
+						most = std::max(most, rest[i] + k.residual[i]);
+					}
+				}
+				if (most < -2.0f) {
+					continue;
+				}
+				const Vector3 p((float)x, (float)y, (float)z);
+				hold(origin + p * old_vs);
+				for (const Key &k : keys) {
+					if (!k.motion.empty()) {
+						hold(origin + (p + k.motion[i]) * old_vs);
+					}
+				}
+			}
+		}
+	}
+	if (lo.x > hi.x) {
+		return duplicate_shape(); // (nothing on the kept side)
+	}
+	const Vector3 room = Vector3(2.0f, 2.0f, 2.0f) * old_vs;
+	Vector3 blo = lo - room, bhi = hi + room;
+	double vs = voxel_size;
+	Vector3i n;
+	for (;;) {
+		const Vector3 extent = (bhi - blo) / (float)vs;
+		n = Vector3i((int)std::ceil(extent.x) + 1, (int)std::ceil(extent.y) + 1, (int)std::ceil(extent.z) + 1);
+		if ((n.x <= MAX_SIZE && n.y <= MAX_SIZE && n.z <= MAX_SIZE) || vs * 2.0 > MAX_VOXEL_SIZE) {
+			break;
+		}
+		vs *= 2.0;
+	}
+	n = n.clamp(Vector3i(2, 2, 2), Vector3i(MAX_SIZE, MAX_SIZE, MAX_SIZE));
+	// (Grid points on the old grid's where nothing was coarsened: the kept
+	// side keeps its values exactly.)
+	if (vs == voxel_size) {
+		const Vector3 shift = ((blo - origin) / old_vs).floor();
+		blo = origin + shift * old_vs;
+		n = Vector3i((int)std::ceil((bhi.x - blo.x) / old_vs) + 1, (int)std::ceil((bhi.y - blo.y) / old_vs) + 1,
+				(int)std::ceil((bhi.z - blo.z) / old_vs) + 1)
+					.clamp(Vector3i(2, 2, 2), Vector3i(MAX_SIZE, MAX_SIZE, MAX_SIZE));
+	}
+	const float k = old_vs / (float)vs;
+	const size_t ncount = (size_t)n.x * n.y * n.z;
+	auto sample_plain = [&](const std::vector<float> &v, const Vector3 &q) {
+		const Vector3 c = q.clamp(Vector3(), Vector3(size - Vector3i(1, 1, 1)));
+		const int x0 = std::min((int)c.x, size.x - 1), y0 = std::min((int)c.y, size.y - 1), z0 = std::min((int)c.z, size.z - 1);
+		const int x1 = std::min(x0 + 1, size.x - 1), y1 = std::min(y0 + 1, size.y - 1), z1 = std::min(z0 + 1, size.z - 1);
+		const float fx = c.x - x0, fy = c.y - y0, fz = c.z - z0;
+		auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+		return lerp(lerp(lerp(v[index(x0, y0, z0)], v[index(x1, y0, z0)], fx), lerp(v[index(x0, y1, z0)], v[index(x1, y1, z0)], fx), fy),
+				lerp(lerp(v[index(x0, y0, z1)], v[index(x1, y0, z1)], fx), lerp(v[index(x0, y1, z1)], v[index(x1, y1, z1)], fx), fy), fz);
+	};
+	Ref<DensityShape> copy;
+	copy.instantiate();
+	copy->size = n;
+	copy->origin = blo;
+	copy->voxel_size = vs;
+	copy->rest.resize(ncount);
+	copy->materials.resize(ncount);
+	copy->keys.resize(keys.size());
+	for (size_t kk = 0; kk < keys.size(); kk++) {
+		copy->keys[kk].name = keys[kk].name;
+		if (!keys[kk].motion.empty()) {
+			copy->keys[kk].motion.resize(ncount);
+		}
+		if (!keys[kk].residual.empty()) {
+			copy->keys[kk].residual.resize(ncount);
+		}
+	}
+	for (int z = 0; z < n.z; z++) {
+		for (int y = 0; y < n.y; y++) {
+			for (int x = 0; x < n.x; x++) {
+				const size_t j = ((size_t)z * n.y + y) * n.x + x;
+				const Vector3 b = blo + Vector3((float)x, (float)y, (float)z) * (float)vs;
+				const bool mirror = side(b) < 0.0f;
+				const Vector3 from = mirror ? reflect(b) : b;
+				const Vector3 q = (from - origin) / old_vs;
+				copy->rest[j] = std::clamp(sample_grid(rest, q) * k, -C, C);
+				const Vector3i near = Vector3i((int)std::lround(q.x), (int)std::lround(q.y), (int)std::lround(q.z)).clamp(Vector3i(), size - Vector3i(1, 1, 1));
+				copy->materials[j] = materials.empty() ? (MaterialId)MAT_STONE : materials[index(near.x, near.y, near.z)];
+				for (size_t kk = 0; kk < keys.size(); kk++) {
+					if (!keys[kk].motion.empty()) {
+						Vector3 m = sample_motion(keys[kk].motion, q) * k;
+						if (mirror) {
+							m -= N * (2.0f * m.dot(N)); // (a move mirrored, as the shape is)
+						}
+						copy->keys[kk].motion[j] = m;
+					}
+					if (!keys[kk].residual.empty()) {
+						copy->keys[kk].residual[j] = sample_plain(keys[kk].residual, q) * k;
+					}
+				}
+			}
+		}
+	}
+	density_redistance(copy->rest, n);
+	copy->edited = true;
+	return copy;
+}
+
 Dictionary DensityShape::to_dict() const {
 	Dictionary d;
 	d["size"] = size;
@@ -855,10 +979,13 @@ int DensityShape::combo_frame(const std::vector<int16_t> &p_steps) const {
 			return c.id;
 		}
 	}
-	// Room: as many as about 96 MB holds, 8 to 512 (several weights
-	// animated at once visit many mixes, over and over).
+	// Room: as many as about 256 MB holds, 32 to 1024 (several weights
+	// animated at once visit many mixes, over and over: a walk with a head
+	// turn on top goes through hundreds, and with fewer kept they were
+	// worked out again every time round, the creature showing old frames
+	// meanwhile).
 	const size_t per = std::max<size_t>(count() * (sizeof(float) + sizeof(MaterialId) + sizeof(Vector3)), 1);
-	const size_t most = std::clamp<size_t>(((size_t)96 << 20) / per, 8, 512);
+	const size_t most = std::clamp<size_t>(((size_t)256 << 20) / per, 32, 1024);
 	while (combos.size() >= most) {
 		size_t oldest = 0;
 		for (size_t i = 1; i < combos.size(); i++) {
@@ -1057,7 +1184,9 @@ bool DensityShape::frame_ready(int p_frame) const {
 	return f != nullptr && f->version == version;
 }
 
-// One thread working out frames in the background, the latest asked for first.
+// A few threads working out frames in the background, the latest asked for
+// first (each frame is its own job: several creatures animating at once
+// need many, and one thread fell behind them).
 namespace {
 class FrameWorker {
 public:
@@ -1072,8 +1201,13 @@ public:
 				return;
 			}
 			queue.push_back(std::move(p_job));
-			if (!thread.joinable()) {
-				thread = std::thread([this] { loop(); });
+			if (threads.empty()) {
+				// (Leaving cores for the game's own threads; each frame's work
+				// is split over threads in places too.)
+				const int count = std::clamp((int)std::thread::hardware_concurrency() / 4, 1, 3);
+				for (int i = 0; i < count; i++) {
+					threads.emplace_back([this] { loop(); });
+				}
 			}
 		}
 		wake.notify_one();
@@ -1085,16 +1219,19 @@ public:
 			queue.clear();
 		}
 		wake.notify_all();
-		if (thread.joinable()) {
-			thread.join();
+		for (std::thread &t : threads) {
+			if (t.joinable()) {
+				t.join();
+			}
 		}
+		threads.clear();
 	}
 
 private:
 	std::mutex mutex;
 	std::condition_variable wake;
 	std::vector<std::function<void()>> queue;
-	std::thread thread;
+	std::vector<std::thread> threads;
 	bool stopping = false;
 	void loop() {
 		while (true) {
@@ -1993,7 +2130,8 @@ bool DensityShape::apply_brush(const Vector3 &p_center, double p_radius, double 
 		const Vector3 rp = rest_point(p_center, p_pose, p_weights);
 		target = one_key ? key_point(rp, p_key) : rp;
 	}
-	if (p_mode == ADD) {
+	// (Inflate, layer and clay strips build out too, unless carving.)
+	if (p_mode == ADD || ((p_mode == 5 || p_mode == LAYER || p_mode == 8) && p_strength > 0.0)) {
 		// Room for what it builds, plus a little air: past MAX_SIZE points a
 		// side, coarser voxels rather than a wall it can't build past.
 		const Vector3 room = Vector3(1, 1, 1) * (float)(p_radius + 2.0 * voxel_size);
@@ -2416,6 +2554,7 @@ void DensityShape::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("bake_meshes", "poses", "colors", "voxel_size", "margin"), &DensityShape::bake_meshes);
 	ClassDB::bind_method(D_METHOD("duplicate_shape"), &DensityShape::duplicate_shape);
 	ClassDB::bind_method(D_METHOD("resampled", "voxel_size"), &DensityShape::resampled);
+	ClassDB::bind_method(D_METHOD("mirrored", "point", "normal"), &DensityShape::mirrored);
 	ClassDB::bind_method(D_METHOD("to_dict"), &DensityShape::to_dict);
 	ClassDB::bind_static_method("DensityShape", D_METHOD("from_dict", "dict"), &DensityShape::from_dict);
 	ClassDB::bind_method(D_METHOD("get_density", "position", "pose", "weights"), &DensityShape::get_density, DEFVAL(0.0), DEFVAL(PackedFloat32Array()));
@@ -2535,9 +2674,9 @@ bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector
 			snake_centers = p_centers;
 		}
 	}
-	// Room for where it goes (the grid grows as for adding). A snake hook
-	// may make the voxels coarser to fit; a grab doesn't (it works from the
-	// shape as it began, which must keep its points).
+	// Room for where it goes (the grid grows as for adding): past MAX_SIZE
+	// points a side, coarser voxels (the grab's saved shape with them) rather
+	// than a wall the shape stops at.
 	{
 		Vector3 lo_l(1e30f, 1e30f, 1e30f), hi_l(-1e30f, -1e30f, -1e30f);
 		for (int i = 0; i < count; i++) {
@@ -2546,7 +2685,7 @@ bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector
 			hi_l = hi_l.max(a.max(b));
 		}
 		const Vector3 room = Vector3(1, 1, 1) * (float)(p_radius + 2.0 * voxel_size);
-		fit(lo_l - room, hi_l + room, !p_grab);
+		fit(lo_l - room, hi_l + room, true);
 	}
 	const size_t n = this->count();
 	if (p_grab && one_key && grab_key_density.size() != n) {
@@ -2815,9 +2954,9 @@ bool DensityShape::twist(const std::vector<Vector3> &p_centers, const std::vecto
 		lo_l = lo_l.min(cp.centre - Vector3(1, 1, 1) * cp.reach);
 		hi_l = hi_l.max(cp.centre + Vector3(1, 1, 1) * cp.reach);
 	}
-	// Room for where it goes (as a grab: no coarser voxels).
+	// Room for where it goes (as a grab: coarser voxels past MAX_SIZE).
 	const Vector3 room = Vector3(2, 2, 2) * (float)voxel_size;
-	fit(lo_l - room, hi_l + room, false);
+	fit(lo_l - room, hi_l + room, true);
 	const size_t n = this->count();
 	const float vs = (float)voxel_size, r = R / vs;
 	for (Copy &cp : copies) {

@@ -129,6 +129,11 @@ public:
 	// if that wouldn't fit in MAX_SIZE points a side: get_voxel_size() of the
 	// result says what it got.
 	Ref<DensityShape> resampled(double p_voxel_size) const;
+	// A copy with the side of the plane through p_point facing p_normal (body
+	// space) kept and the other side made its mirror image (rest shape,
+	// materials and every key, motions mirrored too): symmetric across it.
+	// The grid grows to hold the mirrored half (coarser past MAX_SIZE).
+	Ref<DensityShape> mirrored(const Vector3 &p_point, const Vector3 &p_normal) const;
 	// Compact form for save files (zstd).
 	Dictionary to_dict() const;
 	static Ref<DensityShape> from_dict(const Dictionary &p_dict);

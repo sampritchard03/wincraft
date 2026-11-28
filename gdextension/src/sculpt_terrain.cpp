@@ -975,7 +975,7 @@ void SculptTerrain::mark_edited(const Vector3i &p_min, const Vector3i &p_max) {
 	DensityBody3D::wake_near(Vector3(p_min), Vector3(p_max + Vector3i(1, 1, 1)), world.world_size());
 }
 
-int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key) {
+int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key, bool p_force) {
 	// Shared by every body drawing this shape in this frame (frogs share one).
 	const uint64_t id = p_shape->get_instance_id();
 	const int layers = std::clamp(p_shape->get_size().z, 1, GRID_SLOT);
@@ -990,6 +990,10 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 	if (found >= 0 && grid_slots[found].count != layers) {
 		grid_slots.erase(grid_slots.begin() + found); // grown: somewhere new
 		found = -1;
+	}
+	const bool upload = found < 0 || grid_slots[found].version != p_shape->get_version();
+	if (upload && !p_force && upload_budget < layers) {
+		return -1; // (next frame)
 	}
 	if (found < 0) {
 		// A run of free layers (first fit), making room by dropping what
@@ -1034,11 +1038,18 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 	if (s.version != p_shape->get_version()) {
 		PackedByteArray bytes;
 		bytes.resize(GRID_SLOT * GRID_SLOT * 3);
+		Ref<Image> image;
 		for (int z = 0; z < layers; z++) {
 			p_shape->fill_slice(p_key, z, bytes.ptrw());
-			body_atlas->update_layer(Image::create_from_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes), s.base + z);
+			if (image.is_null()) {
+				image = Image::create_from_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes);
+			} else {
+				image->set_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes);
+			}
+			body_atlas->update_layer(image, s.base + z);
 		}
 		s.version = p_shape->get_version();
+		upload_budget -= layers;
 	}
 	s.used = ++slot_clock;
 	return s.base;
@@ -1117,6 +1128,7 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		a->resize(MAX_GRID_BODIES);
 	}
 	frame_clock = slot_clock;
+	upload_budget = UPLOAD_LAYERS;
 	PackedFloat32Array highlights;
 	highlights.resize(MAX_GRID_BODIES);
 	highlights.fill(0.0f);
@@ -1133,15 +1145,29 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		const DensityShape::Blend &blend = d.body->get_blend();
 		float slots[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
 		float weights[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
-		bool placed = true;
-		for (int f = 0; f < blend.count && placed; f++) {
-			const int slot = grid_slot(d.body, shape, blend.frames[f]);
-			placed = slot >= 0;
-			slots[f] = (float)slot;
-			weights[f] = blend.weights[f];
+		// (The heaviest first: if the atlas is full, or this frame's uploads
+		// are spent, it's drawn with the frames that are there, the heaviest
+		// at least; one that can't be is left out, not every one after it.)
+		int placed = 0;
+		float total = 0.0f;
+		for (int f = 0; f < blend.count; f++) {
+			const int slot = grid_slot(d.body, shape, blend.frames[f], f == 0);
+			if (slot < 0) {
+				if (f == 0) {
+					break;
+				}
+				continue;
+			}
+			slots[placed] = (float)slot;
+			weights[placed] = blend.weights[f];
+			total += blend.weights[f];
+			placed++;
 		}
-		if (!placed) {
-			break;
+		if (placed == 0) {
+			continue;
+		}
+		for (int f = 0; f < placed; f++) {
+			weights[f] = total > 1e-6f ? weights[f] / total : (f == 0 ? 1.0f : 0.0f);
 		}
 		// World point -> grid point: (B^-1 (p - T) - origin) / voxel_size, for
 		// any basis B (a transformed selection may be scaled unevenly).

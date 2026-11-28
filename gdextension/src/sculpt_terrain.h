@@ -323,7 +323,7 @@ public:
 	// square, GRID_SLOTS * GRID_SLOT deep.
 	static constexpr int MAX_GRID_BODIES = 48; // terrain_shadow.gdshaderinc
 	static constexpr int GRID_SLOT = DensityShape::MAX_SIZE;
-	static constexpr int GRID_SLOTS = 24;
+	static constexpr int GRID_SLOTS = 31; // (31 x 64 layers: under the 2048 a texture array may have)
 
 	// Selection (selection.cpp): a set of points of the terrain, shown
 	// tinted. While anything is selected, brushes change only selected
@@ -521,8 +521,14 @@ private:
 	uint64_t frame_clock = 0; // slot_clock when this frame's binding began
 	// The first atlas layer holding p_body's p_shape's key p_key, uploading
 	// it if it isn't there or is out of date; -1 if there's no room (what
-	// this frame already uses stays).
-	int grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key);
+	// this frame already uses stays), or (unless p_force) this frame has
+	// uploaded as much as it may (upload_budget).
+	int grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key, bool p_force = false);
+	// Atlas layers a frame may still upload: animated creatures' new frames
+	// beyond it wait a frame or two (each shows the frames it has), so many
+	// at once don't stall the frame.
+	int upload_budget = 0;
+	static constexpr int UPLOAD_LAYERS = 4 * DensityShape::MAX_SIZE;
 	// Milliseconds a frame may spend loading chunks around the camera.
 	static constexpr double LOAD_BUDGET_MS = 3.0;
 
