@@ -207,6 +207,9 @@ public:
 	// One z slice of frame p_frame for the atlas: MAX_SIZE^2 RGB8 texels like
 	// the clipmap's (R density + 128, G B material, see render_bytes()).
 	void fill_slice(int p_frame, int p_z, uint8_t *r_texels) const;
+	// Layers [0, p_layers) at once (MAX_SIZE * MAX_SIZE * 3 bytes each), and the
+	// version of the shape the look is of.
+	int64_t fill_slices(int p_frame, int p_layers, uint8_t *r_texels) const;
 	// How the shape looks in a pose (and key weights): up to MAX_BLEND
 	// frames, their densities blended by weight (summing to 1), the heaviest
 	// first. With several key weights between steps, the frames are the
@@ -223,6 +226,8 @@ public:
 	// Whether frame p_frame is worked out for the shape as it is now (and
 	// still kept: a key weight mix's frame can be dropped for room).
 	bool frame_ready(int p_frame) const;
+	// The version of the shape a frame's look is of (-1: none yet).
+	int64_t frame_version(int p_frame) const;
 	// Has frame p_frame worked out on a background thread, unless it's ready
 	// or on its way (a body shows the frames it has meanwhile).
 	void request_frame(int p_frame) const;
@@ -252,6 +257,8 @@ private:
 		std::vector<float> density;
 		std::vector<MaterialId> materials; // empty: the rest shape's
 		std::vector<Vector3> to_rest; // the rest point (grid units) shown at each point; empty: the same point
+		Vector3i size; // the grid it's of (an edit since may have moved or resized it)
+		Vector3 origin;
 	};
 
 	Vector3i size;
@@ -274,8 +281,7 @@ private:
 	std::vector<Vector3> snake_centers, snake_offsets;
 	int64_t snake_version = -1;
 	uint32_t paint_serial = 0; // varies paint_color()'s rounding dither between calls
-	mutable std::unordered_map<int, std::vector<Vector4>> probe_cache;
-	mutable int64_t probe_version = -1;
+	mutable std::unordered_map<int, std::pair<int64_t, std::vector<Vector4>>> probe_cache; // frame -> (its version, probes)
 	// physical_properties() and mass_properties() of `mass_version` (they
 	// read every point: bodies changing pose, or sharing the shape, reuse them).
 	mutable int64_t mass_version = -1;
@@ -308,6 +314,7 @@ private:
 		std::vector<float> rest;
 		std::vector<Key> keys;
 		std::vector<MaterialId> materials;
+		Vector3 origin;
 		int64_t version = -1;
 	};
 	struct Job {
@@ -345,6 +352,11 @@ private:
 	void frame_keys(int p_frame, int &r_a, int &r_b, float &r_t) const;
 	int key_frame(int p_key) const;
 	const Frame &frame(int p_frame) const;
+	// The frame as last worked out, if it's of this grid (maybe from before
+	// the latest edits: a new one is asked for in the background), else frame().
+	const Frame &recent_frame(int p_frame) const;
+	// Whether a frame holds a look of this grid (of any version).
+	bool usable(const Frame &p_frame) const { return p_frame.version >= 0 && p_frame.size == size && p_frame.origin == origin && p_frame.density.size() == count(); }
 	// The shape at keys a, b blended by t: densities (distances repaired if
 	// it moves), materials and rest points (empty: the rest shape's / the
 	// same). p_residual: with the keys' residuals.
@@ -388,6 +400,12 @@ private:
 	// Makes the grid cover [p_lo, p_hi] (grid points, may be outside it now),
 	// as far as MAX_SIZE allows, keeping what's there.
 	void grow(Vector3i p_lo, Vector3i p_hi);
+	// The grid made to cover exactly old points [p_lo, p_hi] (outside the old
+	// grid: air, motion and material extended from its edge).
+	void regrid(const Vector3i &p_lo, const Vector3i &p_hi);
+	// Drops the air round what it holds (far enough that nothing it draws or
+	// any key moves changes): no detail lost. Returns whether it shrank.
+	bool trim();
 	// Halves the resolution: voxels twice as big, every other point kept
 	// (the grab's saved shape too).
 	void coarsen();

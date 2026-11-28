@@ -45,6 +45,9 @@ const TURN_R := "turn_r"
 ## expects (_model_forward()), for a model made facing elsewhere. Every one of
 ## a kind shares it (the object editor's "Faces" sets it; saved with the world).
 @export var facing_offset := 0.0
+## And tilted this many degrees up (+) or down from level, about its side:
+## for a model made leaning. Its up tilts with it (what it stands upright by).
+@export var facing_pitch := 0.0
 
 enum State { UP, DOWN, RIGHTING }
 
@@ -88,9 +91,23 @@ func _model_forward() -> Vector3:
 	return Vector3.RIGHT
 
 
+## Its model's own axes, from its body's: turned by facing_offset, tilted by facing_pitch.
+func _facing_basis() -> Basis:
+	var turned := Basis(Vector3.UP, deg_to_rad(facing_offset))
+	var side := _model_forward().cross(Vector3.UP)
+	if side.length_squared() < 1e-6 or absf(facing_pitch) < 1e-4:
+		return turned
+	return turned * Basis(side.normalized(), deg_to_rad(facing_pitch))
+
+
 ## Which way it faces (world space).
 func _forward() -> Vector3:
-	return global_basis * Basis(Vector3.UP, deg_to_rad(facing_offset)) * _model_forward()
+	return global_basis * (_facing_basis() * _model_forward())
+
+
+## Which way is up for it (world space): its body's up, tilted with its facing.
+func _up() -> Vector3:
+	return (global_basis * (_facing_basis() * Vector3.UP)).normalized()
 
 
 ## What it does on its own (walking, hopping), each physics frame. p_on_feet:
@@ -133,7 +150,7 @@ func on_feet() -> bool:
 func _physics_process(delta: float) -> void:
 	if has_meta("editing") or freeze:
 		return  # (the object editor has it, or it's pinned)
-	var up := global_basis.y.normalized()
+	var up := _up()
 	var tilt_angle := rad_to_deg(up.angle_to(Vector3.UP))
 	touching = get_contact_count() > 0
 	air_time = 0.0 if touching else air_time + delta

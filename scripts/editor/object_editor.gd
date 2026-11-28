@@ -31,10 +31,16 @@ extends Node
 ## chiggins): a plain physics object (P, Ctrl+O, a piece cut off) is loose
 ## ground, one shape, so for one the editor shows only its sculpting and
 ## physics settings.
+##
+## A frog or chiggin (creatures.gd): what's changed here (its shape,
+## animations, facing) is this one's own until "Update others" gives it to
+## the rest of its kind, or, marked unique, to those of its kind with the
+## same unique name.
 
 const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
 const PhysicsObject := preload("res://scripts/objects/physics_object.gd")
 const Entity := preload("res://scripts/objects/entities/entity.gd")
+const Creatures := preload("res://scripts/objects/entities/creatures.gd")
 
 var world: Node  # world.gd
 var active := false
@@ -94,11 +100,24 @@ var timeline: Timeline
 var file_dialog: FileDialog
 var facing_row: HBoxContainer
 var facing_spin: SpinBox
+var pitch_row: HBoxContainer
+var pitch_spin: SpinBox
+var group_row: Container  # Update others, unique (a creature)
+var unique_check: CheckBox
+var unique_name_edit: LineEdit
+var library_before: AnimationLibrary = null  # a creature's animations when it was opened
 var updating_ui := false  # filling the panels in: their signals are ignored
 var entity_controls: Array[Control] = []  # shown only for an entity (shape keys, animation)
 var plain_label: Label  # shown instead, for a plain physics object
 var seen_shape: DensityShape = null
 var seen_keys := -1
+## Dragging the centre of mass (not automatic): pressed on its star, it
+## follows the crosshair across the plane facing the camera.
+var com_dragging := false
+var com_drag_normal := Vector3.ZERO
+var com_drag_offset := Vector3.ZERO
+var com_drag_before := Vector3.ZERO
+var com_drag_was_auto := false
 
 
 func _ready() -> void:
@@ -120,6 +139,13 @@ func _ready() -> void:
 
 ## Handles an input event first; true if it was the editor's.
 func handle_input(event: InputEvent) -> bool:
+	if active and event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and world._captured():
+		if event.pressed and not com_dragging and is_instance_valid(body) and not body.auto_center_of_mass and _aiming_at_com():
+			_begin_com_drag()
+			return true
+		if not event.pressed and com_dragging:
+			_end_com_drag()
+			return true
 	if event is InputEventKey and event.pressed and not event.echo:
 		if get_viewport().gui_get_focus_owner() is LineEdit:
 			return false
@@ -160,6 +186,10 @@ func has_point(p_position: Vector2) -> bool:
 func _is_entity() -> bool:
 	return is_instance_valid(body) and PhysicsObject.body_is_entity(body)
 
+## A frog or chiggin (one of a kind: creatures.gd).
+func _is_creature() -> bool:
+	return is_instance_valid(body) and body.scene_file_path != "" and not body is DensityCharacter3D
+
 
 # --- Opening and closing ----------------------------------------------------
 
@@ -191,6 +221,13 @@ func open(p_body: DensityBody3D) -> void:
 	player.stop()  # (what it plays by itself: on again when the editor closes)
 	if not player.has_animation_library(""):
 		player.add_animation_library("", AnimationLibrary.new())
+	# A creature's animations: a copy of its own while it's edited (the
+	# rest of its kind keep theirs until Update others); put back on close
+	# if nothing changed.
+	library_before = null
+	if _is_creature():
+		library_before = Creatures.library_of(body)
+		Creatures.set_library(body, Creatures.copy_library(library_before))
 	var names := player.get_animation_list()
 	var plays: String = BodyAnimation.get_plays(body)
 	anim_name = plays if plays != "" else (names[0] if not names.is_empty() else "")
@@ -212,11 +249,15 @@ func open(p_body: DensityBody3D) -> void:
 func close() -> void:
 	if not active:
 		return
+	_end_com_drag()
 	active = false
 	ui.visible = false
 	line_mesh.clear_surfaces()
 	if is_instance_valid(body):
 		kept_targets[body.get_instance_id()] = [current_key, sculpt_target]
+		if library_before != null and Creatures.library_dict(Creatures.library_of(body)) == Creatures.library_dict(library_before):
+			Creatures.set_library(body, library_before)  # (unchanged: its kind's again)
+		library_before = null
 		body.remove_meta("editing")
 		body.edit_key = -1
 		body.freeze = was_frozen
@@ -255,6 +296,11 @@ func _process(_delta: float) -> void:
 		_refresh_ui()
 	if playing:
 		_show_weights()
+	if com_dragging:
+		if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or world.assume_captured:
+			_drag_com()
+		else:
+			_end_com_drag()
 	_draw_center_of_mass()
 	_update_status()
 	timeline.queue_redraw()
@@ -443,13 +489,57 @@ func _show_time() -> void:
 
 # --- Drawing --------------------------------------------------------------------
 
-## The centre of mass: a magenta star (dimmer while it's automatic).
+## How big the centre of mass's star is drawn (world units).
+func _com_star_size() -> float:
+	return maxf(world.camera.global_position.distance_to(body.get_global_center_of_mass()) * 0.012, 0.6) * 1.4
+
+## Whether the crosshair is on the centre of mass's star.
+func _aiming_at_com() -> bool:
+	var from: Vector3 = world.camera.global_position
+	var dir: Vector3 = -world.camera.global_basis.z
+	var com := body.get_global_center_of_mass()
+	var along := (com - from).dot(dir)
+	return along > 0.0 and (from + dir * along).distance_to(com) < _com_star_size() * 1.2
+
+func _com_plane_hit():
+	return Plane(com_drag_normal, body.get_global_center_of_mass()).intersects_ray(world.camera.global_position, -world.camera.global_basis.z)
+
+func _begin_com_drag() -> void:
+	com_dragging = true
+	com_drag_before = body.center_of_mass
+	com_drag_was_auto = body.auto_center_of_mass
+	com_drag_normal = -world.camera.global_basis.z
+	var hit = _com_plane_hit()
+	com_drag_offset = body.get_global_center_of_mass() - hit if hit != null else Vector3.ZERO
+
+func _drag_com() -> void:
+	if not is_instance_valid(body):
+		com_dragging = false
+		return
+	var hit = Plane(com_drag_normal, body.to_global(body.center_of_mass)).intersects_ray(world.camera.global_position, -world.camera.global_basis.z)
+	if hit == null:
+		return
+	body.center_of_mass = body.to_local(hit + com_drag_offset)
+	body.auto_center_of_mass = false
+
+func _end_com_drag() -> void:
+	if not com_dragging:
+		return
+	com_dragging = false
+	if is_instance_valid(body) and not body.center_of_mass.is_equal_approx(com_drag_before):
+		world._push_history({"com": body, "before": com_drag_before, "before_auto": com_drag_was_auto, "after": body.center_of_mass})
+	_refresh_ui()
+
+## The centre of mass: a magenta star (dimmer while it's automatic; white
+## while the crosshair's on it, to drag it, or it's being dragged).
 func _draw_center_of_mass() -> void:
 	line_mesh.clear_surfaces()
 	line_mesh.surface_begin(Mesh.PRIMITIVE_LINES)
 	var com := body.get_global_center_of_mass()
 	var color := Color(1.0, 0.3, 0.9) if not body.auto_center_of_mass else Color(0.8, 0.45, 0.75)
-	var size := maxf(world.camera.global_position.distance_to(com) * 0.012, 0.6) * 1.4
+	if not body.auto_center_of_mass and (com_dragging or _aiming_at_com()):
+		color = Color(1.0, 0.95, 1.0)
+	var size := _com_star_size()
 	for axis in [Vector3(1, 1, 0), Vector3(1, -1, 0), Vector3(0, 1, 1), Vector3(0, 1, -1), Vector3(1, 0, 1), Vector3(1, 0, -1)]:
 		var a: Vector3 = com - axis.normalized() * size
 		var b: Vector3 = com + axis.normalized() * size
@@ -462,12 +552,18 @@ func _draw_center_of_mass() -> void:
 		var forward: Vector3 = body._forward().normalized()
 		var length := size * 6.0
 		var tip := com + forward * length
-		var side := forward.cross(body.global_basis.y.normalized()).normalized() * size
+		var up: Vector3 = body._up() if body.has_method("_up") else body.global_basis.y.normalized()
+		var side := forward.cross(up).normalized() * size
 		for to in [com, tip - forward * size * 1.5 + side, tip - forward * size * 1.5 - side]:
 			line_mesh.surface_set_color(Color(1.0, 0.85, 0.1))
 			line_mesh.surface_add_vertex(tip if to != com else to)
 			line_mesh.surface_set_color(Color(1.0, 0.85, 0.1))
 			line_mesh.surface_add_vertex(to if to != com else tip)
+		# Its up (tilted with the facing): a shorter blue line.
+		line_mesh.surface_set_color(Color(0.3, 0.6, 1.0))
+		line_mesh.surface_add_vertex(com)
+		line_mesh.surface_set_color(Color(0.3, 0.6, 1.0))
+		line_mesh.surface_add_vertex(com + up * length * 0.6)
 	line_mesh.surface_end()
 
 
@@ -535,16 +631,46 @@ func _make_panels() -> void:
 	auto_com_check = _check(box, "Auto centre of mass", func(on: bool) -> void:
 		if is_instance_valid(body):
 			body.auto_center_of_mass = on)
+	auto_com_check.tooltip_text = "Off: drag the magenta star (aim at it, hold the left button) to move the centre of mass"
 	_button(box, "Centre of mass at the crosshair", _set_com_here)
 	facing_row = HBoxContainer.new()
 	box.add_child(facing_row)
 	facing_row.add_child(_label("Faces (degrees, the yellow arrow)"))
 	facing_spin = _spin(facing_row, -180.0, 180.0, 1.0, _set_facing)
-	facing_spin.tooltip_text = "Turns which way a frog or chiggin thinks it's facing (every one of its kind): for a model made facing another way"
+	facing_spin.tooltip_text = "Turns which way a frog or chiggin thinks it's facing (this one; Update others: the rest of its kind): for a model made facing another way"
 	for turn in [-90, 90]:
 		_button(facing_row, "%+d" % turn, func() -> void:
 			if is_instance_valid(body) and body.get("facing_offset") != null:
 				facing_spin.value = wrapf(body.facing_offset + turn, -180.0, 180.0))
+	pitch_row = HBoxContainer.new()
+	box.add_child(pitch_row)
+	pitch_row.add_child(_label("Tilts (degrees up, the blue line its up)"))
+	pitch_spin = _spin(pitch_row, -90.0, 90.0, 1.0, _set_pitch)
+	pitch_spin.tooltip_text = "Tilts which way it faces up (+) or down, its up with it (this one; Update others: the rest of its kind): for a model made leaning. It stands upright by its up"
+	for tilt in [-45, 45]:
+		_button(pitch_row, "%+d" % tilt, func() -> void:
+			if is_instance_valid(body) and body.get("facing_pitch") != null:
+				pitch_spin.value = clampf(body.facing_pitch + tilt, -90.0, 90.0))
+	group_row = VBoxContainer.new()
+	box.add_child(group_row)
+	var update_button := _button(group_row, "Update others", _update_others)
+	update_button.tooltip_text = "Gives this one's shape, shape keys, animations and facing to the rest of its kind (those not unique), or, if it's unique, to those of its kind with its unique name. Until then, what's changed here is this one's alone. Ctrl+Z undoes"
+	unique_check = _check(group_row, "Is unique", func(on: bool) -> void:
+		if is_instance_valid(body):
+			Creatures.set_unique(body, on, unique_name_edit.text)
+			_refresh_ui())
+	unique_check.tooltip_text = "Update others on the rest of its kind leaves this one as it is"
+	unique_name_edit = LineEdit.new()
+	unique_name_edit.placeholder_text = "Unique name (Enter)"
+	unique_name_edit.tooltip_text = "Update others on this one updates the others of its kind with this name (none if it's blank)"
+	var set_name := func(t: String) -> void:
+		if is_instance_valid(body):
+			Creatures.set_unique(body, true, t)
+	unique_name_edit.text_submitted.connect(func(t: String) -> void:
+		set_name.call(t)
+		unique_name_edit.release_focus())
+	unique_name_edit.text_changed.connect(set_name)
+	group_row.add_child(unique_name_edit)
 	autokey_check = _check(box, "Auto key the weight sliders", func(on: bool) -> void: auto_key = on)
 	autokey_check.set_pressed_no_signal(true)
 	# (Here, not along the bottom: that row is full.)
@@ -590,7 +716,7 @@ func _make_panels() -> void:
 		mirror_button.tooltip_text = "Once: cuts it in half at the mirror symmetry's plane (E on it; a creature's runs down its middle) and makes the other half this half's mirror image, shape keys too, so symmetry lines up. Ctrl+Z undoes. (Shift+E in the world: the side you're looking from)"
 	var files := HBoxContainer.new()
 	box.add_child(files)
-	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); on a frog or chiggin, every one of its kind. Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
+	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
 	_button(files, "Export model", _export_model)
 	_button(files, "Export scene", _export_scene)
 	make_default_button = _button(files, "Make game default", _make_default)
@@ -725,10 +851,31 @@ func _spin(p_box: Container, p_min: float, p_max: float, p_step: float, p_change
 func _set_facing(p_degrees: float) -> void:
 	if not is_instance_valid(body) or body.get("facing_offset") == null:
 		return
-	if body.scene_file_path != "":
-		world.creatures.set_kind_facing(body.scene_file_path, p_degrees)
+	body.facing_offset = p_degrees  # (a creature: this one, until Update others)
+
+func _set_pitch(p_degrees: float) -> void:
+	if not is_instance_valid(body) or body.get("facing_pitch") == null:
+		return
+	body.facing_pitch = p_degrees
+
+## Update others (creatures.gd, update_others()), as one undo step.
+func _update_others() -> void:
+	if not _is_creature():
+		return
+	var kind := body.scene_file_path.get_file().get_basename()
+	if Creatures.is_unique(body) and Creatures.unique_name_of(body) == "":
+		notice = "Unique with no name: nothing to update (give it a unique name)"
 	else:
-		body.facing_offset = p_degrees
+		var entry: Dictionary = world.creatures.update_others(body)
+		world._push_history(entry)
+		if entry.library != null:
+			library_before = entry.library  # (what it has now is the same as theirs)
+		var count: int = entry.members.size()
+		if Creatures.is_unique(body):
+			notice = "Updated %d other %s named %s" % [count, kind, Creatures.unique_name_of(body)]
+		else:
+			notice = "Updated %d other %s (and the kind: new ones start so)" % [count, kind]
+	notice_until = Time.get_ticks_msec() + 8000
 
 func _set_com_here() -> void:
 	if not is_instance_valid(body):
@@ -773,6 +920,15 @@ func _refresh_ui() -> void:
 	facing_row.visible = body.get("facing_offset") != null
 	if facing_row.visible:
 		facing_spin.set_value_no_signal(body.facing_offset)
+	pitch_row.visible = body.get("facing_pitch") != null
+	if pitch_row.visible:
+		pitch_spin.set_value_no_signal(body.facing_pitch)
+	group_row.visible = _is_creature()
+	if group_row.visible:
+		unique_check.set_pressed_no_signal(Creatures.is_unique(body))
+		unique_name_edit.visible = Creatures.is_unique(body)
+		if unique_name_edit.get_viewport() == null or not unique_name_edit.has_focus():
+			unique_name_edit.text = Creatures.unique_name_of(body)
 	# Its voxel size (one not offered is listed too, as it is).
 	voxel_select.clear()
 	var sizes: Array = VOXEL_SIZES.duplicate()
@@ -1005,6 +1161,8 @@ func _make_default() -> void:
 	if body.scene_file_path == "":
 		notice = "Only for a frog or chiggin (something with a scene of its own): Export scene makes one"
 	else:
+		if not Creatures.is_unique(body):
+			_update_others()  # (the rest of its kind here too: as they'd start)
 		notice = world.creatures.save_as_default(body)
 	notice_until = Time.get_ticks_msec() + 8000
 

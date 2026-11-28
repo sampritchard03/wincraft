@@ -41,6 +41,9 @@ uniform float water_clarity = 7.0;
 // Ripples on the surface (res://assets/block/water.png, set by world.gd).
 uniform sampler2D water_texture : filter_nearest_mipmap, repeat_enable;
 uniform float ambient_strength : hint_range(0.0, 1.0) = 0.45;
+// Off (J in the game, for painting): no sun shadows or ambient occlusion,
+// so colours read as they are.
+uniform bool shadows_on = true;
 
 // The selection (SculptTerrain.select_*()): a mask over its bounding box,
 // a texel per selection_cell points from selection_origin, layer = z.
@@ -353,10 +356,12 @@ void fragment() {
 		// when the clipmap grew, and every pixel paid for a shadow ray.
 		float shadow_fade = smoothstep(300.0, 700.0, t);
 		float shadow = 0.0;
-		if (diffuse > 0.0) {
+		if (!shadows_on) {
+			shadow = 1.0;
+		} else if (diffuse > 0.0) {
 			shadow = shadow_fade < 1.0 ? mix(sun_map_on ? sun_map_shadow(p, n, sun, scale) : sun_shadow(p, n, sun, scale), 1.0, shadow_fade) : 1.0;
 		}
-		float ao = ambient_occlusion(p, n, scale) * body_occlusion(p, n, sphere, grid);
+		float ao = shadows_on ? ambient_occlusion(p, n, scale) * body_occlusion(p, n, sphere, grid) : 1.0;
 		vec3 sky_light = mix(horizon_color * 0.5, sky_color, 0.5 + 0.5 * n.y) * ambient_strength;
 		color = albedo * (sun_color * diffuse * shadow + sky_light * ao);
 

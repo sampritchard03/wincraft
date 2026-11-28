@@ -79,6 +79,12 @@ inline float brush_falloff(float t) {
 	return brush_falloff(t, brush_options().falloff);
 }
 
+// Inflate: full over the inner half of the brush, then the falloff out to
+// its edge (a swelling, not a bump).
+inline float inflate_falloff(float t) {
+	return brush_falloff(std::max(t - 0.5f, 0.0f) * 2.0f);
+}
+
 // The distance the brush measures (from its middle): straight, or for a
 // cube the largest along any axis.
 inline float brush_distance(const Vector3 &d) {

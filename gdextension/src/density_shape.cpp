@@ -894,6 +894,11 @@ void DensityShape::update_layout() const {
 	}
 	layout_version = version;
 	const int k_count = (int)keys.size();
+	// (Kept if it comes out the same, as it nearly always does after a dab:
+	// the frames worked out, a dab or so behind, are shown until newer
+	// ones are done, rather than every one being worked out again now.)
+	const std::vector<int> old_gaps = gap_frames, old_steps = key_steps;
+	const size_t old_total = frames.size();
 	gap_frames.assign(std::max(k_count - 1, 0), 1);
 	const size_t n = count();
 	for (int g = 0; g + 1 < k_count; g++) {
@@ -916,8 +921,6 @@ void DensityShape::update_layout() const {
 	for (int f : gap_frames) {
 		total += f;
 	}
-	frames.clear();
-	frames.resize(total);
 	// Key weights round to steps that move no point much more than a voxel.
 	key_steps.assign(k_count, 1);
 	for (int k = 0; k < k_count; k++) {
@@ -935,6 +938,11 @@ void DensityShape::update_layout() const {
 			key_steps[k] = std::max(key_steps[k], 4);
 		}
 	}
+	if (gap_frames == old_gaps && key_steps == old_steps && old_total == (size_t)total) {
+		return;
+	}
+	frames.clear();
+	frames.resize(total);
 	cancel_jobs(-1);
 	combos.clear();
 	next_combo = COMBO_BASE;
@@ -1165,8 +1173,30 @@ const DensityShape::Frame &DensityShape::frame(int p_frame) const {
 		cancel_jobs(p_frame); // (needed now)
 		resolve_weights(frame_weights(p_frame), true, *f);
 		f->version = version;
+		f->size = size;
+		f->origin = origin;
 	}
 	return *f;
+}
+
+const DensityShape::Frame &DensityShape::recent_frame(int p_frame) const {
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	update_layout();
+	collect_jobs();
+	Frame *f = frame_slot(p_frame);
+	if (f != nullptr && f->version != version && usable(*f) && (f->to_rest.empty() || f->to_rest.size() == count())) {
+		request_frame(p_frame); // (a newer one, in the background)
+		return *f;
+	}
+	return frame(p_frame);
+}
+
+int64_t DensityShape::frame_version(int p_frame) const {
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	update_layout();
+	collect_jobs();
+	const Frame *f = frame_slot(p_frame);
+	return f != nullptr && usable(*f) ? f->version : -1;
 }
 
 bool DensityShape::frame_ready(int p_frame) const {
@@ -1280,6 +1310,7 @@ void DensityShape::request_frame(int p_frame) const {
 			copy->keys.push_back(std::move(c)); // (not the name: Strings stay on this thread)
 		}
 		copy->materials = materials;
+		copy->origin = origin;
 		copy->version = version;
 		source = copy;
 	}
@@ -1301,13 +1332,17 @@ void DensityShape::request_frame(int p_frame) const {
 void DensityShape::collect_jobs() const {
 	for (size_t i = 0; i < jobs.size();) {
 		Job &j = *jobs[i];
-		if (j.source->version != version) {
-			j.cancelled.store(true, std::memory_order_release); // (the shape changed)
+		if (j.source->size != size || j.source->origin != origin) {
+			j.cancelled.store(true, std::memory_order_release); // (the grid moved or resized: of no use)
 		} else if (j.done.load(std::memory_order_acquire)) {
+			// Done, even if edited since (while brushing, every frame): newer
+			// than what it had, so shown until one of the latest is done.
 			Frame *f = frame_slot(j.frame);
-			if (f != nullptr && f->version != version) {
+			if (f != nullptr && (f->version < j.source->version || !usable(*f))) {
 				*f = std::move(j.result);
-				f->version = version;
+				f->version = j.source->version;
+				f->size = j.source->size;
+				f->origin = j.source->origin;
 			}
 		} else {
 			i++;
@@ -1603,7 +1638,7 @@ float DensityShape::sample_blend(const Vector3 &p_grid, const Blend &p_blend) co
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
 	float d = 0.0f;
 	for (int i = 0; i < p_blend.count; i++) {
-		d += sample_grid(frame(p_blend.frames[i]).density, p_grid) * p_blend.weights[i];
+		d += sample_grid(recent_frame(p_blend.frames[i]).density, p_grid) * p_blend.weights[i];
 	}
 	return d;
 }
@@ -1651,8 +1686,8 @@ int DensityShape::get_material_at(const Vector3 &p_local, double p_pose, const P
 		std::lock_guard<std::recursive_mutex> lock(frame_mutex);
 		Blend blend;
 		pose_blend(p_pose, p_weights, blend);
-		const Frame &f = frame(blend.frames[0]);
-		if (!f.materials.empty()) {
+		const Frame &f = recent_frame(blend.frames[0]);
+		if (!f.materials.empty() && f.materials.size() == count()) {
 			return f.materials[index(x, y, z)];
 		}
 	}
@@ -1669,7 +1704,9 @@ Vector3 DensityShape::rest_grid_point(const Vector3 &p_grid, double p_pose, cons
 	const Vector3i last = size - Vector3i(1, 1, 1);
 	const Vector3i g = Vector3i(p_grid.round()).clamp(Vector3i(), last);
 	auto from = [&](int p_frame) {
-		const Frame &f = frame(p_frame);
+		// (One a dab or so old is near enough to find where the brush is,
+		// and isn't worked out anew, the whole grid, every dab.)
+		const Frame &f = recent_frame(p_frame);
 		if (f.to_rest.empty()) {
 			return p_grid;
 		}
@@ -1695,11 +1732,22 @@ Vector3 DensityShape::rest_grid_point(const Vector3 &p_grid, double p_pose, cons
 		// The anchor's rest point, moved as far as p_grid is from it.
 		return f.to_rest[index(anchor.x, anchor.y, anchor.z)] + (p_grid - Vector3(anchor));
 	};
+	// The frames worked out (a body shows those meanwhile: it's where the
+	// brush is seen to touch); the others are asked for in the background.
 	Vector3 r;
+	float total = 0.0f;
 	for (int i = 0; i < blend.count; i++) {
-		r += from(blend.frames[i]) * blend.weights[i];
+		if (frame_version(blend.frames[i]) >= 0) {
+			r += from(blend.frames[i]) * blend.weights[i];
+			total += blend.weights[i];
+		} else {
+			request_frame(blend.frames[i]);
+		}
 	}
-	return r;
+	if (total > 1e-4f) {
+		return r / total;
+	}
+	return from(blend.frames[0]); // (none yet: worked out now)
 }
 
 Vector3 DensityShape::rest_point(const Vector3 &p_local, double p_pose, const PackedFloat32Array &p_weights) const {
@@ -1728,6 +1776,10 @@ void DensityShape::grow(Vector3i p_lo, Vector3i p_hi) {
 		nlo[a] = -down;
 		nhi[a] = size[a] - 1 + up;
 	}
+	regrid(nlo, nhi);
+}
+
+void DensityShape::regrid(const Vector3i &nlo, const Vector3i &nhi) {
 	if (nlo == Vector3i() && nhi == size - Vector3i(1, 1, 1)) {
 		return;
 	}
@@ -1835,15 +1887,81 @@ void DensityShape::coarsen() {
 	version++;
 }
 
+bool DensityShape::trim() {
+	if (rest.size() != count()) {
+		return false;
+	}
+	// Points within reach of the surface (nearer than the clamp, in the rest
+	// shape or any key's), and where key motion takes them.
+	const float far = -DENSITY_CLAMP + 0.5f;
+	Vector3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+	auto hold = [&](const std::vector<float> &p_rest, const std::vector<Key> &p_keys) {
+		if (p_rest.size() != count()) {
+			return;
+		}
+		for (int z = 0; z < size.z; z++) {
+			for (int y = 0; y < size.y; y++) {
+				for (int x = 0; x < size.x; x++) {
+					const size_t i = index(x, y, z);
+					float most = p_rest[i];
+					for (const Key &k : p_keys) {
+						if (k.residual.size() == p_rest.size()) {
+							most = std::max(most, p_rest[i] + k.residual[i]);
+						}
+					}
+					if (most < far) {
+						continue;
+					}
+					const Vector3 p((float)x, (float)y, (float)z);
+					lo = lo.min(p);
+					hi = hi.max(p);
+					for (const Key &k : p_keys) {
+						if (k.motion.size() == p_rest.size()) {
+							lo = lo.min(p + k.motion[i]);
+							hi = hi.max(p + k.motion[i]);
+						}
+					}
+				}
+			}
+		}
+	};
+	hold(rest, keys);
+	hold(grab_rest, grab_keys);
+	if (lo.x > hi.x) {
+		return false; // (all air: left as it is)
+	}
+	const Vector3i m(2, 2, 2); // (a little air kept round it)
+	const Vector3i last = size - Vector3i(1, 1, 1);
+	const Vector3i nlo = (Vector3i((int)std::floor(lo.x), (int)std::floor(lo.y), (int)std::floor(lo.z)) - m).clamp(Vector3i(), last);
+	const Vector3i nhi = (Vector3i((int)std::ceil(hi.x), (int)std::ceil(hi.y), (int)std::ceil(hi.z)) + m).clamp(nlo, last);
+	if (nlo == Vector3i() && nhi == last) {
+		return false;
+	}
+	regrid(nlo, nhi);
+	return true;
+}
+
 void DensityShape::fit(const Vector3 &p_lo, const Vector3 &p_hi, bool p_coarsen) {
-	bool coarsened = false;
+	bool coarsened = false, trimmed = false;
 	while (p_coarsen && voxel_size * 2.0 <= MAX_VOXEL_SIZE) {
-		// The box with the grid, in points at the current voxel size.
-		const Vector3 grid_hi = origin + Vector3(size - Vector3i(1, 1, 1)) * (float)voxel_size;
-		const Vector3 extent = p_hi.max(grid_hi) - p_lo.min(origin);
-		const float points = std::max({ extent.x, extent.y, extent.z }) / (float)voxel_size + 2.0f;
-		if (points <= (float)MAX_SIZE) {
+		// The points the grid would need a side, with the box (as grow() counts them).
+		const float gvs = (float)voxel_size;
+		int points = 0;
+		for (int a = 0; a < 3; a++) {
+			const int blo = std::min((int)std::floor((p_lo[a] - origin[a]) / gvs), 0);
+			const int bhi = std::max((int)std::ceil((p_hi[a] - origin[a]) / gvs), size[a] - 1);
+			points = std::max(points, bhi - blo + 1);
+		}
+		if (points <= MAX_SIZE) {
 			break;
+		}
+		// Air round it goes before any detail does.
+		if (!trimmed) {
+			trimmed = true;
+			if (trim()) {
+				coarsened = true; // (changed: drawn anew)
+				continue;
+			}
 		}
 		coarsen();
 		coarsened = true;
@@ -1961,7 +2079,7 @@ bool DensityShape::brush_grid(std::vector<float> &r_values, std::vector<Material
 					} break;
 					case INFLATE:
 						if (std::abs(v) < C) {
-							after[i] = std::clamp(v + s * brush_falloff(dist / r), -C, C);
+							after[i] = std::clamp(v + s * inflate_falloff(dist / r), -C, C);
 						}
 						break;
 					case PINCH: {
@@ -2063,9 +2181,29 @@ void DensityShape::inherit_motion(const std::vector<float> &p_before, const Vect
 	}
 	// The box the edit (and its distance repair) can have changed, and round
 	// it, room to find what it was added onto.
-	const int M = 2 * ((int)std::ceil(DENSITY_CLAMP) + 1);
+	const int M = (int)std::ceil(DENSITY_CLAMP) + 1;
 	const Vector3i last = size - Vector3i(1, 1, 1), m(M, M, M);
-	const Vector3i lo = (p_lo - m).clamp(Vector3i(), last), hi = (p_hi + m).clamp(Vector3i(), last);
+	// The points that changed (the edit, and its distance repair round it),
+	// and round those, room to find what they were added onto.
+	const Vector3i elo = (p_lo - m).clamp(Vector3i(), last), ehi = (p_hi + m).clamp(Vector3i(), last);
+	Vector3i clo = ehi, chi = elo;
+	bool changed_any = false;
+	for (int z = elo.z; z <= ehi.z; z++) {
+		for (int y = elo.y; y <= ehi.y; y++) {
+			for (int x = elo.x; x <= ehi.x; x++) {
+				const size_t i = index(x, y, z);
+				if (p_before[i] <= 0.0f && rest[i] != p_before[i]) {
+					clo = clo.min(Vector3i(x, y, z));
+					chi = chi.max(Vector3i(x, y, z));
+					changed_any = true;
+				}
+			}
+		}
+	}
+	if (!changed_any) {
+		return;
+	}
+	const Vector3i lo = (clo - m).clamp(Vector3i(), last), hi = (chi + m).clamp(Vector3i(), last);
 	const Vector3i n = hi - lo + Vector3i(1, 1, 1);
 	auto sub_index = [&](int x, int y, int z) { return ((size_t)(z - lo.z) * n.y + (y - lo.y)) * n.x + (x - lo.x); };
 	// Breadth first from what was solid: each point's nearest solid point.
@@ -2401,18 +2539,22 @@ int DensityShape::paint_fill(const Vector3 &p_center, double p_threshold, int p_
 
 const std::vector<Vector4> &DensityShape::probes(int p_frame) const {
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
-	if (probe_version != version || probe_cache.size() > 256) {
+	if (probe_cache.size() > 256) {
 		probe_cache.clear();
-		probe_version = version;
 	}
 	static const std::vector<Vector4> none;
 	if (keys.empty()) {
 		return none;
 	}
-	std::vector<Vector4> &list = probe_cache[p_frame];
-	if (!list.empty()) {
+	// (Of the frame as it last was: while brushing, one a little behind.)
+	const int64_t of = recent_frame(p_frame).version;
+	auto &entry = probe_cache[p_frame];
+	std::vector<Vector4> &list = entry.second;
+	if (entry.first == of && !list.empty()) {
 		return list;
 	}
+	entry.first = of;
+	list.clear();
 	const std::vector<Vector4> skin = skin_points(p_frame);
 	// At most ~256: every n-th (in grid order, which spreads them evenly enough).
 	const size_t step = std::max<size_t>(1, (skin.size() + 255) / 256);
@@ -2430,7 +2572,7 @@ std::vector<Vector4> DensityShape::skin_points(int p_frame) const {
 	// Solid points next to air (the skin), each a sphere as big as its
 	// distance to the surface, so together they stand in for the surface.
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
-	const std::vector<float> &v = frame(p_frame).density;
+	const std::vector<float> &v = recent_frame(p_frame).density;
 	if (v.size() != count()) {
 		return skin;
 	}
@@ -2500,7 +2642,7 @@ void DensityShape::mass_properties_now(Vector3 &r_centroid, Basis &r_inertia) co
 
 void DensityShape::fill_slice(int p_frame, int p_z, uint8_t *r_texels) const {
 	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
-	const Frame *f = keys.empty() || p_frame < 0 ? nullptr : &frame(p_frame);
+	const Frame *f = keys.empty() || p_frame < 0 ? nullptr : &recent_frame(p_frame);
 	if (f != nullptr && f->density.size() != count()) {
 		f = nullptr;
 	}
@@ -2519,6 +2661,37 @@ void DensityShape::fill_slice(int p_frame, int p_z, uint8_t *r_texels) const {
 			}
 		}
 	}
+}
+
+int64_t DensityShape::fill_slices(int p_frame, int p_layers, uint8_t *r_texels) const {
+	std::lock_guard<std::recursive_mutex> lock(frame_mutex);
+	const Frame *f = keys.empty() || p_frame < 0 ? nullptr : &recent_frame(p_frame);
+	if (f != nullptr && f->density.size() != count()) {
+		f = nullptr;
+	}
+	const std::vector<MaterialId> &mats = f != nullptr && f->materials.size() == count() ? f->materials : materials;
+	const bool mats_ok = mats.size() == count();
+	const size_t layer_bytes = (size_t)MAX_SIZE * MAX_SIZE * 3;
+	for (int z = 0; z < p_layers; z++) {
+		uint8_t *layer = r_texels + layer_bytes * z;
+		for (int y = 0; y < MAX_SIZE; y++) {
+			uint8_t *t = layer + (size_t)y * MAX_SIZE * 3;
+			int x = 0;
+			if (f != nullptr && y < size.y && z < size.z) {
+				const size_t row = index(0, y, z);
+				for (; x < size.x; x++, t += 3) {
+					t[0] = (uint8_t)(quantize_density(f->density[row + x]) + 128);
+					render_bytes(mats_ok ? mats[row + x] : (MaterialId)MAT_STONE, t + 1);
+				}
+			}
+			for (; x < MAX_SIZE; x++, t += 3) {
+				t[0] = (uint8_t)(128 - DENSITY_LIMIT);
+				t[1] = (uint8_t)MAT_STONE;
+				t[2] = 0;
+			}
+		}
+	}
+	return f != nullptr ? f->version : version;
 }
 
 void DensityShape::_bind_methods() {
