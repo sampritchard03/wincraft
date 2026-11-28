@@ -145,7 +145,9 @@ public:
 		flatten_plane_set = true;
 	}
 	void clear_flatten_plane() { flatten_plane_set = false; }
-	bool paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness);
+	bool paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_scatter = 0.0, int p_seed = 0);
+	// Paint fill on the shape, in world space (see DensityShape.paint_fill()).
+	int paint_fill(const Vector3 &p_center, double p_threshold, int p_material, const Color &p_color, double p_opacity, double p_scatter, int p_seed);
 	// Grab and snake hook on the shape, in world space (as
 	// SculptTerrain.warp(), one centre): begin_grab(), then warp() each frame.
 	void begin_grab();

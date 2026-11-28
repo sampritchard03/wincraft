@@ -11,18 +11,17 @@ config_version=5
 [application]
 
 config/name="wincraft"
-config/quit_on_go_back=false
 run/main_scene="uid://bk5nw2xinihnd"
+config/quit_on_go_back=false
 config/features=PackedStringArray("4.7", "GL Compatibility")
-run/max_fps=0
 config/icon="res://icon.svg"
 
 [display]
 
 window/stretch/mode="viewport"
 window/stretch/aspect="expand"
-window/handheld/orientation=4
 display_server/driver.linuxbsd="wayland"
+window/handheld/orientation=4
 window/vsync/vsync_mode=0
 
 [dotnet]

@@ -76,7 +76,12 @@ var key_name_edit: LineEdit
 var plays_select: OptionButton
 var current_key := 0  # the key the key buttons act on
 var sculpt_target := -1  # what brushes edit: -1 all keys, -2 the current key, else that key
+var kept_targets := {}  # body instance id -> [current key, sculpt target] when it was last closed
 var physics_check: CheckBox
+var voxel_select: OptionButton
+## The voxel sizes offered (finer: more detail, but a smaller object fits:
+## MAX_SIZE points a side, 64).
+const VOXEL_SIZES := [2.0, 1.0, 0.5, 0.25, 0.125]
 var auto_com_check: CheckBox
 var autokey_check: CheckBox
 var anim_select: OptionButton
@@ -191,8 +196,11 @@ func open(p_body: DensityBody3D) -> void:
 	anim_name = plays if plays != "" else (names[0] if not names.is_empty() else "")
 	if not _has_pose_tracks():
 		body.pose = 0.0  # (keys are weighed in on top of key 0)
-	current_key = clampi(current_key, 0, maxi(body.shape.get_key_count() - 1, 0))
-	sculpt_target = -1
+	# The keys it was left on, if it's been open before.
+	var kept: Array = kept_targets.get(body.get_instance_id(), [current_key, -1])
+	var key_count := body.shape.get_key_count()
+	current_key = clampi(kept[0], 0, maxi(key_count - 1, 0))
+	sculpt_target = kept[1] if kept[1] < key_count else -1
 	body.edit_key = -1
 	time = 0.0
 	playing = false
@@ -208,6 +216,7 @@ func close() -> void:
 	ui.visible = false
 	line_mesh.clear_surfaces()
 	if is_instance_valid(body):
+		kept_targets[body.get_instance_id()] = [current_key, sculpt_target]
 		body.remove_meta("editing")
 		body.edit_key = -1
 		body.freeze = was_frozen
@@ -558,6 +567,19 @@ func _make_panels() -> void:
 	box.add_child(plays_select)
 	entity_controls = [keys_label, weights_box, key_row, key_name_edit, sculpt_label, edit_key_select,
 			autokey_check, plays_label, plays_select]
+	var voxel_row := HBoxContainer.new()
+	box.add_child(voxel_row)
+	var voxel_label := Label.new()
+	voxel_label.text = "Voxel size"
+	voxel_row.add_child(voxel_label)
+	voxel_select = OptionButton.new()
+	voxel_select.focus_mode = Control.FOCUS_NONE
+	voxel_select.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	voxel_select.tooltip_text = "How fine its voxels are (the brush is measured in them). Finer: more detail, but at most 64 a side, so a big object stays coarser"
+	voxel_select.item_selected.connect(func(i: int) -> void:
+		if not updating_ui:
+			set_voxel_size(voxel_select.get_item_metadata(i)))
+	voxel_row.add_child(voxel_select)
 	var files := HBoxContainer.new()
 	box.add_child(files)
 	_button(files, "Import model", _import_model).tooltip_text = "Replaces this one's model with a saved shape (.res); on a frog or chiggin, every one of its kind. Shape keys it hasn't got are kept, empty, so the animations still find them: sculpt them again"
@@ -743,6 +765,19 @@ func _refresh_ui() -> void:
 	facing_row.visible = body.get("facing_offset") != null
 	if facing_row.visible:
 		facing_spin.set_value_no_signal(body.facing_offset)
+	# Its voxel size (one not offered is listed too, as it is).
+	voxel_select.clear()
+	var sizes: Array = VOXEL_SIZES.duplicate()
+	var own: float = shape.get_voxel_size()
+	if not sizes.any(func(v: float) -> bool: return is_equal_approx(v, own)):
+		sizes.append(own)
+		sizes.sort()
+		sizes.reverse()
+	for v in sizes:
+		voxel_select.add_item(_voxel_text(v))
+		voxel_select.set_item_metadata(voxel_select.item_count - 1, v)
+		if is_equal_approx(v, own):
+			voxel_select.select(voxel_select.item_count - 1)
 	edit_key_select.clear()
 	edit_key_select.add_item("All keys (the shape itself)", -1)
 	edit_key_select.add_item("Current key (%s)" % shape.get_key_label(current_key), -2)
@@ -986,7 +1021,7 @@ func import_model_from(path: String) -> void:
 	var before: DensityShape = body.shape
 	var after: DensityShape = loaded.duplicate_shape()
 	if not _is_entity():
-		after = PhysicsObject.conform_shape(after)  # (one shape, terrain-sized voxels)
+		after = PhysicsObject.conform_shape(after)  # (one shape: no shape keys; its voxel size kept)
 	var own := after.get_key_count()
 	var old := before.get_key_count() if before != null and _is_entity() else 0
 	if own > 0:
@@ -1004,6 +1039,27 @@ func import_model_from(path: String) -> void:
 			"part_shapes": [], "part_transform": body.global_transform, "parts": []})
 	current_key = mini(current_key, maxi(after.get_key_count() - 1, 0))
 	notice = "Imported %s" % path.get_file() + (" (%d of its keys empty: sculpt them again)" % (old - own) if old > own and own > 0 else "")
+	notice_until = Time.get_ticks_msec() + 8000
+	_refresh_ui()
+
+static func _voxel_text(p_size: float) -> String:
+	return ("%.3f" % p_size).rstrip("0").rstrip(".")
+
+## Samples the body's shape again at p_size (its keys too), as one undo
+## step. A shape too big for that many voxels gets the finest that fits.
+func set_voxel_size(p_size: float) -> void:
+	if not is_instance_valid(body) or body.shape == null:
+		return
+	var before: DensityShape = body.shape
+	if is_equal_approx(before.get_voxel_size(), p_size):
+		return
+	var after: DensityShape = before.resampled(p_size)
+	body.shape = after
+	world._push_history({"body": body, "before": before, "after": after,
+			"part_shapes": [], "part_transform": body.global_transform, "parts": []})
+	var got := after.get_voxel_size()
+	notice = "Voxel size %s" % _voxel_text(got) + ("" if is_equal_approx(got, p_size) else
+			" (too big for %s: at most 64 voxels a side)" % _voxel_text(p_size))
 	notice_until = Time.get_ticks_msec() + 8000
 	_refresh_ui()
 

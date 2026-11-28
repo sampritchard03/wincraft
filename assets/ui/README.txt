@@ -16,7 +16,7 @@ Crosshair
 
 Tool icons (64x64, also in the bar): tool_ + the tool's name in lower case
   tool_draw, tool_inflate, tool_smooth, tool_pinch, tool_flatten, tool_grab,
-  tool_snake_hook, tool_paint, tool_select_paint, tool_select_fill,
+  tool_snake_hook, tool_paint, tool_paint_fill, tool_select_paint, tool_select_fill,
   tool_select_geometry, tool_extrude, tool_transform, tool_physics_gun,
   tool_geometry, tool_box, tool_rotate, tool_scale (tool_box_cut: unused)
 

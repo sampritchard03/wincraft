@@ -38,14 +38,13 @@ static func body_is_entity(p_body: Object) -> bool:
 
 
 ## p_shape as a plain physics object may have it: key 0 alone (the rest
-## shape), at terrain-sized voxels (resampled if finer). p_shape itself if it
-## already is; otherwise a new shape.
+## shape), at its own voxel size (finer than the terrain's is kept: the
+## object editor sets it; an export and import keeps it). p_shape itself if
+## it already is; otherwise a new shape.
 static func conform_shape(p_shape: DensityShape) -> DensityShape:
 	if p_shape == null:
 		return null
 	var shape := p_shape
-	if shape.get_voxel_size() < VOXEL_SIZE - 1e-4:
-		shape = ShapeBuilder.resample(shape, VOXEL_SIZE)
 	if shape.get_key_count() > 1:
 		if shape == p_shape:
 			shape = shape.duplicate_shape()

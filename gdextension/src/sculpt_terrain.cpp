@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <queue>
 
 using namespace godot;
 
@@ -1319,7 +1320,30 @@ MaterialId SculptTerrain::stroke_start_material(int x, int y, int z, MaterialId 
 	return recording.chunks[it->second].materials[((size_t)(z - c.z * C) * C + (y - c.y * C)) * C + (x - c.x * C)];
 }
 
-void SculptTerrain::paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness) {
+Color SculptTerrain::scatter_color(const Color &p_color, double p_scatter, int x, int y, int z, int p_seed) {
+	const float s = std::clamp((float)p_scatter, 0.0f, 1.0f);
+	if (s <= 0.0f) {
+		return p_color;
+	}
+	uint32_t h = (uint32_t)x * 0x8DA6B343u ^ (uint32_t)y * 0xD8163841u ^ (uint32_t)z * 0xCB1AB31Fu ^ (uint32_t)p_seed * 0x9E3779B9u;
+	auto next = [&]() { // -1 .. 1
+		h ^= h >> 15;
+		h *= 0x2C1B3C6Du;
+		h ^= h >> 12;
+		h *= 0x297A2D39u;
+		h ^= h >> 15;
+		return (float)(h & 0xFFFFFF) / (float)0x800000 - 1.0f;
+	};
+	// Mostly lighter or darker, a little of each channel on its own.
+	const float shade = next() * 0.3f * s;
+	Color out = p_color;
+	out.r = std::clamp(p_color.r + shade + next() * 0.08f * s, 0.0f, 1.0f);
+	out.g = std::clamp(p_color.g + shade + next() * 0.08f * s, 0.0f, 1.0f);
+	out.b = std::clamp(p_color.b + shade + next() * 0.08f * s, 0.0f, 1.0f);
+	return out;
+}
+
+void SculptTerrain::paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_scatter, int p_seed) {
 	ERR_FAIL_COND_MSG(!opened, "SculptTerrain: call open_world() first.");
 	if (p_radius <= 0.0) {
 		return;
@@ -1367,7 +1391,7 @@ void SculptTerrain::paint_color(const Vector3 &p_center, double p_radius, const 
 				}
 				had = want;
 				const Color base = get_material_color(stroke_start_material(x, y, z, materials_before[i]));
-				materials_after[i] = (MaterialId)color_to_material(base.lerp(p_color, opacity * want / 255.0f));
+				materials_after[i] = (MaterialId)color_to_material(base.lerp(scatter_color(p_color, p_scatter, x, y, z, p_seed), opacity * want / 255.0f));
 				any = true;
 			}
 		}
@@ -1377,6 +1401,147 @@ void SculptTerrain::paint_color(const Vector3 &p_center, double p_radius, const 
 	}
 	const std::vector<uint8_t> brushed(before.size(), 0);
 	commit_edit(lo, hi, lo, n, before, before, brushed, true, materials_before, materials_after);
+}
+
+int SculptTerrain::paint_fill(const Vector3 &p_from, double p_radius, double p_threshold, int p_material, const Color &p_color, double p_opacity, double p_scatter, int p_seed) {
+	ERR_FAIL_COND_V_MSG(!opened, 0, "SculptTerrain: call open_world() first.");
+	const int C = VoxelWorld::CHUNK;
+	const int R = std::clamp((int)std::ceil(p_radius), 1, 256);
+	const float SKIN = 2.5f; // the points that show the surface's material (as paint_color())
+	// Points are read a chunk at a time, as the fill reaches them.
+	struct Block {
+		std::vector<float> density;
+		std::vector<MaterialId> materials;
+		std::vector<uint8_t> seen;
+	};
+	std::unordered_map<Vector3i, Block, Vector3iHash> blocks;
+	auto block_of = [&](const Vector3i &p) -> std::pair<Block *, size_t> {
+		const Vector3i c = VoxelWorld::chunk_of(p.x, p.y, p.z);
+		Block &b = blocks[c];
+		if (b.density.empty()) {
+			b.density.resize((size_t)C * C * C);
+			b.materials.resize(b.density.size());
+			b.seen.assign(b.density.size(), 0);
+			world.read_points(c * C, c * C + Vector3i(C - 1, C - 1, C - 1), b.density.data(), 1, b.materials.data());
+		}
+		return { &b, ((size_t)(p.z - c.z * C) * C + (p.y - c.y * C)) * C + (p.x - c.x * C) };
+	};
+	// From the most solid point next to where the ray hit.
+	const Vector3i centre((int)std::lround(p_from.x), (int)std::lround(p_from.y), (int)std::lround(p_from.z));
+	Vector3i start = centre;
+	float best = -1e9f;
+	for (int dz = -1; dz <= 1; dz++) {
+		for (int dy = -1; dy <= 1; dy++) {
+			for (int dx = -1; dx <= 1; dx++) {
+				const Vector3i q = centre + Vector3i(dx, dy, dz);
+				auto [b, i] = block_of(q);
+				if (b->density[i] > best) {
+					best = b->density[i];
+					start = q;
+				}
+			}
+		}
+	}
+	if (best <= 0.0f) {
+		return 0;
+	}
+	Color want;
+	{
+		auto [b, i] = block_of(start);
+		want = get_material_color(b->materials[i]);
+		b->seen[i] = 1;
+	}
+	auto accept = [&](const Vector3i &q, Block *b, size_t i) {
+		const float d = b->density[i];
+		if (d <= 0.0f || d >= SKIN) {
+			return false; // only the surface's skin: a fill doesn't spread through the ground inside
+		}
+		if (selected_count > 0 && !is_selected(q.x, q.y, q.z)) {
+			return false;
+		}
+		const Color c = get_material_color(b->materials[i]);
+		const float dr = c.r - want.r, dg = c.g - want.g, db = c.b - want.b;
+		return std::sqrt(dr * dr + dg * dg + db * db) <= (float)p_threshold + 1e-4f;
+	};
+	// Breadth first through the solid skin, within R of the start.
+	std::vector<Vector3i> found;
+	std::queue<Vector3i> todo;
+	todo.push(start);
+	const Vector3i steps[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+	const size_t LIMIT = 4u << 20;
+	while (!todo.empty() && found.size() < LIMIT) {
+		const Vector3i p = todo.front();
+		todo.pop();
+		found.push_back(p);
+		for (const Vector3i &s : steps) {
+			const Vector3i q = p + s;
+			if ((q - start).length_squared() > R * R) {
+				continue;
+			}
+			auto [b, i] = block_of(q);
+			if (!b->seen[i] && accept(q, b, i)) {
+				b->seen[i] = 1;
+				todo.push(q);
+			}
+		}
+	}
+	// And the skin of air just outside it (painted too, as paint_color()
+	// does: the surface between shows a mix of both), two steps deep.
+	const size_t solid_count = found.size();
+	{
+		std::vector<std::pair<Vector3i, int>> air;
+		for (size_t k = 0; k < solid_count; k++) {
+			air.push_back({ found[k], 0 });
+		}
+		for (size_t k = 0; k < air.size(); k++) {
+			const auto [p, depth] = air[k];
+			if (depth >= 2) {
+				continue;
+			}
+			for (const Vector3i &s : steps) {
+				const Vector3i q = p + s;
+				auto [b, i] = block_of(q);
+				if (!b->seen[i] && b->density[i] <= 0.0f && b->density[i] > -SKIN) {
+					b->seen[i] = 1;
+					found.push_back(q);
+					air.push_back({ q, depth + 1 });
+				}
+			}
+		}
+	}
+	if (found.empty()) {
+		return 0;
+	}
+	Vector3i lo = found[0], hi = found[0];
+	for (const Vector3i &p : found) {
+		lo = Vector3i(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
+		hi = Vector3i(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
+	}
+	const Vector3i n = hi - lo + Vector3i(1, 1, 1);
+	std::vector<float> before((size_t)n.x * n.y * n.z);
+	std::vector<MaterialId> materials_before(before.size());
+	world.read_points(lo, hi, before.data(), worker_count(), materials_before.data());
+	std::vector<MaterialId> materials_after = materials_before;
+	const float opacity = std::clamp((float)p_opacity, 0.0f, 1.0f);
+	bool any = false;
+	for (const Vector3i &p : found) {
+		const size_t i = ((size_t)(p.z - lo.z) * n.y + (p.y - lo.y)) * n.x + (p.x - lo.x);
+		MaterialId next;
+		if (p_material >= 0) {
+			next = (MaterialId)p_material;
+		} else {
+			const Color base = get_material_color(materials_before[i]);
+			next = (MaterialId)color_to_material(base.lerp(scatter_color(p_color, p_scatter, p.x, p.y, p.z, p_seed), opacity));
+		}
+		any |= next != materials_before[i];
+		materials_after[i] = next;
+	}
+	if (!any) {
+		return 0;
+	}
+	const std::vector<uint8_t> brushed(before.size(), 0);
+	commit_edit(lo, hi, lo, n, before, before, brushed, true, materials_before, materials_after);
+	return (int)found.size();
 }
 
 PackedStringArray SculptTerrain::get_material_names() {
@@ -2255,6 +2420,11 @@ void SculptTerrain::warp(const PackedVector3Array &p_centers, const PackedVector
 			for (int y = lo.y; y <= hi.y; y++) {
 				for (int x = lo.x; x <= hi.x; x++) {
 					const Vector3 p((float)x, (float)y, (float)z);
+					// Each copy that moves p offers the most solid of its own
+					// roots; the most solid of those wins (where copies
+					// overlap). A copy that doesn't move p offers nothing: its
+					// "stays put" mustn't win over another copy's move (with
+					// symmetry, pulling inward left the solid where it was).
 					bool moved = false;
 					float value = -INFINITY;
 					Vector3 from = p; // where the winning value came from
@@ -2265,26 +2435,17 @@ void SculptTerrain::warp(const PackedVector3Array &p_centers, const PackedVector
 						const float dd = delta.length_squared();
 						const float t = dd > 0.0f ? std::clamp((p - centre).dot(delta) / dd, 0.0f, 1.0f) : 0.0f;
 						if ((p - centre - delta * t).length_squared() >= r * r) {
-							const float v = source(p);
-							if (v > value) {
-								value = v;
-								from = p;
-							}
-							moved = true;
 							continue;
 						}
 						auto h = [&](float s) { return falloff((p - delta * s - centre).length() / r) - s; };
 						float s0 = 0.0f, h0 = h(0.0f);
+						bool copy_moves = false;
+						float copy_value = -INFINITY;
+						Vector3 copy_from = p;
 						if (h0 <= 0.0f) {
-							// s = 0 is a root: the point's own material (when
-							// beyond this copy's reach) stays, unless more
-							// solid material lands on it.
-							const float v = source(p);
-							if (v > value) {
-								value = v;
-								from = p;
-							}
-							moved = true;
+							// s = 0 is a root: the point's own material stays,
+							// unless more solid material lands on it.
+							copy_value = source(p);
 						}
 						for (int k = 1; k <= SCAN; k++) {
 							const float s1 = (float)k / SCAN, h1 = h(s1);
@@ -2296,14 +2457,19 @@ void SculptTerrain::warp(const PackedVector3Array &p_centers, const PackedVector
 								}
 								const Vector3 q = p - delta * ((a + b) * 0.5f);
 								const float v = source(q);
-								if (v > value) {
-									value = v;
-									from = q;
+								if (v > copy_value) {
+									copy_value = v;
+									copy_from = q;
 								}
-								moved = true;
+								copy_moves = true;
 							}
 							s0 = s1;
 							h0 = h1;
+						}
+						if (copy_moves && copy_value > value) {
+							value = copy_value;
+							from = copy_from;
+							moved = true;
 						}
 					}
 					after[index(x, y, z)] = moved ? value : snapshot_point(x, y, z);
@@ -2696,7 +2862,8 @@ void SculptTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("update_view", "camera_position", "wait"), &SculptTerrain::update_view, DEFVAL(false));
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material"), &SculptTerrain::apply_brush, DEFVAL(-1));
 	ClassDB::bind_method(D_METHOD("get_block_material", "position"), &SculptTerrain::get_block_material);
-	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness"), &SculptTerrain::paint_color);
+	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness", "scatter", "seed"), &SculptTerrain::paint_color, DEFVAL(0.0), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("paint_fill", "from", "radius", "threshold", "material", "color", "opacity", "scatter", "seed"), &SculptTerrain::paint_fill);
 	ClassDB::bind_method(D_METHOD("set_material_colors", "colors"), &SculptTerrain::set_material_colors);
 	ClassDB::bind_method(D_METHOD("get_material_color", "material"), &SculptTerrain::get_material_color);
 	ClassDB::bind_static_method("SculptTerrain", D_METHOD("color_to_material", "color"), &SculptTerrain::color_to_material);

@@ -607,6 +607,110 @@ Ref<DensityShape> DensityShape::duplicate_shape() const {
 	return copy;
 }
 
+Ref<DensityShape> DensityShape::resampled(double p_voxel_size) const {
+	if (keys.empty() || rest.empty()) {
+		return duplicate_shape();
+	}
+	const float C = DENSITY_CLAMP;
+	// What it holds: points near or inside a surface, in the rest shape or
+	// any key's (a key's motion moves them; its residual adds some).
+	Vector3 lo(1e30f, 1e30f, 1e30f), hi(-1e30f, -1e30f, -1e30f);
+	for (int z = 0; z < size.z; z++) {
+		for (int y = 0; y < size.y; y++) {
+			for (int x = 0; x < size.x; x++) {
+				const size_t i = index(x, y, z);
+				float most = rest[i];
+				for (const Key &k : keys) {
+					if (!k.residual.empty()) {
+						most = std::max(most, rest[i] + k.residual[i]);
+					}
+				}
+				if (most < -2.0f) {
+					continue;
+				}
+				const Vector3 p((float)x, (float)y, (float)z);
+				lo = lo.min(p);
+				hi = hi.max(p);
+				for (const Key &k : keys) {
+					if (!k.motion.empty()) {
+						lo = lo.min(p + k.motion[i]);
+						hi = hi.max(p + k.motion[i]);
+					}
+				}
+			}
+		}
+	}
+	if (lo.x > hi.x) {
+		return duplicate_shape();
+	}
+	const float old_vs = (float)voxel_size;
+	// A couple of old voxels' room round it, in body space.
+	const Vector3 room(2.0f, 2.0f, 2.0f);
+	const Vector3 blo = origin + (lo - room) * old_vs, bhi = origin + (hi + room) * old_vs;
+	double vs = std::clamp(p_voxel_size, 0.01, MAX_VOXEL_SIZE);
+	Vector3i n;
+	for (;;) {
+		const Vector3 extent = (bhi - blo) / (float)vs;
+		n = Vector3i((int)std::ceil(extent.x) + 1, (int)std::ceil(extent.y) + 1, (int)std::ceil(extent.z) + 1);
+		if ((n.x <= MAX_SIZE && n.y <= MAX_SIZE && n.z <= MAX_SIZE) || vs * 2.0 > MAX_VOXEL_SIZE) {
+			break;
+		}
+		vs *= 2.0;
+	}
+	n = n.clamp(Vector3i(2, 2, 2), Vector3i(MAX_SIZE, MAX_SIZE, MAX_SIZE));
+	const float k = old_vs / (float)vs; // old voxels -> new
+	const size_t ncount = (size_t)n.x * n.y * n.z;
+	// Plain trilinear (not a distance: no fall-off past the edge).
+	auto sample_plain = [&](const std::vector<float> &v, const Vector3 &q) {
+		const Vector3 c = q.clamp(Vector3(), Vector3(size - Vector3i(1, 1, 1)));
+		const int x0 = std::min((int)c.x, size.x - 1), y0 = std::min((int)c.y, size.y - 1), z0 = std::min((int)c.z, size.z - 1);
+		const int x1 = std::min(x0 + 1, size.x - 1), y1 = std::min(y0 + 1, size.y - 1), z1 = std::min(z0 + 1, size.z - 1);
+		const float fx = c.x - x0, fy = c.y - y0, fz = c.z - z0;
+		auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+		return lerp(lerp(lerp(v[index(x0, y0, z0)], v[index(x1, y0, z0)], fx), lerp(v[index(x0, y1, z0)], v[index(x1, y1, z0)], fx), fy),
+				lerp(lerp(v[index(x0, y0, z1)], v[index(x1, y0, z1)], fx), lerp(v[index(x0, y1, z1)], v[index(x1, y1, z1)], fx), fy), fz);
+	};
+	Ref<DensityShape> copy;
+	copy.instantiate();
+	copy->size = n;
+	copy->origin = blo;
+	copy->voxel_size = vs;
+	copy->rest.resize(ncount);
+	copy->materials.resize(ncount);
+	copy->keys.resize(keys.size());
+	for (size_t kk = 0; kk < keys.size(); kk++) {
+		copy->keys[kk].name = keys[kk].name;
+		if (!keys[kk].motion.empty()) {
+			copy->keys[kk].motion.resize(ncount);
+		}
+		if (!keys[kk].residual.empty()) {
+			copy->keys[kk].residual.resize(ncount);
+		}
+	}
+	for (int z = 0; z < n.z; z++) {
+		for (int y = 0; y < n.y; y++) {
+			for (int x = 0; x < n.x; x++) {
+				const size_t j = ((size_t)z * n.y + y) * n.x + x;
+				const Vector3 q = (blo + Vector3((float)x, (float)y, (float)z) * (float)vs - origin) / old_vs;
+				copy->rest[j] = std::clamp(sample_grid(rest, q) * k, -C, C);
+				const Vector3i near = Vector3i((int)std::lround(q.x), (int)std::lround(q.y), (int)std::lround(q.z)).clamp(Vector3i(), size - Vector3i(1, 1, 1));
+				copy->materials[j] = materials.empty() ? (MaterialId)MAT_STONE : materials[index(near.x, near.y, near.z)];
+				for (size_t kk = 0; kk < keys.size(); kk++) {
+					if (!keys[kk].motion.empty()) {
+						copy->keys[kk].motion[j] = sample_motion(keys[kk].motion, q) * k;
+					}
+					if (!keys[kk].residual.empty()) {
+						copy->keys[kk].residual[j] = sample_plain(keys[kk].residual, q) * k;
+					}
+				}
+			}
+		}
+	}
+	density_redistance(copy->rest, n);
+	copy->edited = true;
+	return copy;
+}
+
 Dictionary DensityShape::to_dict() const {
 	Dictionary d;
 	d["size"] = size;
@@ -1969,7 +2073,7 @@ bool DensityShape::apply_brush(const Vector3 &p_center, double p_radius, double 
 	return any;
 }
 
-bool DensityShape::paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_pose, const PackedFloat32Array &p_weights) {
+bool DensityShape::paint_color(const Vector3 &p_center, double p_radius, const Color &p_color, double p_opacity, double p_hardness, double p_pose, const PackedFloat32Array &p_weights, double p_scatter, int p_seed) {
 	if (keys.empty() || p_radius <= 0.0) {
 		return false;
 	}
@@ -1989,8 +2093,13 @@ bool DensityShape::paint_color(const Vector3 &p_center, double p_radius, const C
 		}
 	}
 	// What the brush lays down, in the 5-bit steps a color material has.
-	const float target_color[3] = { (float)std::lround(std::clamp(p_color.r, 0.0f, 1.0f) * 31.0f), (float)std::lround(std::clamp(p_color.g, 0.0f, 1.0f) * 31.0f),
-		(float)std::lround(std::clamp(p_color.b, 0.0f, 1.0f) * 31.0f) };
+	auto target_of = [](const Color &p_c, float r_target[3]) {
+		r_target[0] = (float)std::lround(std::clamp(p_c.r, 0.0f, 1.0f) * 31.0f);
+		r_target[1] = (float)std::lround(std::clamp(p_c.g, 0.0f, 1.0f) * 31.0f);
+		r_target[2] = (float)std::lround(std::clamp(p_c.b, 0.0f, 1.0f) * 31.0f);
+	};
+	float target_color[3];
+	target_of(p_color, target_color);
 	const SculptTerrain *terrain = SculptTerrain::get_singleton();
 	paint_serial++;
 	bool any = false;
@@ -2028,6 +2137,9 @@ bool DensityShape::paint_color(const Vector3 &p_center, double p_radius, const C
 				// short of the paint, the old one showing through; a dither
 				// makes the steps add up on average.
 				const float d = dither(x, y, z, paint_serial);
+				if (p_scatter > 0.0) {
+					target_of(SculptTerrain::scatter_color(p_color, p_scatter, x, y, z, p_seed), target_color);
+				}
 				int channel[3];
 				for (int a = 0; a < 3; a++) {
 					channel[a] = std::clamp((int)std::floor(from[a] + (target_color[a] - from[a]) * t + d), 0, 31);
@@ -2045,6 +2157,106 @@ bool DensityShape::paint_color(const Vector3 &p_center, double p_radius, const C
 		changed();
 	}
 	return any;
+}
+
+int DensityShape::paint_fill(const Vector3 &p_center, double p_threshold, int p_material, const Color &p_color, double p_opacity, double p_scatter, int p_seed, double p_pose, const PackedFloat32Array &p_weights) {
+	if (keys.empty() || rest.empty()) {
+		return 0;
+	}
+	const Vector3 target = has_motion() ? rest_point(p_center, p_pose, p_weights) : p_center;
+	const Vector3 c = (target - origin) / (float)voxel_size;
+	const SculptTerrain *terrain = SculptTerrain::get_singleton();
+	auto color_of = [&](MaterialId m) {
+		return terrain != nullptr ? terrain->get_material_color(m)
+								  : (is_color_material(m) ? Color(((m >> 10) & 31) / 31.0f, ((m >> 5) & 31) / 31.0f, (m & 31) / 31.0f) : Color(0.5f, 0.5f, 0.5f));
+	};
+	// How near a surface a point is: the rest shape's, or a key's that
+	// doesn't move (as paint_color()).
+	auto nearest = [&](size_t i) {
+		float v = std::abs(rest[i]);
+		for (const Key &k : keys) {
+			if (k.motion.empty() && !k.residual.empty()) {
+				v = std::min(v, std::abs(rest[i] + k.residual[i]));
+			}
+		}
+		return v;
+	};
+	const float SKIN = 2.5f;
+	auto inside = [&](const Vector3i &q) { return q.x >= 0 && q.y >= 0 && q.z >= 0 && q.x < size.x && q.y < size.y && q.z < size.z; };
+	// From the most solid point next to where the ray hit.
+	const Vector3i centre((int)std::lround(c.x), (int)std::lround(c.y), (int)std::lround(c.z));
+	Vector3i start = centre;
+	float best = -1e9f;
+	for (int dz = -1; dz <= 1; dz++) {
+		for (int dy = -1; dy <= 1; dy++) {
+			for (int dx = -1; dx <= 1; dx++) {
+				const Vector3i q = centre + Vector3i(dx, dy, dz);
+				if (inside(q) && rest[index(q.x, q.y, q.z)] > best) {
+					best = rest[index(q.x, q.y, q.z)];
+					start = q;
+				}
+			}
+		}
+	}
+	if (best <= 0.0f) {
+		return 0;
+	}
+	const Color want = color_of(materials[index(start.x, start.y, start.z)]);
+	std::vector<uint8_t> seen(count(), 0);
+	auto accept = [&](size_t i) {
+		if (rest[i] <= 0.0f || nearest(i) >= SKIN) {
+			return false;
+		}
+		const Color m = color_of(materials[i]);
+		const float dr = m.r - want.r, dg = m.g - want.g, db = m.b - want.b;
+		return std::sqrt(dr * dr + dg * dg + db * db) <= (float)p_threshold + 1e-4f;
+	};
+	const Vector3i steps[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+	std::vector<Vector3i> found;
+	std::vector<int> depth; // air: steps out from the solid found
+	seen[index(start.x, start.y, start.z)] = 1;
+	found.push_back(start);
+	depth.push_back(0);
+	for (size_t k = 0; k < found.size(); k++) {
+		const Vector3i p = found[k];
+		const bool solid = depth[k] == 0;
+		for (const Vector3i &s : steps) {
+			const Vector3i q = p + s;
+			if (!inside(q)) {
+				continue;
+			}
+			const size_t i = index(q.x, q.y, q.z);
+			if (seen[i]) {
+				continue;
+			}
+			if (solid && accept(i)) {
+				seen[i] = 1;
+				found.push_back(q);
+				depth.push_back(0);
+			} else if (rest[i] <= 0.0f && nearest(i) < SKIN && depth[k] < 2) {
+				// The skin of air just outside it, two steps deep.
+				seen[i] = 1;
+				found.push_back(q);
+				depth.push_back(depth[k] + 1);
+			}
+		}
+	}
+	const float opacity = std::clamp((float)p_opacity, 0.0f, 1.0f);
+	int painted = 0;
+	for (const Vector3i &p : found) {
+		const size_t i = index(p.x, p.y, p.z);
+		const MaterialId next = p_material >= 0 ? (MaterialId)p_material
+												: (MaterialId)SculptTerrain::color_to_material(color_of(materials[i]).lerp(SculptTerrain::scatter_color(p_color, p_scatter, p.x, p.y, p.z, p_seed), opacity));
+		if (next != materials[i]) {
+			materials[i] = next;
+			painted++;
+		}
+	}
+	if (painted > 0) {
+		edited = true;
+		changed();
+	}
+	return painted;
 }
 
 // --- For bodies and drawing ----------------------------------------------------------
@@ -2203,6 +2415,7 @@ void DensityShape::_bind_methods() {
 	ClassDB::bind_static_method("DensityShape", D_METHOD("make_sphere", "radius", "material", "stripe_material", "voxel_size"), &DensityShape::make_sphere, DEFVAL(-1), DEFVAL(1.0));
 	ClassDB::bind_method(D_METHOD("bake_meshes", "poses", "colors", "voxel_size", "margin"), &DensityShape::bake_meshes);
 	ClassDB::bind_method(D_METHOD("duplicate_shape"), &DensityShape::duplicate_shape);
+	ClassDB::bind_method(D_METHOD("resampled", "voxel_size"), &DensityShape::resampled);
 	ClassDB::bind_method(D_METHOD("to_dict"), &DensityShape::to_dict);
 	ClassDB::bind_static_method("DensityShape", D_METHOD("from_dict", "dict"), &DensityShape::from_dict);
 	ClassDB::bind_method(D_METHOD("get_density", "position", "pose", "weights"), &DensityShape::get_density, DEFVAL(0.0), DEFVAL(PackedFloat32Array()));
@@ -2211,7 +2424,8 @@ void DensityShape::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("rest_point", "position", "pose", "weights"), &DensityShape::rest_point, DEFVAL(PackedFloat32Array()));
 	ClassDB::bind_method(D_METHOD("key_point", "rest_position", "key"), &DensityShape::key_point);
 	ClassDB::bind_method(D_METHOD("apply_brush", "center", "radius", "strength", "mode", "material", "key", "pose", "weights"), &DensityShape::apply_brush, DEFVAL(-1), DEFVAL(-1), DEFVAL(0.0), DEFVAL(PackedFloat32Array()));
-	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness", "pose", "weights"), &DensityShape::paint_color, DEFVAL(0.0), DEFVAL(PackedFloat32Array()));
+	ClassDB::bind_method(D_METHOD("paint_color", "center", "radius", "color", "opacity", "hardness", "pose", "weights", "scatter", "seed"), &DensityShape::paint_color, DEFVAL(0.0), DEFVAL(PackedFloat32Array()), DEFVAL(0.0), DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("paint_fill", "center", "threshold", "material", "color", "opacity", "scatter", "seed", "pose", "weights"), &DensityShape::paint_fill, DEFVAL(0.0), DEFVAL(PackedFloat32Array()));
 	ClassDB::bind_method(D_METHOD("get_version"), &DensityShape::get_version);
 	ClassDB::bind_method(D_METHOD("get_volume"), &DensityShape::get_volume);
 	ClassDB::bind_method(D_METHOD("get_mass"), &DensityShape::get_mass);
@@ -2384,6 +2598,9 @@ bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector
 	// falloff(|that - c| / r), the most solid (by p_solid) of the roots of
 	// every copy (as the terrain's grab).
 	auto grab_source = [&](const Vector3 &p, auto &&p_solid) {
+		// Each copy that moves p offers the most solid of its roots; the
+		// most solid of those wins. One that doesn't move it offers nothing
+		// (its "stays put" mustn't win over another copy's move).
 		float value = -INFINITY;
 		Vector3 best_from = p;
 		for (int cc = 0; cc < count; cc++) {
@@ -2393,23 +2610,14 @@ bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector
 			const float dd = delta.length_squared();
 			const float tt = dd > 0.0f ? std::clamp((p - c).dot(delta) / dd, 0.0f, 1.0f) : 0.0f;
 			if ((p - c - delta * tt).length_squared() >= r * r) {
-				const float v = p_solid(p);
-				if (v > value) {
-					value = v;
-					best_from = p;
-				}
 				continue;
 			}
 			auto h = [&](float s) { return falloff((p - delta * s - c).length() / r) - s; };
 			const int SCAN = 12;
 			float s0 = 0.0f, h0 = h(0.0f);
-			if (h0 <= 0.0f) {
-				const float v = p_solid(p);
-				if (v > value) {
-					value = v;
-					best_from = p;
-				}
-			}
+			bool copy_moves = false;
+			float copy_value = h0 <= 0.0f ? p_solid(p) : -INFINITY;
+			Vector3 copy_from = p;
 			for (int j = 1; j <= SCAN; j++) {
 				const float s1 = (float)j / SCAN, h1 = h(s1);
 				if ((h0 > 0.0f) != (h1 > 0.0f)) {
@@ -2420,13 +2628,18 @@ bool DensityShape::warp(const std::vector<Vector3> &p_centers, const std::vector
 					}
 					const Vector3 q = p - delta * ((a + b) * 0.5f);
 					const float v = p_solid(q);
-					if (v > value) {
-						value = v;
-						best_from = q;
+					if (v > copy_value) {
+						copy_value = v;
+						copy_from = q;
 					}
+					copy_moves = true;
 				}
 				s0 = s1;
 				h0 = h1;
+			}
+			if (copy_moves && copy_value > value) {
+				value = copy_value;
+				best_from = copy_from;
 			}
 		}
 		return best_from;
