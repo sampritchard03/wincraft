@@ -11,10 +11,10 @@ shader = ExtResource("2_terrain")
 shader_parameter/clip_brick_count = 16.0
 shader_parameter/clip_count = 0
 shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-shader_parameter/clip_size = 156.0
+shader_parameter/clip_size = 256.0
 shader_parameter/clip_reach = 109.0
 shader_parameter/view_position = Vector3(0, 0, 0)
-shader_parameter/view_distance_limit = 872.0
+shader_parameter/view_distance_limit = 3488.0
 shader_parameter/use_prepass = false
 shader_parameter/sun_direction = Vector3(0.45, 0.75, 0.35)
 shader_parameter/sun_color = Color(1, 0.94, 0.82, 1)
@@ -36,7 +36,7 @@ shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 shader_parameter/clip_size = 256.0
 shader_parameter/clip_reach = 109.0
 shader_parameter/view_position = Vector3(0, 0, 0)
-shader_parameter/view_distance_limit = 872.0
+shader_parameter/view_distance_limit = 3488.0
 
 [sub_resource type="QuadMesh" id="ScreenQuad"]
 size = Vector2(2, 2)

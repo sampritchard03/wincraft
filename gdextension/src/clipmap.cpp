@@ -237,7 +237,20 @@ void Clipmap::take_patches(Slab &r_slab, int p_level, const VoxelWorld &p_world)
 		}
 		const int8_t *data;
 		const MaterialId *materials;
-		if (empty || !p_world.edited_data(c, p_level, data, materials, patch.side)) {
+		if (empty) {
+			continue;
+		}
+		if (p_level == 0 && p_world.edited_unloaded(c, data, materials)) {
+			const size_t half = (size_t)(C / 2) * (C / 2) * (C / 2);
+			patch.chunk = c;
+			patch.side = C;
+			patch.from_save = true;
+			patch.data.assign(data, data + half);
+			patch.materials.assign(materials, materials + half);
+			r_slab.patches.push_back(std::move(patch));
+			continue;
+		}
+		if (!p_world.edited_data(c, p_level, data, materials, patch.side)) {
 			continue;
 		}
 		const size_t count = (size_t)patch.side * patch.side * patch.side;
@@ -863,7 +876,28 @@ void Clipmap::generate_slab(const VoxelWorld &p_world, int p_level, Slab &r_slab
 		}
 	});
 	// Edited chunks over the generated texels (before the surface is found).
-	for (const Patch &patch : r_slab.patches) {
+	for (Patch &patch : r_slab.patches) {
+		if (patch.from_save) {
+			std::vector<int8_t> full;
+			std::vector<MaterialId> full_materials;
+			if (!p_world.read_saved(patch.chunk, full, full_materials)) {
+				// Unreadable: its mip 1, each point twice along every axis.
+				const int C = VoxelWorld::CHUNK, h = C / 2;
+				full.resize((size_t)C * C * C);
+				full_materials.resize(full.size());
+				for (int z = 0; z < C; z++) {
+					for (int y = 0; y < C; y++) {
+						for (int x = 0; x < C; x++) {
+							const size_t from = ((size_t)(z >> 1) * h + (y >> 1)) * h + (x >> 1);
+							full[((size_t)z * C + y) * C + x] = patch.data[from];
+							full_materials[((size_t)z * C + y) * C + x] = patch.materials[from];
+						}
+					}
+				}
+			}
+			patch.data = std::move(full);
+			patch.materials = std::move(full_materials);
+		}
 		write_chunk(p_level, patch.chunk, patch.data.data(), patch.materials.data(), patch.side, patch.t0, patch.t1, r_texels, nullptr);
 	}
 	r_slab.patches.clear();
@@ -905,8 +939,7 @@ void Clipmap::start_job(int p_level, const Vector3i &p_target, const VoxelWorld 
 		overlap = std::abs(p_target[a] - level.origin[a]) < size;
 	}
 	if (!overlap) {
-		job->reset = true;
-		job->texels.assign((size_t)size * size * size * TEXEL_BYTES, 0);
+		job->reset = true; // (its new storage is made by the worker: tens of MB to clear)
 		job->slabs.push_back({ lo, hi, {} });
 	} else {
 		for (int a = 0; a < 3; a++) {
@@ -928,37 +961,40 @@ void Clipmap::start_job(int p_level, const Vector3i &p_target, const VoxelWorld 
 	for (Slab &slab : job->slabs) {
 		take_patches(slab, p_level, p_world);
 	}
-	uint8_t *target = job->reset ? job->texels.data() : level.texels.data();
-	// Where the worker puts the raw values (none for level 0; if the level
-	// has none yet, finish_job() makes them).
-	uint8_t *raw_target = nullptr;
+	// Where the worker writes: the level's storage, or for a reset new
+	// storage it makes. Levels 1 and up also put the raw values there (the
+	// level's, or for a reset a new copy; if the level has none yet,
+	// finish_job() makes them).
+	uint8_t *level_texels = level.texels.data();
+	uint8_t *level_raw = p_level > 0 && level.raw.size() == (size_t)size * size * size ? level.raw.data() : nullptr;
 	if (p_level > 0) {
-		const size_t count = (size_t)size * size * size;
-		if (job->reset) {
-			job->raw.assign(count, 128);
-			raw_target = job->raw.data();
-		} else if (level.raw.size() == count) {
-			raw_target = level.raw.data();
-		}
-		job->raw_done = raw_target != nullptr;
+		job->raw_done = job->reset || level_raw != nullptr;
 	}
-	if (p_wait) {
-		for (Slab &slab : job->slabs) {
+	auto run = [this, level_texels, level_raw, &p_world, p_level](Job *p_job, int p_threads) {
+		uint8_t *target = level_texels, *raw_target = level_raw;
+		if (p_job->reset) {
+			const size_t count = (size_t)size * size * size;
+			p_job->texels.assign(count * TEXEL_BYTES, 0);
+			target = p_job->texels.data();
+			if (p_level > 0) {
+				p_job->raw.assign(count, 128);
+				raw_target = p_job->raw.data();
+			}
+		}
+		for (Slab &slab : p_job->slabs) {
 			generate_slab(p_world, p_level, slab, target, p_threads);
 			if (raw_target != nullptr) {
 				copy_raw(slab, target, raw_target);
 			}
 		}
+	};
+	if (p_wait) {
+		run(job.get(), p_threads);
 		job->finished = true;
 	} else {
 		Job *raw = job.get();
-		raw->thread = std::thread([this, raw, target, raw_target, &p_world, p_level]() {
-			for (Slab &slab : raw->slabs) {
-				generate_slab(p_world, p_level, slab, target, 1);
-				if (raw_target != nullptr) {
-					copy_raw(slab, target, raw_target);
-				}
-			}
+		raw->thread = std::thread([run, raw]() {
+			run(raw, 1);
 			raw->finished = true;
 		});
 	}

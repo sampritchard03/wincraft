@@ -159,6 +159,10 @@ private:
 		int side = 0; // points per axis of data
 		std::vector<int8_t> data;
 		std::vector<MaterialId> materials;
+		// Level 0, a chunk not in memory: the worker reads its points from
+		// the save (data holds its mip 1, 16^3, in case that fails), so a
+		// move doesn't wait on the disk.
+		bool from_save = false;
 	};
 	struct Slab {
 		Vector3i lo, hi;

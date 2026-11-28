@@ -276,6 +276,16 @@ public:
 	// above (edited chunks only; the rest are generated); side = points per
 	// axis. False otherwise.
 	bool edited_data(const Vector3i &p_chunk, int p_level, const int8_t *&r_data, const MaterialId *&r_materials, int &r_side) const;
+	// An edited chunk whose points aren't in memory (only in the save), with
+	// its mip 1 (16^3) to fall back on: level 0 reads it with read_saved()
+	// on its worker instead of loading it here.
+	bool edited_unloaded(const Vector3i &p_chunk, const int8_t *&r_mip1, const MaterialId *&r_mip1_materials) const;
+	// A chunk's points from the save; safe on another thread (as
+	// load_near()'s batch reads them). An unloaded chunk's save is current
+	// (see unload_far()).
+	bool read_saved(const Vector3i &p_chunk, std::vector<int8_t> &r_full, std::vector<MaterialId> &r_materials) const {
+		return read_full(p_chunk, r_full, r_materials);
+	}
 
 	// The points of a chunk, ready to edit (expanded if it was uniform), and
 	// marked edited and unsaved; nullptr data outside the y limits. Call

@@ -11,6 +11,8 @@
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/classes/shader_material.hpp>
 #include <godot_cpp/variant/color.hpp>
+
+#include <unordered_map>
 #include <godot_cpp/variant/aabb.hpp>
 #include <godot_cpp/variant/array.hpp>
 #include <godot_cpp/variant/typed_array.hpp>
@@ -412,9 +414,9 @@ private:
 	// material, prepass_material and extra_materials (the valid ones).
 	std::vector<Ref<ShaderMaterial>> clip_materials() const;
 	int clip_size = 256;
-	int clip_levels = 3;
+	int clip_levels = 5;
 	// 109, 218, 436, 872, 1744, 3488, 6976, 13952
-	double view_distance = 872.0;
+	double view_distance = 3488.0;
 	int thread_count = 0; // 0 = one per CPU core
 	double simulation_radius = 160.0;
 	int blocky_size = 0;
@@ -528,7 +530,21 @@ private:
 	// beyond it wait a frame or two (each shows the frames it has), so many
 	// at once don't stall the frame.
 	int upload_budget = 0;
-	static constexpr int UPLOAD_LAYERS = 4 * DensityShape::MAX_SIZE;
+	static constexpr int UPLOAD_LAYERS = 2 * DensityShape::MAX_SIZE;
+	// The atlas slot of p_shape's frame p_key if it's there and up to date
+	// (marked used), else -1; uploads nothing.
+	int resident_slot(const Ref<DensityShape> &p_shape, int p_key);
+	// What each grid body was drawn with last frame (by instance id): its
+	// frames and weights, shown again while its new heaviest frame waits
+	// for upload budget.
+	struct DrawnFrames {
+		int keys[DensityShape::MAX_BLEND] = { -1, -1, -1, -1 };
+		float weights[DensityShape::MAX_BLEND] = { 0, 0, 0, 0 };
+		int count = 0;
+	};
+	std::unordered_map<uint64_t, DrawnFrames> drawn_frames;
+	double grid_upload_ms = 0.0; // the slowest frame's atlas uploads since take_view_times()
+	double grid_frame_ms = 0.0; // this frame's
 	// Milliseconds a frame may spend loading chunks around the camera.
 	static constexpr double LOAD_BUDGET_MS = 3.0;
 

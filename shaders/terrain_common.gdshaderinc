@@ -35,7 +35,7 @@ uniform float clip_size = 256.0;
 // |dx|, |dy|, |dz|); Clipmap::reach(). Its box always reaches 3 texels beyond.
 uniform float clip_reach = 109.0;
 uniform vec3 view_position; // the camera position the clipmap was last centred on
-uniform float view_distance_limit = 872.0; // SculptTerrain.view_distance
+uniform float view_distance_limit = 3488.0; // SculptTerrain.view_distance
 
 const float CLAMP = 127.0 / 16.0; // DENSITY_CLAMP, in texels of the level
 const float BRICK = 8.0; // Clipmap::BRICK

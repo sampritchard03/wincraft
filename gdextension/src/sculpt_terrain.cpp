@@ -692,6 +692,8 @@ Dictionary SculptTerrain::take_view_times() {
 	}
 	times["brush.dabs"] = (double)brush_max_dabs;
 	brush_max_dabs = 0;
+	times["bodies.upload"] = grid_upload_ms;
+	grid_upload_ms = 0.0;
 	times["layers"] = layers_uploaded;
 	layers_uploaded = 0;
 	return times;
@@ -975,6 +977,21 @@ void SculptTerrain::mark_edited(const Vector3i &p_min, const Vector3i &p_max) {
 	DensityBody3D::wake_near(Vector3(p_min), Vector3(p_max + Vector3i(1, 1, 1)), world.world_size());
 }
 
+int SculptTerrain::resident_slot(const Ref<DensityShape> &p_shape, int p_key) {
+	const uint64_t id = p_shape->get_instance_id();
+	const int layers = std::clamp(p_shape->get_size().z, 1, GRID_SLOT);
+	for (GridSlot &s : grid_slots) {
+		if (s.shape == id && s.key == p_key) {
+			if (s.count != layers || s.version != p_shape->get_version()) {
+				return -1;
+			}
+			s.used = ++slot_clock;
+			return s.base;
+		}
+	}
+	return -1;
+}
+
 int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_shape, int p_key, bool p_force) {
 	// Shared by every body drawing this shape in this frame (frogs share one).
 	const uint64_t id = p_shape->get_instance_id();
@@ -1036,6 +1053,7 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 	}
 	GridSlot &s = grid_slots[found];
 	if (s.version != p_shape->get_version()) {
+		const auto upload_start = std::chrono::steady_clock::now();
 		PackedByteArray bytes;
 		bytes.resize(GRID_SLOT * GRID_SLOT * 3);
 		Ref<Image> image;
@@ -1050,6 +1068,7 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 		}
 		s.version = p_shape->get_version();
 		upload_budget -= layers;
+		grid_frame_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - upload_start).count();
 	}
 	s.used = ++slot_clock;
 	return s.base;
@@ -1129,6 +1148,8 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 	}
 	frame_clock = slot_clock;
 	upload_budget = UPLOAD_LAYERS;
+	grid_frame_ms = 0.0;
+	std::unordered_map<uint64_t, DrawnFrames> drawn_now;
 	PackedFloat32Array highlights;
 	highlights.resize(MAX_GRID_BODIES);
 	highlights.fill(0.0f);
@@ -1150,8 +1171,9 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 		// at least; one that can't be is left out, not every one after it.)
 		int placed = 0;
 		float total = 0.0f;
+		int keys[DensityShape::MAX_BLEND] = { -1, -1, -1, -1 };
 		for (int f = 0; f < blend.count; f++) {
-			const int slot = grid_slot(d.body, shape, blend.frames[f], f == 0);
+			const int slot = grid_slot(d.body, shape, blend.frames[f], false);
 			if (slot < 0) {
 				if (f == 0) {
 					break;
@@ -1160,11 +1182,50 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 			}
 			slots[placed] = (float)slot;
 			weights[placed] = blend.weights[f];
+			keys[placed] = blend.frames[f];
 			total += blend.weights[f];
 			placed++;
 		}
+		const uint64_t body_id = d.body->get_instance_id();
+		if (placed == 0) {
+			// Its heaviest frame waits for upload room: what it showed last
+			// frame if that's all still there, else (nothing to show) now.
+			auto last = drawn_frames.find(body_id);
+			if (last != drawn_frames.end() && last->second.count > 0) {
+				for (int f = 0; f < last->second.count; f++) {
+					const int slot = resident_slot(shape, last->second.keys[f]);
+					if (slot < 0) {
+						placed = 0;
+						break;
+					}
+					slots[placed] = (float)slot;
+					weights[placed] = last->second.weights[f];
+					keys[placed] = last->second.keys[f];
+					placed++;
+				}
+				total = 1.0f;
+			}
+			if (placed == 0 && blend.count > 0) {
+				const int slot = grid_slot(d.body, shape, blend.frames[0], true);
+				if (slot >= 0) {
+					slots[0] = (float)slot;
+					weights[0] = 1.0f;
+					keys[0] = blend.frames[0];
+					total = 1.0f;
+					placed = 1;
+				}
+			}
+		}
 		if (placed == 0) {
 			continue;
+		}
+		{
+			DrawnFrames &drawn = drawn_now[body_id];
+			drawn.count = placed;
+			for (int f = 0; f < placed; f++) {
+				drawn.keys[f] = keys[f];
+				drawn.weights[f] = total > 1e-6f ? weights[f] / total : (f == 0 ? 1.0f : 0.0f);
+			}
 		}
 		for (int f = 0; f < placed; f++) {
 			weights[f] = total > 1e-6f ? weights[f] / total : (f == 0 ? 1.0f : 0.0f);
@@ -1202,6 +1263,8 @@ void SculptTerrain::bind_bodies(const Vector3 &p_camera) {
 	material->set_shader_parameter("grid_highlight", highlights);
 	material->set_shader_parameter("grid_bound", bounds);
 	material->set_shader_parameter("grid_count", grid_count);
+	drawn_frames.swap(drawn_now);
+	grid_upload_ms = std::max(grid_upload_ms, grid_frame_ms);
 }
 
 Dictionary SculptTerrain::get_stats() const {

@@ -1533,6 +1533,16 @@ bool VoxelWorld::edited_data(const Vector3i &p_chunk, int p_level, const int8_t 
 	return true;
 }
 
+bool VoxelWorld::edited_unloaded(const Vector3i &p_chunk, const int8_t *&r_mip1, const MaterialId *&r_mip1_materials) const {
+	const Chunk *chunk = chunk_at(p_chunk);
+	if (chunk == nullptr || !chunk->edited || chunk->loaded || chunk->mips.size() < (size_t)MIP_BYTES) {
+		return false;
+	}
+	r_mip1 = chunk->mips.data() + mip_offset(1);
+	r_mip1_materials = chunk->mip_materials.data() + mip_offset(1);
+	return true;
+}
+
 void VoxelWorld::generate_materials(const Vector3i &p_chunk, MaterialId *r_full) const {
 	const Vector3i o = p_chunk * CHUNK;
 	size_t i = 0;
