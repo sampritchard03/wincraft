@@ -12,7 +12,7 @@ extends Node
 @export var camera : Camera3D
 @export var forg_scene : PackedScene
 ## What G drops (Shift+G switches): a frog or a chiggin.
-const CHIGGIN_SCENE := preload("res://chiggin.tscn")
+const CHIGGIN_SCENE := preload("res://scenes/entities/chiggin.tscn")
 const CREATURE_NAMES := ["Frog", "Chiggin"]
 var creature := 0
 ## A message shown in the status panel for a moment (notice_until, msec).
@@ -54,26 +54,26 @@ var notice_until := 0
 ## origin. Balls and frogs bounce off it; it can stand on them.
 var player: DensityCharacter3D
 ## Balls thrown with F (bouncy_balls.gd), saved with the world.
-const BouncyBalls := preload("res://bouncy_balls.gd")
+const BouncyBalls := preload("res://scripts/objects/physics_objects.gd")
 var balls: BouncyBalls
 ## Frogs and chiggins (creatures.gd): saved with the world, and every one
 ## of a kind shares its shape and animations.
-const Creatures := preload("res://creatures.gd")
+const Creatures := preload("res://scripts/objects/entities/creatures.gd")
 var creatures: Creatures
 ## The object editor (M on a body: sculpt it, animate its pose keys; object_editor.gd).
-const ObjectEditor := preload("res://object_editor.gd")
+const ObjectEditor := preload("res://scripts/editor/object_editor.gd")
 var editor: ObjectEditor
 ## Multiplayer (network.gd): hosting or joining, from the command line.
-const Network := preload("res://network.gd")
+const Network := preload("res://scripts/world/network.gd")
 var network: Network
 ## VR (vr.gd): a headset, if one is running (Meta Quest through OpenXR).
-const VR := preload("res://vr.gd")
+const VR := preload("res://scripts/vr/vr.gd")
 var vr: VR
 ## The HUD (hud.gd): the bar of tool / material / brush slots, the status
 ## panel, the help list (H) and the tool wheel (hold Tab), all skinned from
 ## res://assets/ui/.
-const Hud := preload("res://hud.gd")
-const BrushPanel := preload("res://brush_panel.gd")
+const Hud := preload("res://scripts/ui/hud.gd")
+const BrushPanel := preload("res://scripts/ui/brush_panel.gd")
 var hud: Hud
 ## The tool wheel's ring, from the top clockwise, with each tool's key (the
 ## number of presses for a key with several).
@@ -110,7 +110,7 @@ func _wheel_keys() -> Array:
 	return hints
 var block_icons := {}  # material -> ImageTexture, for the HUD
 ## Sun shadows from shadow maps (sun_shadows.gd).
-const SunShadows := preload("res://sun_shadows.gd")
+const SunShadows := preload("res://scripts/world/sun_shadows.gd")
 var sun_shadows: SunShadows
 ## The ball or frog the brush is on this frame (null: the terrain).
 var target_body: DensityBody3D = null

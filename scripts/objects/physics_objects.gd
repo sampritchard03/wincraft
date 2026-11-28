@@ -11,7 +11,7 @@ extends Node3D
 ## Balls are saved to objects.cfg in the world's save directory. Only balls
 ## near the player are loaded (see stream()).
 
-const BodyAnimation := preload("res://body_animation.gd")
+const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
 
 @export var ball_radius := 3.0
 @export var throw_speed := 220.0

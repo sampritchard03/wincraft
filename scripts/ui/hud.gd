@@ -14,8 +14,8 @@ extends Control
 ##
 ## Laid out for a 720-pixel-high window and scaled to the real one.
 
-const UiSkin := preload("res://ui_skin.gd")
-const RadialMenu := preload("res://radial_menu.gd")
+const UiSkin := preload("res://scripts/ui/ui_skin.gd")
+const RadialMenu := preload("res://scripts/ui/radial_menu.gd")
 
 const ICON := 32.0  # icon size in the bar, before scaling
 const DESIGN_HEIGHT := 720.0

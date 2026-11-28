@@ -8,7 +8,7 @@ path="res://.godot/imported/forg.glb-acdf3a17d3266391b63ff44c0b44ca7f.scn"
 
 [deps]
 
-source_file="res://forg.glb"
+source_file="res://assets/entities/frog/forg.glb"
 dest_files=["res://.godot/imported/forg.glb-acdf3a17d3266391b63ff44c0b44ca7f.scn"]
 
 [params]

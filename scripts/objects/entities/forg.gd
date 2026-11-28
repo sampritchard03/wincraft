@@ -1,4 +1,4 @@
-extends "res://creature.gd"
+extends "res://scripts/objects/entities/creature.gd"
 ## The frog: hops round to face somewhere new now and then, and every so
 ## often takes a big leap. Each jump crouches first (jump_start), then plays
 ## jump while it's in the air. A good shove knocks it over: it flails a

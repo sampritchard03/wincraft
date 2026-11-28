@@ -16,7 +16,7 @@ extends Node
 ## Everything is sized in real metres and scaled by XRServer.world_scale, so
 ## it's the same size to you however big the player is.
 
-const Hud := preload("res://hud.gd")
+const Hud := preload("res://scripts/ui/hud.gd")
 
 const HUD_PIXELS := Vector2i(1280, 720)  # the HUD's layout size (hud.gd's DESIGN_HEIGHT)
 const WHEEL_PIXELS := 600  # the wheel's viewport (radial_menu.gd lays out for 600 high)

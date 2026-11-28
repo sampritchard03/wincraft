@@ -60,7 +60,7 @@ func _ready() -> void:
 	sun = (terrain_material.get_shader_parameter("sun_direction") as Vector3).normalized()
 	right = Vector3.UP.cross(sun).normalized() if absf(sun.y) < 0.99 else Vector3.RIGHT
 	up = sun.cross(right).normalized()
-	var shader: Shader = load("res://terrain_sun_map.gdshader")
+	var shader: Shader = load("res://shaders/terrain_sun_map.gdshader")
 	var extra: Array = []
 	for i in 2:
 		var c := Cascade.new()

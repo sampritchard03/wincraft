@@ -74,7 +74,7 @@ extends Node
 ## keep the player near 0 (_wrap_player()), differently on each computer.
 ## Each receiver puts a remote player at the repeat nearest its own.
 
-const BodyAnimation := preload("res://body_animation.gd")
+const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
 
 signal settings_received  ## joining: open the world with host_settings, then call world_opened()
 signal joined  ## joining: every edited chunk has arrived and been applied

@@ -13,8 +13,8 @@ render_mode unshaded, cull_disabled, depth_draw_always, shadows_disabled;
 // needs no march at all, and the others start where it first came close to a
 // surface.
 
-#include "res://terrain_common.gdshaderinc"
-#include "res://terrain_shadow.gdshaderinc"
+#include "res://shaders/terrain_common.gdshaderinc"
+#include "res://shaders/terrain_shadow.gdshaderinc"
 
 // R: where to start (voxels along the ray / START_SCALE), G: 1 if the
 // block is all sky.

@@ -21,7 +21,7 @@ extends Node
 ## wheel are vr_ui.gd's.
 
 const REAL_HEIGHT := 1.7  # metres, the player's height in the world
-const VrUi := preload("res://vr_ui.gd")
+const VrUi := preload("res://scripts/vr/vr_ui.gd")
 
 ## Headset refresh rate to ask for (the highest available up to this).
 @export var maximum_refresh_rate := 90

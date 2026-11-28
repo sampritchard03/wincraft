@@ -21,7 +21,7 @@ func _initialize() -> void:
 	bake.call_deferred()
 
 func bake() -> void:
-	var model: Node3D = load("res://forg_model.tscn").instantiate()
+	var model: Node3D = load("res://scenes/entities/forg_model.tscn").instantiate()
 	model.scale = Vector3.ONE * MODEL_SCALE
 	root.add_child(model)
 	var tree := model.get_node("AnimationTree") as AnimationTree
@@ -62,12 +62,12 @@ func bake() -> void:
 	var shape := DensityShape.new()
 	shape.bake_meshes(poses, colors, VOXEL_SIZE, MARGIN)
 	print("grid ", shape.get_size(), " voxel ", shape.voxel_size)
-	ResourceSaver.save(shape, "res://forg_shape.res")
+	ResourceSaver.save(shape, "res://assets/entities/frog/forg_shape.res")
 
 	# The frog scene.
 	var frog := DensityBody3D.new()
 	frog.name = "Forg"
-	frog.shape = load("res://forg_shape.res")
+	frog.shape = load("res://assets/entities/frog/forg_shape.res")
 	frog.drawn = true
 	frog.bounce = 0.29
 	frog.gravity_scale = 0.212  # ~51 voxels/s^2 with gravity 240
@@ -75,7 +75,7 @@ func bake() -> void:
 	frog.auto_material_properties = false  # its own mass and bounce, set here
 	frog.auto_center_of_mass = false
 	frog.center_of_mass = Vector3(0, -5, 0)  # well below its middle: it rights itself
-	frog.set_script(load("res://forg.gd"))
+	frog.set_script(load("res://scripts/objects/entities/forg.gd"))
 	var animations := AnimationPlayer.new()
 	animations.name = "AnimationPlayer"
 	var library := AnimationLibrary.new()
@@ -94,10 +94,10 @@ func bake() -> void:
 	var scene := PackedScene.new()
 	scene.pack(frog)
 	# Keep forg.tscn's id, so world.tscn's reference to it still matches.
-	var old_uid := ResourceLoader.get_resource_uid("res://forg.tscn")
-	ResourceSaver.save(scene, "res://forg.tscn")
+	var old_uid := ResourceLoader.get_resource_uid("res://scenes/entities/forg.tscn")
+	ResourceSaver.save(scene, "res://scenes/entities/forg.tscn")
 	if old_uid != ResourceUID.INVALID_ID:
-		ResourceSaver.set_uid("res://forg.tscn", old_uid)
+		ResourceSaver.set_uid("res://scenes/entities/forg.tscn", old_uid)
 	print("saved forg_shape.res and forg.tscn")
 	quit()
 

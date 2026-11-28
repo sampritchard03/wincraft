@@ -12,7 +12,7 @@ render_mode unshaded;
 // Drawn only when the map moves or the terrain changes, a strip at a time,
 // rather than one ray to the sun for every pixel of every frame.
 
-#include "res://terrain_common.gdshaderinc"
+#include "res://shaders/terrain_common.gdshaderinc"
 
 uniform vec3 map_origin;
 uniform vec3 map_right; // the plane's axes (UV x, y)

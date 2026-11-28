@@ -27,7 +27,7 @@ extends Node
 ## The animations live on the body itself, in its AnimationPlayer (made if
 ## it has none), so the frog's AnimationTree, say, can play what you make here.
 
-const BodyAnimation := preload("res://body_animation.gd")
+const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
 
 var world: Node  # world.gd
 var active := false

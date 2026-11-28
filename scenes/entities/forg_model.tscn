@@ -1,7 +1,7 @@
 [gd_scene format=4 uid="uid://bmf3wn773pt6v"]
 
-[ext_resource type="PackedScene" uid="uid://xrq5si71306s" path="res://forg.glb" id="1_po82g"]
-[ext_resource type="Shader" uid="uid://bljupjjqy3e7u" path="res://forg.gdshader" id="2_dlm18"]
+[ext_resource type="PackedScene" uid="uid://xrq5si71306s" path="res://assets/entities/frog/forg.glb" id="1_po82g"]
+[ext_resource type="Shader" uid="uid://bljupjjqy3e7u" path="res://shaders/forg.gdshader" id="2_dlm18"]
 
 [sub_resource type="ShaderMaterial" id="ShaderMaterial_4tl7q"]
 render_priority = 0

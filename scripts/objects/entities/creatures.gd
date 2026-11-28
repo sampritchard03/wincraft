@@ -17,7 +17,7 @@ extends Node
 ## a kind's shape and animations the game's own (its scene's files). Multiplayer: a kind's shape goes to the other players
 ## when it's changed here (network.gd, send_kind_shape()).
 
-const BodyAnimation := preload("res://body_animation.gd")
+const BodyAnimation := preload("res://scripts/editor/body_animation.gd")
 const META_SEEN := "creature_shape"  # the shape the creature had when last looked at
 const META_VERSION := "creature_version"  # and its version (edits in place)
 
@@ -254,7 +254,7 @@ func save_as_default(p_body: DensityBody3D) -> String:
 	var player := BodyAnimation.player_of(root)
 	var files := 0
 	if library != null and player != null:
-		var folder := path.get_basename()  # res://chiggin.tscn -> res://chiggin/
+		var folder := path.get_basename()  # res://scenes/entities/chiggin.tscn -> res://chiggin/
 		var in_files := DirAccess.dir_exists_absolute(folder)
 		for anim_name in library.get_animation_list():
 			var anim := library.get_animation(anim_name)

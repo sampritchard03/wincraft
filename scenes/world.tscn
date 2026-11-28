@@ -1,9 +1,9 @@
 [gd_scene format=3 uid="uid://drlmvflveo18g"]
 
-[ext_resource type="Script" uid="uid://cf1fglmiv57xt" path="res://world.gd" id="1_tlwt5"]
-[ext_resource type="Shader" uid="uid://cu75sf0yohhpb" path="res://terrain.gdshader" id="2_terrain"]
-[ext_resource type="Shader" uid="uid://brg3fiekapihb" path="res://terrain_prepass.gdshader" id="3_prepass"]
-[ext_resource type="PackedScene" uid="uid://claoexgme20hh" path="res://forg.tscn" id="4_aqk2v"]
+[ext_resource type="Script" uid="uid://cf1fglmiv57xt" path="res://scripts/world/world.gd" id="1_tlwt5"]
+[ext_resource type="Shader" uid="uid://cu75sf0yohhpb" path="res://shaders/terrain.gdshader" id="2_terrain"]
+[ext_resource type="Shader" uid="uid://brg3fiekapihb" path="res://shaders/terrain_prepass.gdshader" id="3_prepass"]
+[ext_resource type="PackedScene" uid="uid://claoexgme20hh" path="res://scenes/entities/forg.tscn" id="4_aqk2v"]
 
 [sub_resource type="ShaderMaterial" id="TerrainMaterial"]
 render_priority = 0
@@ -11,7 +11,7 @@ shader = ExtResource("2_terrain")
 shader_parameter/clip_brick_count = 16.0
 shader_parameter/clip_count = 0
 shader_parameter/clip_origin = PackedVector3Array(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-shader_parameter/clip_size = 156.0
+shader_parameter/clip_size = 256.0
 shader_parameter/clip_reach = 109.0
 shader_parameter/view_position = Vector3(0, 0, 0)
 shader_parameter/view_distance_limit = 872.0

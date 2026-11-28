@@ -1,4 +1,4 @@
-extends "res://creature.gd"
+extends "res://scripts/objects/entities/creature.gd"
 ## The chiggin: wanders about on its feet and looks around as it goes. A
 ## good shove knocks it over: it flaps a while, then rolls itself upright
 ## (creature.gd).

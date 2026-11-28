@@ -11,7 +11,7 @@ render_mode unshaded, cull_disabled, depth_draw_never, depth_test_disabled, shad
 // Must render before the full image (it is a viewport inside that one) into
 // a float target (use_hdr_2d), with the same camera.
 
-#include "res://terrain_common.gdshaderinc"
+#include "res://shaders/terrain_common.gdshaderinc"
 
 void vertex() {
 	POSITION = vec4(VERTEX.xy, 0.0, 1.0);

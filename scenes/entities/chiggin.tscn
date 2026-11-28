@@ -1,11 +1,11 @@
 [gd_scene format=3 uid="uid://vwhpvm0oaduj"]
 
-[ext_resource type="DensityShape" uid="uid://2onqsjyi1swp" path="res://chiggin_shape_v2.res" id="1_shape"]
-[ext_resource type="Script" uid="uid://c8h07muf4yr32" path="res://chiggin.gd" id="2_script"]
-[ext_resource type="Animation" uid="uid://b1vrxm0wk7qdb" path="res://chiggin/chiggin_idle.tres" id="3_idle"]
-[ext_resource type="Animation" uid="uid://cefe03d2rtqd7" path="res://chiggin/chiggin_walk.tres" id="4_walk"]
-[ext_resource type="Animation" uid="uid://di1gkd6wagbsq" path="res://chiggin/chiggin_flap.tres" id="5_flap"]
-[ext_resource type="Animation" uid="uid://bwy4ndyimc2p0" path="res://chiggin/chiggin_head_turn.tres" id="6_head"]
+[ext_resource type="DensityShape" uid="uid://2onqsjyi1swp" path="res://assets/entities/chiggin/chiggin_shape_v2.res" id="1_shape"]
+[ext_resource type="Script" uid="uid://c8h07muf4yr32" path="res://scripts/objects/entities/chiggin.gd" id="2_script"]
+[ext_resource type="Animation" uid="uid://b1vrxm0wk7qdb" path="res://assets/entities/chiggin/animations/chiggin_idle.tres" id="3_idle"]
+[ext_resource type="Animation" uid="uid://cefe03d2rtqd7" path="res://assets/entities/chiggin/animations/chiggin_walk.tres" id="4_walk"]
+[ext_resource type="Animation" uid="uid://di1gkd6wagbsq" path="res://assets/entities/chiggin/animations/chiggin_flap.tres" id="5_flap"]
+[ext_resource type="Animation" uid="uid://bwy4ndyimc2p0" path="res://assets/entities/chiggin/animations/chiggin_head_turn.tres" id="6_head"]
 
 [sub_resource type="AnimationLibrary" id="AnimationLibrary_chiggin"]
 _data = {
