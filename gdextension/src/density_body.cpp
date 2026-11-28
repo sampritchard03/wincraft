@@ -557,25 +557,37 @@ void DensityBody3D::step_all(SculptTerrain *p_terrain, double p_delta, const Vec
 		}
 		b->begin_step();
 	}
-	// Forces act over the whole step.
-	double travel = 0.0; // the farthest anything goes, in its own smallest radii
-	for (DensityBody3D *b : bodies) {
+	// Forces act over the whole step. Each body is split into substeps by
+	// its own speed (so one fast body doesn't make a resting pile do all its
+	// collision work many times over): the step has as many as the fastest
+	// needs, and a slower body moves every sub_stride of them.
+	std::vector<int> needs(bodies.size(), 0);
+	int substeps = 1;
+	for (size_t i = 0; i < bodies.size(); i++) {
+		DensityBody3D *b = bodies[i];
 		if (b->moving()) {
 			b->linear_velocity += b->force / b->mass * p_delta;
 			b->angular_velocity += b->inverse_inertia_world().xform(b->torque) * p_delta;
 			const double reach = (b->linear_velocity.length() + b->angular_velocity.length() * b->bound) * p_delta;
-			travel = std::max(travel, reach / b->smallest);
+			needs[i] = std::clamp((int)std::ceil(reach / b->smallest / SUBSTEP_TRAVEL), 1, MAX_SUBSTEPS);
+			substeps = std::max(substeps, needs[i]);
 		}
 		b->force = Vector3();
 		b->torque = Vector3();
 	}
-	const int substeps = std::clamp((int)std::ceil(travel / SUBSTEP_TRAVEL), 1, MAX_SUBSTEPS);
+	for (size_t i = 0; i < bodies.size(); i++) {
+		bodies[i]->sub_stride = needs[i] > 0 ? std::max(1, substeps / needs[i]) : 0;
+		bodies[i]->sub_last = 0;
+	}
 	const double h = p_delta / substeps;
-	const double rest_speed = std::max(REST_SPEED_MIN, 3.0 * p_gravity.length() * h);
+	auto rest_speed_for = [&](int p_stride) {
+		return std::max(REST_SPEED_MIN, 3.0 * p_gravity.length() * h * std::max(p_stride, 1));
+	};
 
 	// Pairs that could touch this step: one of them moving (or a frozen
 	// body that could push a sleeping one), close enough to meet.
 	std::vector<std::pair<DensityBody3D *, DensityBody3D *>> pairs;
+	std::vector<std::pair<int, int>> pair_index; // the same, as indices into bodies
 	for (size_t i = 0; i < bodies.size(); i++) {
 		DensityBody3D *a = bodies[i];
 		if (!a->collide_with_bodies) {
@@ -593,20 +605,41 @@ void DensityBody3D::step_all(SculptTerrain *p_terrain, double p_delta, const Vec
 			if (a->com.distance_squared_to(b->com) <= reach * reach) {
 				// The dynamic one first: resolve() treats a as the one hit.
 				pairs.push_back(a->freeze ? std::make_pair(b, a) : std::make_pair(a, b));
+				pair_index.push_back(a->freeze ? std::make_pair((int)j, (int)i) : std::make_pair((int)i, (int)j));
 			}
 		}
 	}
 
+	std::vector<char> due(bodies.size()); // moved this substep (or the last one, for still ones)
+
 	for (int s = 0; s < substeps; s++) {
-		for (DensityBody3D *b : bodies) {
-			if (b->moving()) {
-				b->integrate(h, p_gravity);
+		const bool last = s == substeps - 1;
+		for (size_t i = 0; i < bodies.size(); i++) {
+			DensityBody3D *b = bodies[i];
+			due[i] = 0;
+			if (b->moving() && b->sub_stride > 0) {
+				if (s + 1 - b->sub_last >= b->sub_stride || last) {
+					b->integrate(h * (s + 1 - b->sub_last), p_gravity);
+					b->sub_last = s + 1;
+					due[i] = 1;
+				}
+			} else if (last) {
+				due[i] = 1; // still or frozen: in place all step, checked once
 			}
 		}
-		for (auto &[a, b] : pairs) {
+		for (size_t k = 0; k < pairs.size(); k++) {
+			DensityBody3D *a = pairs[k].first, *b = pairs[k].second;
+			const int ia = pair_index[k].first, ib = pair_index[k].second;
+			if (!due[ia] && !due[ib]) {
+				continue;
+			}
 			if (!a->moving() && !b->moving() && !a->freeze && !b->freeze) {
 				continue;
 			}
+			const bool a_was = a->moving(), b_was = b->moving();
+			const int fine = std::min(a->sub_stride > 0 ? a->sub_stride : substeps, b->sub_stride > 0 ? b->sub_stride : substeps);
+			const double rest_speed = rest_speed_for(fine);
+			bool touched = false;
 			// Each of a's probes against b's density; for two grids, both
 			// ways round (a grid's probes are only its skin points).
 			auto probe = [&](DensityBody3D *p_from, DensityBody3D *p_into) {
@@ -630,6 +663,7 @@ void DensityBody3D::step_all(SculptTerrain *p_terrain, double p_delta, const Vec
 						}
 						const Vector3 n = p_into->normal_at(c);
 						resolve(p_from, p_into, c - n * r, n, depth, rest_speed, i, -1, !grid);
+						touched = true;
 						if (depth > deepest) {
 							deepest = depth;
 							deepest_normal = n;
@@ -644,11 +678,28 @@ void DensityBody3D::step_all(SculptTerrain *p_terrain, double p_delta, const Vec
 			if (a->shape.is_valid() && b->shape.is_valid()) {
 				probe(b, a);
 			}
+			if (touched) {
+				// Bodies in contact move together from here (one hit by a fast
+				// one could be going fast now), from where they are now.
+				for (DensityBody3D *p : { a, b }) {
+					if (!p->moving()) {
+						continue;
+					}
+					const bool woken = !(p == a ? a_was : b_was) || p->sub_stride == 0;
+					if (woken) {
+						p->sub_last = s + 1;
+						p->sub_stride = fine;
+					} else if (fine < p->sub_stride) {
+						p->sub_stride = fine;
+					}
+				}
+			}
 		}
 		// The ground last: it can't move, so nothing may end a step pushed into it.
-		for (DensityBody3D *b : bodies) {
-			if (b->moving()) {
-				b->collide_terrain(p_terrain, rest_speed);
+		for (size_t i = 0; i < bodies.size(); i++) {
+			DensityBody3D *b = bodies[i];
+			if (due[i] && b->moving()) {
+				b->collide_terrain(p_terrain, rest_speed_for(b->sub_stride));
 			}
 		}
 	}
