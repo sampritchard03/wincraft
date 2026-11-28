@@ -964,6 +964,9 @@ func _animations(p_id: String, p_animation: Dictionary) -> void:
 	var b = bodies.get(p_id)
 	if b == null or not is_instance_valid(b):
 		return
+	# (One creature's own: not into the library the rest of its kind share.)
+	if _library_of(b) != null and _library_of(b) in world.creatures.kind_libraries.values():
+		world.creatures.set_library(b, world.creatures.copy_library(_library_of(b)))
 	BodyAnimation.apply(b, p_animation)
 	var library := _library_of(b)
 	if library != null:
@@ -988,17 +991,34 @@ func _kind_shape(p_scene: String, p_shape: Dictionary) -> void:
 	world.creatures.take_kind_shape(p_scene, DensityShape.from_dict(p_shape))
 
 ## A kind of creature's facing changed here (creatures.gd, set_kind_facing()).
-func send_kind_facing(p_scene: String, p_degrees: float) -> void:
+func send_kind_facing(p_scene: String, p_degrees: float, p_pitch: float) -> void:
 	if mode == Mode.OFFLINE or not ready_for_bodies or multiplayer.get_peers().is_empty():
 		return
-	_kind_facing.rpc(p_scene, p_degrees)
+	_kind_facing.rpc(p_scene, p_degrees, p_pitch)
 
 @rpc("any_peer", "call_remote", "reliable", 1)
-func _kind_facing(p_scene: String, p_degrees: float) -> void:
+func _kind_facing(p_scene: String, p_degrees: float, p_pitch: float) -> void:
 	if not ready_for_bodies:
-		early_bodies.append(_kind_facing.bind(p_scene, p_degrees))
+		early_bodies.append(_kind_facing.bind(p_scene, p_degrees, p_pitch))
 		return
-	world.creatures.set_kind_facing(p_scene, p_degrees, true)
+	world.creatures.set_kind_facing(p_scene, p_degrees, p_pitch, true)
+
+## A kind of creature's animations changed here (Update others).
+func send_kind_animations(p_scene: String, p_animation: Dictionary) -> void:
+	if mode == Mode.OFFLINE or not ready_for_bodies or multiplayer.get_peers().is_empty():
+		return
+	_kind_animations.rpc(p_scene, p_animation)
+
+@rpc("any_peer", "call_remote", "reliable", 1)
+func _kind_animations(p_scene: String, p_animation: Dictionary) -> void:
+	if not ready_for_bodies:
+		early_bodies.append(_kind_animations.bind(p_scene, p_animation))
+		return
+	world.creatures.take_kind_animations(p_scene, p_animation)
+	for body in world.creatures.all():
+		var library := _library_of(body)
+		if library != null:
+			library_hashes[library] = _library_hash(library)  # (not sent back)
 
 func _update_bodies(p_delta: float, p_k: float) -> void:
 	scan_timer += p_delta

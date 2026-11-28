@@ -1,5 +1,7 @@
 #include "sculpt_terrain.h"
 
+#include <chrono>
+
 #include "density_body.h"
 #include "density_shape.h"
 #include "parallel.h"
@@ -991,7 +993,16 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 		grid_slots.erase(grid_slots.begin() + found); // grown: somewhere new
 		found = -1;
 	}
-	const bool upload = found < 0 || grid_slots[found].version != p_shape->get_version();
+	// (Of the frame's look, which may be a little behind the shape while it's
+	// brushed; a newer look is uploaded when it's done.)
+	const int64_t look = p_key >= 0 ? p_shape->frame_version(p_key) : p_shape->get_version();
+	bool upload = found < 0 || look < 0 || grid_slots[found].version != look;
+	// A newer look of one it has (it's being brushed): at most every 50 ms,
+	// not every frame a newer one is done.
+	const uint64_t now_ms = (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+	if (upload && found >= 0 && look >= 0 && grid_slots[found].version >= 0 && now_ms - grid_slots[found].uploaded_ms < 50) {
+		upload = false;
+	}
 	if (upload && !p_force && upload_budget < layers) {
 		return -1; // (next frame)
 	}
@@ -1035,12 +1046,18 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 		found = (int)grid_slots.size() - 1;
 	}
 	GridSlot &s = grid_slots[found];
-	if (s.version != p_shape->get_version()) {
+	if (upload) {
+		const size_t layer_bytes = (size_t)GRID_SLOT * GRID_SLOT * 3;
+		slice_bytes.resize(layer_bytes * layers);
+		int64_t look_version;
+		{
+			look_version = p_shape->fill_slices(p_key, layers, slice_bytes.data());
+		}
 		PackedByteArray bytes;
-		bytes.resize(GRID_SLOT * GRID_SLOT * 3);
+		bytes.resize((int64_t)layer_bytes);
 		Ref<Image> image;
 		for (int z = 0; z < layers; z++) {
-			p_shape->fill_slice(p_key, z, bytes.ptrw());
+			memcpy(bytes.ptrw(), slice_bytes.data() + layer_bytes * z, layer_bytes);
 			if (image.is_null()) {
 				image = Image::create_from_data(GRID_SLOT, GRID_SLOT, false, Image::FORMAT_RGB8, bytes);
 			} else {
@@ -1048,7 +1065,8 @@ int SculptTerrain::grid_slot(DensityBody3D *p_body, const Ref<DensityShape> &p_s
 			}
 			body_atlas->update_layer(image, s.base + z);
 		}
-		s.version = p_shape->get_version();
+		s.version = p_key >= 0 ? look_version : p_shape->get_version();
+		s.uploaded_ms = now_ms;
 		upload_budget -= layers;
 	}
 	s.used = ++slot_clock;
@@ -1700,9 +1718,11 @@ void SculptTerrain::apply_brush(const Vector3 &p_center, double p_radius, double
 					} break;
 					case BRUSH_INFLATE:
 						// Every part of the surface moves along its own normal:
-						// the distance field just shifts (s voxels at the centre).
+						// the distance field just shifts, by s voxels over the inner
+						// half of the brush (inflate_falloff()): it swells evenly,
+						// thin parts fatter all round, where Draw builds a dome.
 						if (std::abs(v) < C) {
-							after[i] = std::clamp(v + s * brush_falloff(dist / r), -C, C);
+							after[i] = std::clamp(v + s * inflate_falloff(dist / r), -C, C);
 						}
 						break;
 					case BRUSH_PINCH: {

@@ -87,7 +87,7 @@ func stream(p_player: Vector3, p_unload := true) -> void:
 			if not body.freeze:  # (a frozen copy of another player's follows them)
 				_break(body)
 		elif p_unload and _offset_from(p_player, body.global_position).length() > unload_distance:
-			unloaded.append(_entry_of(body))
+			unloaded.append(entry_of(body))
 			bodies.remove_at(i)
 			body.queue_free()
 	for i in range(unloaded.size() - 1, -1, -1):
@@ -95,14 +95,14 @@ func stream(p_player: Vector3, p_unload := true) -> void:
 		if d.length() < load_distance:
 			var entry: Dictionary = unloaded[i]
 			unloaded.remove_at(i)
-			_restore(entry, p_player + d)
+			restore(entry, p_player + d)
 
 
 ## Brings every put-away object back, each at the repeat of the wrapping
 ## world nearest p_player (multiplayer keeps them all loaded).
 func load_all(p_player: Vector3) -> void:
 	for entry in unloaded:
-		_restore(entry, p_player + _offset_from(p_player, entry.get("position", Vector3.ZERO)))
+		restore(entry, p_player + _offset_from(p_player, entry.get("position", Vector3.ZERO)))
 	unloaded.clear()
 
 
@@ -110,7 +110,7 @@ func load_all(p_player: Vector3) -> void:
 func save(p_path: String, p_creatures := {}) -> void:
 	var list := unloaded.duplicate()
 	for body in bodies:
-		list.append(_entry_of(body))
+		list.append(entry_of(body))
 	var config := ConfigFile.new()
 	config.set_value("objects", "balls", list)  # (the key from when they were all balls)
 	for key in p_creatures:
@@ -135,7 +135,7 @@ func kind_of(p_body: DensityBody3D) -> String:
 	return "ball" if p_body.get_script() == Ball else "object"
 
 
-func _entry_of(p_body: DensityBody3D) -> Dictionary:
+func entry_of(p_body: DensityBody3D) -> Dictionary:
 	return {
 		"kind": kind_of(p_body),
 		"position": p_body.global_position,
@@ -153,7 +153,7 @@ func _entry_of(p_body: DensityBody3D) -> Dictionary:
 	}
 
 
-func _restore(p_entry: Dictionary, p_position: Vector3) -> void:
+func restore(p_entry: Dictionary, p_position: Vector3) -> DensityBody3D:
 	var color: Color = p_entry.get("color", Color.WHITE)
 	var material: int = p_entry.get("material", -1)
 	# (Saves from before kinds: a ball has a colour or a block of its own.)
@@ -165,7 +165,7 @@ func _restore(p_entry: Dictionary, p_position: Vector3) -> void:
 	elif saved != null:
 		body = _make(PhysicsObject, PhysicsObject.conform_shape(saved), color, material)
 	else:
-		return
+		return null
 	body.global_transform = Transform3D(Basis(p_entry.get("rotation", Quaternion.IDENTITY)), p_position)
 	body.linear_velocity = p_entry.get("velocity", Vector3.ZERO)
 	body.angular_velocity = p_entry.get("spin", Vector3.ZERO)
@@ -174,6 +174,7 @@ func _restore(p_entry: Dictionary, p_position: Vector3) -> void:
 	body.freeze = p_entry.get("frozen", false)
 	body.key_weights = p_entry.get("key_weights", PackedFloat32Array())
 	BodyAnimation.apply(body, p_entry.get("animation", {}))
+	return body
 
 
 ## p_to - p_from the short way round the wrapping world (x and z).

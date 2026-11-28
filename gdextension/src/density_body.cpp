@@ -1,5 +1,7 @@
 #include "density_body.h"
 
+#include <chrono>
+
 #include "sculpt_terrain.h"
 
 #include <godot_cpp/classes/engine.hpp>
@@ -140,7 +142,15 @@ bool DensityBody3D::shape_changed() const {
 	if (shape.is_null()) {
 		return false;
 	}
-	return shape->get_version() != shape_version || nearest_frame() != probe_frame;
+	if (shape->get_version() == shape_version && nearest_frame() == probe_frame) {
+		return false;
+	}
+	if (nearest_frame() != probe_frame || probe_data_version < 0) {
+		return true;
+	}
+	// Edited: its probes wait for a newer look than they're of, and while
+	// it's brushed are made again at most every 100 ms (not every dab).
+	return shape->frame_version(probe_frame) != probe_data_version && now_ms() - inertia_ms >= 100;
 }
 
 int DensityBody3D::nearest_frame() const {
@@ -178,9 +188,20 @@ const DensityShape::Blend &DensityBody3D::get_blend() const {
 		shown_shape = shape.ptr();
 		return shown;
 	}
+	// The frames wanted, as they last were (while it's brushed: a dab or so
+	// behind), else the ones shown, if they're there.
+	bool want_there = true;
+	for (int i = 0; i < want.count && want_there; i++) {
+		want_there = shape->frame_version(want.frames[i]) >= 0;
+	}
+	if (want_there) {
+		shown = want;
+		shown_shape = shape.ptr();
+		return shown;
+	}
 	bool old_ready = shown_shape == shape.ptr() && shown.count > 0;
 	for (int i = 0; i < shown.count && old_ready; i++) {
-		old_ready = shape->frame_ready(shown.frames[i]);
+		old_ready = shape->frame_version(shown.frames[i]) >= 0;
 	}
 	if (old_ready) {
 		return shown;
@@ -197,8 +218,13 @@ const DensityShape::Blend &DensityBody3D::get_blend() const {
 	return shown;
 }
 
+uint64_t DensityBody3D::now_ms() {
+	return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void DensityBody3D::update_inertia() {
 	inertia_dirty = false;
+	inertia_ms = now_ms();
 	local_offsets.clear();
 	local_radii.clear();
 	Basis inertia = zero_basis();
@@ -225,6 +251,7 @@ void DensityBody3D::update_inertia() {
 			local_offsets.push_back((Vector3(p.x, p.y, p.z) - com_local) * scale);
 			local_radii.push_back(p.w * (float)scale);
 		}
+		probe_data_version = grid->frame_version(probe_frame);
 	} else {
 		com_local = center_of_mass;
 		double total = 0.0;
@@ -958,7 +985,8 @@ bool DensityBody3D::apply_brush(const Vector3 &p_center, double p_radius, double
 	b.stroke_direction = inv.basis.xform(brush_options().stroke_direction);
 	const bool any = shape->apply_brush(local, p_radius / s, p_strength / s, p_mode, p_material, edit_key, pose, key_weights);
 	if (any) {
-		inertia_dirty = true;
+		// (Its mass and probes follow the edit when shape_changed() says:
+		// not made again every dab, which was most of the lag brushing it.)
 		wake();
 	}
 	return any;
@@ -1025,9 +1053,7 @@ bool DensityBody3D::warp_copies(const PackedVector3Array &p_centers, const Packe
 		deltas.push_back(inv.basis.xform(p_deltas[i]));
 	}
 	const bool any = shape->warp(centers, deltas, p_radius / s, p_grab, edit_key, pose, key_weights);
-	if (any) {
-		inertia_dirty = true;
-	}
+	(void)any; // (mass and probes: as for apply_brush())
 	return any;
 }
 
@@ -1050,9 +1076,7 @@ bool DensityBody3D::twist(const PackedVector3Array &p_centers, const Array &p_ba
 		bases.push_back(inv.basis * b * t.basis); // (the same turn and scale, about the body's axes)
 	}
 	const bool any = shape->twist(centers, bases, p_radius / s, edit_key, pose, key_weights);
-	if (any) {
-		inertia_dirty = true;
-	}
+	(void)any; // (mass and probes: as for apply_brush())
 	return any;
 }
 

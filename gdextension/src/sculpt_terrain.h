@@ -513,10 +513,12 @@ private:
 		uint64_t shape = 0; // its instance id
 		int key = -1; // frame
 		int64_t version = -1;
+		uint64_t uploaded_ms = 0; // when its look was last uploaded
 		uint64_t used = 0;
 		int base = 0, count = 0; // its layers
 	};
 	std::vector<GridSlot> grid_slots;
+	std::vector<uint8_t> slice_bytes; // (a frame's layers, filled at once)
 	uint64_t slot_clock = 0;
 	uint64_t frame_clock = 0; // slot_clock when this frame's binding began
 	// The first atlas layer holding p_body's p_shape's key p_key, uploading

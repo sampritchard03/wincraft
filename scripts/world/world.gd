@@ -120,6 +120,7 @@ var block_icons := {}  # material -> ImageTexture, for the HUD
 ## Sun shadows from shadow maps (sun_shadows.gd).
 const SunShadows := preload("res://scripts/world/sun_shadows.gd")
 var sun_shadows: SunShadows
+var shadows_on := true  # J
 ## The ball or frog the brush is on this frame (null: the terrain).
 var target_body: DensityBody3D = null
 ## A body being sculpted is held still for the stroke (it would roll away
@@ -206,7 +207,9 @@ var gizmo_mode := Gizmo.MOVE
 var floating: DensityBody3D = null
 ## Transform on an object or creature (clicked with Transform, no selection
 ## needed): the gizmo moves and turns it (held still while dragged). One undo
-## step per drag: {"moved": body, "before", "after"} (transforms).
+## step per drag: {"moved": body, "before", "after"} (transforms). A centre
+## of mass dragged in the object editor: {"com": body, "before", "before_auto", "after"}.
+## Update others (creatures.gd, update_others()): {"group_update": scene, "members", ...}.
 var gizmo_body: DensityBody3D = null
 var gizmo_body_frozen := false  # its freeze before the drag
 var gizmo_handles: Array[MeshInstance3D] = []  # x, y, z
@@ -218,6 +221,11 @@ var gizmo_start_param := 0.0
 var gizmo_plane_normal := Vector3.ZERO
 var clipboard: DensityShape = null
 var clipboard_center := Vector3.ZERO
+## Objects and creatures copied (Ctrl+C with them selected): _body_copy()
+## each, with its offset from their middle. Pasted ones: {"pasted": [{body,
+## parent}]} in the history.
+var clipboard_bodies: Array = []
+var clipboard_lift := 0.0
 
 ## Extrude (8): drag on the selection; it sweeps along the surface's normal.
 var extruding := false
@@ -342,6 +350,7 @@ var last_grab_delta := Vector3.INF
 var twisting := false
 var twist_body: DensityBody3D = null  # rotating / scaling a body (held still meanwhile), not the ground
 var twist_center := Vector3.ZERO
+var twist_hit := Vector3.ZERO  # where the brush is (Scale's centre is in under it)
 var twist_copies: Array[Transform3D] = []
 var twist_turn := Basis()
 var twist_scale := 1.0
@@ -801,6 +810,11 @@ func _input(event: InputEvent) -> void:
 				toggle_color_panel()
 			KEY_H:
 				hud.toggle_help()
+			KEY_J:
+				# Shadows (and ambient occlusion) off: colours as they are, for painting.
+				shadows_on = not shadows_on
+				terrain.material.set_shader_parameter("shadows_on", shadows_on)
+				_notify("Shadows " + ("on" if shadows_on else "off (J: on again)"))
 			KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0:
 				var cycle: Array = KEY_TOOLS[_key_of(event)]
 				if cycle.size() == 1:
@@ -1035,7 +1049,7 @@ func attach_symmetry_to(p_body: DensityBody3D) -> void:
 	var up := camera.global_basis.y
 	if body.has_method("_forward"):
 		# A creature: along where it faces, mirrored left to right.
-		up = body.global_basis.y.normalized()
+		up = body._up() if body.has_method("_up") else body.global_basis.y.normalized()
 		forward = body._forward()
 		forward = (forward - up * forward.dot(up)).normalized()
 	var side := forward.cross(up).normalized()
@@ -1519,7 +1533,7 @@ func _captured() -> bool:
 
 func _sculpt(delta: float) -> void:
 	var look := -camera.global_basis.z
-	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting
+	var sculpting := _captured() and not capture_click and not hud.radial.visible and not hoisting and not (editor != null and editor.com_dragging)
 	var held := sculpting and _button(MOUSE_BUTTON_LEFT)
 	var pressing := held or (sculpting and _button(MOUSE_BUTTON_RIGHT))
 	if tool in [Tool.PHYSICS_GUN, Tool.TRANSFORM, Tool.GEOMETRY, Tool.SELECT_GEOMETRY, Tool.BOX]:
@@ -1890,12 +1904,12 @@ func _undelete(p_entry: Dictionary) -> void:
 ## Frees what an undo step kept that nothing can bring back now (out of
 ## the world, and no step left in the history deleted it).
 func _forget_entry(p_entry: Dictionary) -> void:
-	for r in p_entry.get("deleted", []):
+	for r in p_entry.get("deleted", []) + p_entry.get("pasted", []):
 		if not is_instance_valid(r.body) or r.body.is_inside_tree():
 			continue
 		var held := false
 		for e in history:
-			for other in e.get("deleted", []):
+			for other in e.get("deleted", []) + e.get("pasted", []):
 				held = held or other.body == r.body
 		if not held:
 			r.body.free()
@@ -2031,6 +2045,13 @@ func _begin_twist(p_hit: Vector3) -> void:
 	var kept := _distinct_copies(copies, p_hit) if twist_body == null else _body_copies(twist_body, copies, p_hit)
 	for i in kept:
 		twist_copies.append(copies[i])
+	# Scale: about the middle of what's solid under the brush, not the point
+	# on its surface: about a point on a flat surface, shrinking only moved
+	# it along itself, so did nothing (and growing only did something by
+	# folding material over itself). A leg or a head shrinks to its own middle.
+	twist_hit = p_hit
+	if tool == Tool.SCALE:
+		twist_center = _solid_middle(p_hit, twist_body, _radius_on(twist_body))
 	twist_turn = Basis()
 	twist_scale = 1.0
 	twist_sent = Basis()
@@ -2039,6 +2060,26 @@ func _begin_twist(p_hit: Vector3) -> void:
 		twist_body.begin_grab()
 	else:
 		terrain.begin_grab()
+
+## The middle of the solid within p_radius of p_point (p_body's, or the
+## terrain's if null): 7 samples across. Just in under the surface if none is.
+func _solid_middle(p_point: Vector3, p_body: DensityBody3D, p_radius: float) -> Vector3:
+	var sum := Vector3.ZERO
+	var count := 0
+	for x in range(-3, 4):
+		for y in range(-3, 4):
+			for z in range(-3, 4):
+				var d := Vector3(x, y, z) / 3.0
+				if d.length_squared() > 1.0:
+					continue
+				var q := p_point + d * p_radius
+				var density: float = p_body.get_density_at(q) if p_body != null else terrain.get_density(q)
+				if density > 0.0:
+					sum += q
+					count += 1
+	if count == 0:
+		return p_point - _surface_normal(p_point, p_body) * p_radius * 0.4
+	return sum / count
 
 func _end_twist() -> void:
 	if twisting:
@@ -2080,7 +2121,7 @@ func _twist() -> Vector3:
 				twist_body.twist(centers, bases, _radius_on(twist_body))
 		else:
 			terrain.twist(centers, bases, brush_radius)
-	return twist_center
+	return twist_hit
 
 ## Holds a body still while it's sculpted (see held_body).
 func _hold_body(p_body: DensityBody3D) -> void:
@@ -2199,6 +2240,17 @@ func _undo() -> void:
 		if is_instance_valid(entry.moved):
 			entry.moved.global_transform = entry.before
 			entry.moved.sleeping = false
+	elif entry.has("com"):
+		if is_instance_valid(entry.com):
+			entry.com.center_of_mass = entry.before
+			entry.com.auto_center_of_mass = entry.before_auto
+	elif entry.has("group_update"):
+		creatures.undo_update(entry, false)
+	elif entry.has("pasted"):
+		for r in entry.pasted:
+			if is_instance_valid(r.body) and r.body.is_inside_tree():
+				_take_out(r.body)
+				r.body.get_parent().remove_child(r.body)
 	if entry.has("sel_before"):
 		_set_selection(entry.sel_before)
 	future.append(entry)
@@ -2234,6 +2286,14 @@ func _redo() -> void:
 		if is_instance_valid(entry.moved):
 			entry.moved.global_transform = entry.after
 			entry.moved.sleeping = false
+	elif entry.has("com"):
+		if is_instance_valid(entry.com):
+			entry.com.center_of_mass = entry.after
+			entry.com.auto_center_of_mass = false
+	elif entry.has("group_update"):
+		creatures.undo_update(entry, true)
+	elif entry.has("pasted"):
+		_undelete({"deleted": entry.pasted, "unloaded": []})
 	if entry.has("sel_after"):
 		_set_selection(entry.sel_after)
 	history.append(entry)
@@ -2496,7 +2556,7 @@ func _key_hint() -> String:
 		Tool.SCALE:
 			return "Scale: hold on the ground or an object and move the mouse (right / up: bigger, left / down: smaller)"
 		Tool.INFLATE:
-			return "Inflate: puffs the surface out (RMB: in)"
+			return "Inflate: swells everything under the brush evenly, each part out along its own normal (thin parts get fatter all round; RMB: shrinks)"
 		Tool.PINCH:
 			return "Pinch: pulls the surface into a crease (RMB: spreads it)"
 		Tool.BOX:
@@ -2612,13 +2672,98 @@ func _apply_floating() -> void:
 	terrain.set_stroke_held(false)
 	terrain.end_stroke()
 
+## Ctrl+C: the selected ground, or else the selected objects and creatures
+## (or, with nothing selected, the one under the crosshair).
 func _copy_selection() -> void:
+	_update_body_selection()
 	if terrain.has_selection():
 		clipboard = terrain.selection_to_shape(false)
 		clipboard_center = terrain.get_selection_center()
+		clipboard_bodies = []
+		return
+	var bodies: Array = selected_bodies.duplicate()
+	if bodies.is_empty():
+		var aimed := DensityBody3D.raycast_bodies(camera.global_position, -camera.global_basis.z, reach)
+		if not aimed.is_empty() and not aimed.body is DensityCharacter3D:
+			bodies = [aimed.body]
+	var copied: Array = []
+	var center := Vector3.ZERO
+	for b in bodies:
+		if is_instance_valid(b) and b.shape != null and b != floating:
+			copied.append(_body_copy(b))
+			center += b.global_position
+	if copied.is_empty():
+		return
+	center /= copied.size()
+	var lift := 0.0  # half the biggest one's size: pasted that far up off the ground
+	for c in copied:
+		c.offset = c.position - center
+		lift = maxf(lift, c.size * 0.5)
+	clipboard_bodies = copied
+	clipboard_lift = lift
+	_notify("Copied %d object%s (Ctrl+V pastes at the crosshair)" % [copied.size(), "" if copied.size() == 1 else "s"])
 
-## A copy of the clipboard where it was copied from, floating, to transform.
+## All a body needs to be made again (Ctrl+V): as it's saved.
+func _body_copy(p_body: DensityBody3D) -> Dictionary:
+	var c := {"position": p_body.global_position, "basis": p_body.global_basis, "frozen": p_body.freeze,
+			"pose": p_body.pose, "key_weights": p_body.key_weights}
+	var extent := Vector3(p_body.shape.get_size()) * p_body.shape.get_voxel_size() * p_body.global_basis.get_scale()
+	c["size"] = maxf(extent.x, maxf(extent.y, extent.z))
+	if p_body.scene_file_path != "":
+		c["scene"] = p_body.scene_file_path
+		c["own"] = creatures.own_entry(p_body)
+		if p_body.has_meta("editing"):
+			c.frozen = editor.was_frozen
+	else:
+		var entry: Dictionary = objects.entry_of(p_body)
+		entry.shape = p_body.shape.to_dict()  # (a ball's too: as it is)
+		entry.velocity = Vector3.ZERO
+		entry.spin = Vector3.ZERO
+		entry.sleeping = false
+		c["entry"] = entry
+	return c
+
+## Ctrl+V with objects copied: copies of them at the crosshair (laid out as
+## they were), selected; one undo step takes them away again.
+func _paste_bodies() -> void:
+	var look := -camera.global_basis.z
+	var hit = terrain.raycast(camera.global_position, look, reach)
+	var at: Vector3 = (hit + Vector3.UP * (clipboard_lift + 1.0)) if hit != null else camera.global_position + look * maxf(30.0, clipboard_lift * 3.0)
+	_clear_body_selection()
+	terrain.clear_selection()
+	var made: Array = []
+	for c in clipboard_bodies:
+		var body: DensityBody3D = null
+		var position: Vector3 = at + c.offset
+		if c.has("scene"):
+			var scene := load(c.scene) as PackedScene
+			if scene == null:
+				continue
+			body = creatures.spawn(scene, position)
+			creatures.restore_own(body, c.own)
+		else:
+			body = objects.restore(c.entry, position)
+		if body == null:
+			continue
+		body.global_transform = Transform3D(c.basis, position)
+		body.freeze = c.frozen
+		body.pose = c.pose
+		body.key_weights = c.key_weights
+		body.linear_velocity = Vector3.ZERO
+		body.angular_velocity = Vector3.ZERO
+		body.sleeping = false
+		made.append({"body": body, "parent": body.get_parent()})
+		_select_body(body, true)
+	if not made.is_empty():
+		_push_history({"pasted": made})
+		_notify("Pasted %d object%s" % [made.size(), "" if made.size() == 1 else "s"])
+
+## A copy of the clipboard where it was copied from, floating, to transform
+## (objects copied: _paste_bodies()).
 func _paste() -> void:
+	if not clipboard_bodies.is_empty():
+		_paste_bodies()
+		return
 	if clipboard == null:
 		return
 	_apply_floating()
@@ -2761,6 +2906,15 @@ func _gizmo_axes() -> Array[Vector3]:
 	if gizmo_mode == Gizmo.SCALE:
 		var b := _gizmo_target().global_basis
 		return [b.x.normalized(), b.y.normalized(), b.z.normalized()]
+	# A creature: along where it faces (red: forward, green: its up, tilted
+	# with its facing), so it turns about its own axes.
+	var body := _gizmo_target() as DensityBody3D
+	if body != null and body == gizmo_body and body.has_method("_forward"):
+		var up: Vector3 = body.call("_up") if body.has_method("_up") else body.global_basis.y.normalized()
+		var forward: Vector3 = body.call("_forward")
+		forward = (forward - up * forward.dot(up)).normalized()
+		if up.is_finite() and forward.is_finite() and forward.length_squared() > 0.5:
+			return [forward, up, forward.cross(up)]
 	return [Vector3.RIGHT, Vector3.UP, Vector3.BACK]
 
 ## The handle under the crosshair, or -1.
@@ -3030,6 +3184,7 @@ func _import_to_paste() -> void:
 			push_error("%s isn't a density shape" % path)
 			return
 		clipboard = shape
+		clipboard_bodies = []
 		var look := -camera.global_basis.z
 		var hit = terrain.raycast(camera.global_position, look, reach)
 		clipboard_center = hit if hit != null else camera.global_position + look * 30.0

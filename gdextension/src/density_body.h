@@ -249,6 +249,9 @@ protected:
 	Vector3 flatten_point, flatten_normal;
 	int64_t shape_version = -1; // the shape's, when the probes were made
 	int probe_frame = -1; // the shape frame the probes are of
+	int64_t probe_data_version = -1; // the version of the shape that frame's look was of
+	uint64_t inertia_ms = 0; // when the probes were last made
+	static uint64_t now_ms();
 	PackedFloat32Array key_weights;
 	// The shape frame nearest how it looks now (the heaviest of get_blend()).
 	int nearest_frame() const;
